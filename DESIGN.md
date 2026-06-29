@@ -154,12 +154,12 @@ Crate status: **pinned & wired** in `lattice-identity` — `ed25519-dalek` 2, `x
 |---|---|---|
 | Identity signatures | Ed25519 + ML-DSA-65 hybrid (AND-verify) | **Done** |
 | Identity key material | carries X25519 + ML-KEM-768 public keys | **Done** (keys derived & published) |
-| Session confidentiality | hybrid KEM (X25519 + ML-KEM-768) → HKDF combiner → ChaCha20-Poly1305 | **Done** — one-pass handshake + AEAD record layer; per-message ratchet still pending |
+| Session confidentiality | hybrid KEM (X25519 + ML-KEM-768) → HKDF combiner → symmetric ratchet → ChaCha20-Poly1305 | **Done** — handshake + per-message forward-secret ratchet; DH ratchet (post-compromise security) + skipped-key handling pending |
 | Transport (iroh/QUIC-TLS) | independent; app-layer session crypto is the real protection | out of our hands; do not rely on it for E2E |
 | Capabilities | signed with the hybrid identity | inherited once caps sign via `Identity` |
 
 **Caveats recorded honestly:**
-- **PQ ≠ forward secrecy** — orthogonal. v1 stance is a PQ-hybrid *initial* handshake + classical Double-Ratchet for FS (fully-PQ ratcheting is open research; revisit).
+- **PQ ≠ forward secrecy** — orthogonal, and now both present: the PQ-hybrid handshake protects the *initial* secret, and a symmetric KDF ratchet gives per-message forward secrecy. Still pending: the DH ratchet for *post-compromise security* (healing after a state leak) and skipped-message-key storage (out-of-order delivery). Fully-PQ ratcheting remains open research.
 - **Size/bandwidth cost is real** — ML-DSA-65 signatures ≈ 3.3 KB and ML-KEM-768 keys ≈ 1.2 KB, vs. 64 B for Ed25519. In a system that gossips keys and signs every log entry this is a genuine budget; measure early and consider signing batch roots rather than every entry.
 - **Until the session KEM lands, message confidentiality is classical-only and therefore HNDL-exposed.** This is the next PQ priority.
 

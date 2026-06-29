@@ -1,32 +1,38 @@
-//! `lattice-session` — authenticated, forward-looking secure channels built on
-//! a **hybrid KEM handshake** (DESIGN.md §5.1).
+//! `lattice-session` — authenticated secure channels built on a **hybrid KEM
+//! handshake** plus a **symmetric ratchet** for forward secrecy (DESIGN.md §5.1).
 //!
 //! Establishing a session combines two independent key exchanges:
 //!
 //! ```text
 //! ss_x25519  = X25519(ephemeral_initiator, static_responder)   (classical)
 //! ss_mlkem   = ML-KEM-768 encapsulate -> responder             (post-quantum)
-//! session    = HKDF-SHA256( ikm = ss_x25519 ‖ ss_mlkem,
-//!                           salt = transcript )                 (combiner)
+//! root keys  = HKDF-SHA256( ikm = ss_x25519 ‖ ss_mlkem,
+//!                           salt = transcript )                 (combiner, not XOR)
 //! ```
 //!
-//! The KDF combiner (never XOR) means the channel is secure if **either** the
-//! classical or the post-quantum exchange holds — this is the harvest-now-
-//! decrypt-later defense. The `transcript` (domain, both peer ids, ephemeral
-//! public key, ciphertext) is the HKDF salt, binding the keys to this exact
-//! handshake. Per direction we derive a ChaCha20-Poly1305 key with a counter
-//! nonce.
+//! secure if **either** exchange holds (harvest-now-decrypt-later defense). The
+//! two root keys seed a per-direction **KDF chain**. Each message derives a
+//! fresh message key and advances the chain, overwriting its predecessor:
 //!
-//! Scope: this is the one-pass KEM handshake + AEAD record layer. Per-message
-//! ratcheting (full forward secrecy) layers on top later; see DESIGN.md §5.1
-//! ("PQ ≠ forward secrecy"). The ML-KEM operations live in `lattice-identity`
-//! (which owns the typed keys); this crate orchestrates X25519, the combiner,
-//! and the AEAD.
+//! ```text
+//! message_key_n = HKDF(chain_key_n)["mk"]
+//! chain_key_n+1 = HKDF(chain_key_n)["ck"]   (chain_key_n is then erased)
+//! ```
+//!
+//! Because the KDF is one-way and old chain keys are deleted, compromising the
+//! current state cannot recover *past* message keys — that's forward secrecy.
+//!
+//! Scope / honest boundary: this is the **symmetric** ratchet (forward secrecy)
+//! over a one-pass hybrid-KEM handshake. The **DH ratchet** (post-compromise
+//! security / healing) and skipped/out-of-order message-key storage are the
+//! documented next step — v1 is strictly in-order. ML-KEM operations live in
+//! `lattice-identity`; this crate owns X25519, the combiner, the ratchet, and
+//! the AEAD.
 
 use lattice_core::{Error, Identity, PeerId, Result, Verify};
 use lattice_identity::{Keypair, PublicIdentity};
 
-use chacha20poly1305::aead::Aead;
+use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
@@ -50,18 +56,48 @@ enum Role {
     Responder,
 }
 
-/// An established secure channel: directional AEAD keys + counter nonces.
+/// A one-directional KDF chain providing forward secrecy.
+struct Chain {
+    key: Zeroizing<[u8; 32]>,
+    n: u64,
+}
+
+impl Chain {
+    fn new(root: [u8; 32]) -> Self {
+        Self {
+            key: Zeroizing::new(root),
+            n: 0,
+        }
+    }
+
+    /// Derive `(message_key, next_chain_key)` from the current chain key
+    /// *without* mutating — the caller commits only after AEAD succeeds, so a
+    /// bad/forged message can't desync the chain.
+    fn derive(&self) -> (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) {
+        let hk = Hkdf::<Sha256>::new(None, &self.key[..]);
+        let mut mk = [0u8; 32];
+        let mut ck = [0u8; 32];
+        hk.expand(b"lattice/ratchet/mk", &mut mk).expect("hkdf len");
+        hk.expand(b"lattice/ratchet/ck", &mut ck).expect("hkdf len");
+        (Zeroizing::new(mk), Zeroizing::new(ck))
+    }
+
+    /// Advance the chain: erase the old key, install the next, bump the index.
+    fn commit(&mut self, next: &[u8; 32]) {
+        self.key.copy_from_slice(next);
+        self.n += 1;
+    }
+}
+
+/// An established secure channel: a forward-secret KDF chain per direction.
 pub struct SecureSession {
-    send: ChaCha20Poly1305,
-    recv: ChaCha20Poly1305,
-    send_ctr: u64,
-    recv_ctr: u64,
+    send: Chain,
+    recv: Chain,
 }
 
 impl SecureSession {
     /// Initiator side: produce a [`Handshake`] for `peer` and the local session.
     pub fn initiate(me: &Keypair, peer: &PublicIdentity) -> Result<(Handshake, Self)> {
-        // Classical: ephemeral X25519 DH against the peer's static key.
         let mut eb = [0u8; 32];
         getrandom::getrandom(&mut eb).map_err(|e| Error::Crypto(format!("rng: {e}")))?;
         let eph = XStaticSecret::from(eb);
@@ -72,7 +108,6 @@ impl SecureSession {
                 .to_bytes(),
         );
 
-        // Post-quantum: encapsulate to the peer's ML-KEM key.
         #[cfg(feature = "pq")]
         let (mlkem_ct, ss_pq) = {
             let (ct, ss) = peer.pq_encapsulate()?;
@@ -102,7 +137,6 @@ impl SecureSession {
         #[cfg(not(feature = "pq"))]
         let ss_pq: Option<Zeroizing<[u8; 32]>> = None;
 
-        // Same transcript: peer is the initiator, we are the responder.
         let transcript = transcript(&peer.peer_id(), &me.peer_id(), &hs.eph_x25519, &hs.mlkem_ct);
         let ikm = build_ikm(&ss_x, ss_pq.as_ref());
         Ok(Self::derive(&ikm, &transcript, Role::Responder))
@@ -115,47 +149,62 @@ impl SecureSession {
         hk.expand(b"lattice/session/i2r", &mut k_i2r).expect("hkdf len");
         hk.expand(b"lattice/session/r2i", &mut k_r2i).expect("hkdf len");
 
-        let (send_ref, recv_ref) = match role {
-            Role::Initiator => (&k_i2r, &k_r2i),
-            Role::Responder => (&k_r2i, &k_i2r),
+        let session = match role {
+            Role::Initiator => Self {
+                send: Chain::new(k_i2r),
+                recv: Chain::new(k_r2i),
+            },
+            Role::Responder => Self {
+                send: Chain::new(k_r2i),
+                recv: Chain::new(k_i2r),
+            },
         };
-        let send = ChaCha20Poly1305::new_from_slice(send_ref).expect("32-byte key");
-        let recv = ChaCha20Poly1305::new_from_slice(recv_ref).expect("32-byte key");
         k_i2r.zeroize();
         k_r2i.zeroize();
-
-        Self {
-            send,
-            recv,
-            send_ctr: 0,
-            recv_ctr: 0,
-        }
+        session
     }
 
-    /// Encrypt-and-authenticate the next outbound message.
+    /// Encrypt the next outbound message. Output is `index_le(8) ‖ ciphertext`;
+    /// the index is authenticated as associated data.
     pub fn seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let nonce = nonce_for(self.send_ctr);
-        self.send_ctr += 1;
-        self.send
-            .encrypt(Nonce::from_slice(&nonce), plaintext)
-            .map_err(|_| Error::Crypto("AEAD seal failed".into()))
+        let (mk, next) = self.send.derive();
+        let n = self.send.n;
+        let aad = n.to_le_bytes();
+        let cipher = ChaCha20Poly1305::new_from_slice(&mk[..]).expect("32-byte key");
+        // Fresh single-use key per message => a constant nonce is safe.
+        let ct = cipher
+            .encrypt(Nonce::from_slice(&[0u8; 12]), Payload { msg: plaintext, aad: &aad })
+            .map_err(|_| Error::Crypto("AEAD seal failed".into()))?;
+        self.send.commit(&next);
+
+        let mut out = Vec::with_capacity(8 + ct.len());
+        out.extend_from_slice(&aad);
+        out.extend_from_slice(&ct);
+        Ok(out)
     }
 
-    /// Decrypt-and-verify the next inbound message. Fails closed on tamper or
-    /// out-of-order delivery.
-    pub fn open(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>> {
-        let nonce = nonce_for(self.recv_ctr);
-        self.recv_ctr += 1;
-        self.recv
-            .decrypt(Nonce::from_slice(&nonce), ciphertext)
-            .map_err(|_| Error::Verify("AEAD open failed (tampered or out-of-order)".into()))
+    /// Decrypt the next inbound message. In-order only: rejects gaps, reorders,
+    /// and tampering, and does not advance the chain on failure.
+    pub fn open(&mut self, framed: &[u8]) -> Result<Vec<u8>> {
+        if framed.len() < 8 {
+            return Err(Error::Verify("truncated frame".into()));
+        }
+        let n = u64::from_le_bytes(framed[..8].try_into().expect("8 bytes"));
+        if n != self.recv.n {
+            return Err(Error::Verify("out-of-order or replayed message".into()));
+        }
+        let (mk, next) = self.recv.derive();
+        let aad = n.to_le_bytes();
+        let cipher = ChaCha20Poly1305::new_from_slice(&mk[..]).expect("32-byte key");
+        let pt = cipher
+            .decrypt(
+                Nonce::from_slice(&[0u8; 12]),
+                Payload { msg: &framed[8..], aad: &aad },
+            )
+            .map_err(|_| Error::Verify("AEAD open failed (tampered or wrong key)".into()))?;
+        self.recv.commit(&next); // advance only after success
+        Ok(pt)
     }
-}
-
-fn nonce_for(ctr: u64) -> [u8; 12] {
-    let mut n = [0u8; 12];
-    n[..8].copy_from_slice(&ctr.to_le_bytes());
-    n
 }
 
 fn transcript(initiator: &PeerId, responder: &PeerId, eph: &[u8; 32], ct: &[u8]) -> Vec<u8> {
@@ -187,37 +236,64 @@ mod tests {
         Keypair::generate(CryptoSuite::Hybrid).unwrap()
     }
 
-    #[test]
-    fn handshake_then_bidirectional_messaging() {
+    fn pair() -> (SecureSession, SecureSession) {
         let (alice, bob) = (id(), id());
-        let (hs, mut a) = SecureSession::initiate(&alice, bob.public()).unwrap();
-        let mut b = SecureSession::accept(&bob, alice.public(), &hs).unwrap();
+        let (hs, a) = SecureSession::initiate(&alice, bob.public()).unwrap();
+        let b = SecureSession::accept(&bob, alice.public(), &hs).unwrap();
+        (a, b)
+    }
 
+    #[test]
+    fn bidirectional_messaging() {
+        let (mut a, mut b) = pair();
         let ct = a.seal(b"hello bob").unwrap();
         assert_eq!(b.open(&ct).unwrap(), b"hello bob");
-
         let ct2 = b.seal(b"hi alice").unwrap();
         assert_eq!(a.open(&ct2).unwrap(), b"hi alice");
     }
 
     #[test]
-    fn tampered_ciphertext_fails() {
-        let (alice, bob) = (id(), id());
-        let (hs, mut a) = SecureSession::initiate(&alice, bob.public()).unwrap();
-        let mut b = SecureSession::accept(&bob, alice.public(), &hs).unwrap();
+    fn ratchet_advances_over_many_messages() {
+        let (mut a, mut b) = pair();
+        for i in 0..5u8 {
+            let msg = [b'm', i];
+            let ct = a.seal(&msg).unwrap();
+            assert_eq!(b.open(&ct).unwrap(), msg);
+        }
+        // Each message used a distinct key: identical plaintext -> different ct.
+        let c1 = a.seal(b"dup").unwrap();
+        let c2 = a.seal(b"dup").unwrap();
+        assert_ne!(c1, c2, "ratchet must use a fresh key per message");
+    }
 
-        let mut ct = a.seal(b"secret").unwrap();
-        let last = ct.len() - 1;
-        ct[last] ^= 0x01;
-        assert!(b.open(&ct).is_err(), "tampered ciphertext must fail");
+    #[test]
+    fn out_of_order_is_rejected() {
+        let (mut a, mut b) = pair();
+        let _m0 = a.seal(b"first").unwrap();
+        let m1 = a.seal(b"second").unwrap();
+        assert!(b.open(&m1).is_err(), "skipping m0 must be rejected");
+    }
+
+    #[test]
+    fn tampered_ciphertext_fails_and_does_not_desync() {
+        let (mut a, mut b) = pair();
+        let m0 = a.seal(b"zero").unwrap();
+        let m1 = a.seal(b"one").unwrap();
+        assert_eq!(b.open(&m0).unwrap(), b"zero");
+
+        let mut bad = m1.clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 0x01;
+        assert!(b.open(&bad).is_err(), "tampered frame must fail");
+
+        // The failed open did not advance the chain: the genuine #1 still opens.
+        assert_eq!(b.open(&m1).unwrap(), b"one");
     }
 
     #[test]
     fn wrong_responder_cannot_read() {
         let (alice, bob, eve) = (id(), id(), id());
         let (hs, mut a) = SecureSession::initiate(&alice, bob.public()).unwrap();
-        // Eve accepts a handshake meant for Bob: her keys yield a different
-        // shared secret, so she cannot open Alice's messages.
         let mut e = SecureSession::accept(&eve, alice.public(), &hs).unwrap();
         let ct = a.seal(b"for bob only").unwrap();
         assert!(e.open(&ct).is_err(), "non-intended responder must not decrypt");
