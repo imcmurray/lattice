@@ -1,33 +1,28 @@
-//! `lattice-session` — authenticated secure channels built on a **hybrid KEM
-//! handshake** plus a **symmetric ratchet** for forward secrecy (DESIGN.md §5.1).
+//! `lattice-session` — authenticated secure channels with a **Double Ratchet**
+//! over a hybrid-KEM handshake (DESIGN.md §5.1).
 //!
-//! Establishing a session combines two independent key exchanges:
+//! Establishing a session combines two independent key exchanges into a root key:
 //!
 //! ```text
 //! ss_x25519  = X25519(ephemeral_initiator, static_responder)   (classical)
 //! ss_mlkem   = ML-KEM-768 encapsulate -> responder             (post-quantum)
-//! root keys  = HKDF-SHA256( ikm = ss_x25519 ‖ ss_mlkem,
-//!                           salt = transcript )                 (combiner, not XOR)
+//! root_key   = HKDF( ikm = ss_x25519 ‖ ss_mlkem, salt = transcript )
 //! ```
 //!
 //! secure if **either** exchange holds (harvest-now-decrypt-later defense). The
-//! two root keys seed a per-direction **KDF chain**. Each message derives a
-//! fresh message key and advances the chain, overwriting its predecessor:
+//! root key then seeds a Double Ratchet:
 //!
-//! ```text
-//! message_key_n = HKDF(chain_key_n)["mk"]
-//! chain_key_n+1 = HKDF(chain_key_n)["ck"]   (chain_key_n is then erased)
-//! ```
+//! - **Symmetric ratchet** — each message derives a fresh key from a one-way
+//!   KDF chain, erasing its predecessor → *forward secrecy*.
+//! - **DH ratchet** — each time the direction flips, the sender mixes a fresh
+//!   X25519 ratchet key into the root via `KDF_RK`, so a state compromise heals
+//!   after one round trip → *post-compromise security*. Message headers carry
+//!   the sender's current ratchet public key.
 //!
-//! Because the KDF is one-way and old chain keys are deleted, compromising the
-//! current state cannot recover *past* message keys — that's forward secrecy.
-//!
-//! Scope / honest boundary: this is the **symmetric** ratchet (forward secrecy)
-//! over a one-pass hybrid-KEM handshake. The **DH ratchet** (post-compromise
-//! security / healing) and skipped/out-of-order message-key storage are the
-//! documented next step — v1 is strictly in-order. ML-KEM operations live in
-//! `lattice-identity`; this crate owns X25519, the combiner, the ratchet, and
-//! the AEAD.
+//! Honest boundary: delivery is **in-order** (no skipped-message-key storage),
+//! so out-of-order or dropped messages are rejected rather than buffered — the
+//! documented follow-on. ML-KEM ops live in `lattice-identity`; this crate owns
+//! X25519, the ratchet, and the AEAD.
 
 use lattice_core::{Error, Identity, PeerId, Result, Verify};
 use lattice_identity::{Keypair, PublicIdentity};
@@ -40,171 +35,261 @@ use x25519_dalek::{PublicKey as XPublicKey, StaticSecret as XStaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 
 const HS_DOMAIN: &[u8] = b"lattice-session-hs-v1";
+const HEADER_LEN: usize = 32 + 8 + 8; // ratchet pubkey ‖ prev-chain-len ‖ msg-index
 
 /// The initiator's one-pass handshake message, sent to the responder.
 #[derive(Clone, Debug)]
 pub struct Handshake {
-    /// Ephemeral X25519 public key.
+    /// Ephemeral X25519 public key (KEM handshake).
     pub eph_x25519: [u8; 32],
     /// ML-KEM ciphertext (empty when the `pq` feature is off).
     pub mlkem_ct: Vec<u8>,
 }
 
-#[derive(Clone, Copy)]
-enum Role {
-    Initiator,
-    Responder,
-}
-
-/// A one-directional KDF chain providing forward secrecy.
-struct Chain {
-    key: Zeroizing<[u8; 32]>,
-    n: u64,
-}
-
-impl Chain {
-    fn new(root: [u8; 32]) -> Self {
-        Self {
-            key: Zeroizing::new(root),
-            n: 0,
-        }
-    }
-
-    /// Derive `(message_key, next_chain_key)` from the current chain key
-    /// *without* mutating — the caller commits only after AEAD succeeds, so a
-    /// bad/forged message can't desync the chain.
-    fn derive(&self) -> (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) {
-        let hk = Hkdf::<Sha256>::new(None, &self.key[..]);
-        let mut mk = [0u8; 32];
-        let mut ck = [0u8; 32];
-        hk.expand(b"lattice/ratchet/mk", &mut mk).expect("hkdf len");
-        hk.expand(b"lattice/ratchet/ck", &mut ck).expect("hkdf len");
-        (Zeroizing::new(mk), Zeroizing::new(ck))
-    }
-
-    /// Advance the chain: erase the old key, install the next, bump the index.
-    fn commit(&mut self, next: &[u8; 32]) {
-        self.key.copy_from_slice(next);
-        self.n += 1;
-    }
-}
-
-/// An established secure channel: a forward-secret KDF chain per direction.
+/// An established secure channel running a Double Ratchet.
 pub struct SecureSession {
-    send: Chain,
-    recv: Chain,
+    rk: Zeroizing<[u8; 32]>,            // root key
+    dhs: XStaticSecret,                 // our current ratchet secret
+    dhs_pub: [u8; 32],                  // our current ratchet public
+    dhr: Option<[u8; 32]>,              // their current ratchet public
+    cks: Option<Zeroizing<[u8; 32]>>,   // sending chain key
+    ckr: Option<Zeroizing<[u8; 32]>>,   // receiving chain key
+    ns: u64,                            // messages sent in current chain
+    nr: u64,                            // messages received in current chain
+    pn: u64,                            // messages in previous sending chain
+}
+
+/// Output of the initiator's hybrid-KEM handshake.
+struct KemInit {
+    eph_pub: [u8; 32],
+    mlkem_ct: Vec<u8>,
+    root: Zeroizing<[u8; 32]>,
 }
 
 impl SecureSession {
-    /// Initiator side: produce a [`Handshake`] for `peer` and the local session.
+    /// Initiator side: produce a [`Handshake`] and the local session.
     pub fn initiate(me: &Keypair, peer: &PublicIdentity) -> Result<(Handshake, Self)> {
-        let mut eb = [0u8; 32];
-        getrandom::getrandom(&mut eb).map_err(|e| Error::Crypto(format!("rng: {e}")))?;
-        let eph = XStaticSecret::from(eb);
-        eb.zeroize();
-        let eph_pub = XPublicKey::from(&eph).to_bytes();
-        let ss_x = Zeroizing::new(
-            eph.diffie_hellman(&XPublicKey::from(peer.x25519_bytes()))
-                .to_bytes(),
-        );
+        let KemInit { eph_pub, mlkem_ct, root: sk } = kem_initiate(me, peer)?;
 
-        #[cfg(feature = "pq")]
-        let (mlkem_ct, ss_pq) = {
-            let (ct, ss) = peer.pq_encapsulate()?;
-            (ct, Some(ss))
+        // Double Ratchet init (Alice): fresh ratchet key, peer's static as DHr.
+        let (dhs, dhs_pub) = gen_ratchet_key()?;
+        let dhr = peer.x25519_bytes();
+        let (rk, cks) = kdf_rk(&sk, &dh(&dhs, &dhr));
+
+        let session = Self {
+            rk,
+            dhs,
+            dhs_pub,
+            dhr: Some(dhr),
+            cks: Some(cks),
+            ckr: None,
+            ns: 0,
+            nr: 0,
+            pn: 0,
         };
-        #[cfg(not(feature = "pq"))]
-        let (mlkem_ct, ss_pq): (Vec<u8>, Option<Zeroizing<[u8; 32]>>) = (Vec::new(), None);
-
-        let transcript = transcript(&me.peer_id(), &peer.peer_id(), &eph_pub, &mlkem_ct);
-        let ikm = build_ikm(&ss_x, ss_pq.as_ref());
-        let session = Self::derive(&ikm, &transcript, Role::Initiator);
-        Ok((
-            Handshake {
-                eph_x25519: eph_pub,
-                mlkem_ct,
-            },
-            session,
-        ))
+        Ok((Handshake { eph_x25519: eph_pub, mlkem_ct }, session))
     }
 
-    /// Responder side: consume the initiator's [`Handshake`] and derive the session.
+    /// Responder side: consume the [`Handshake`] and derive the session. The
+    /// responder has no sending chain until it receives the first message.
     pub fn accept(me: &Keypair, peer: &PublicIdentity, hs: &Handshake) -> Result<Self> {
-        let ss_x = me.x25519_dh(&hs.eph_x25519);
-
-        #[cfg(feature = "pq")]
-        let ss_pq = Some(me.pq_decapsulate(&hs.mlkem_ct)?);
-        #[cfg(not(feature = "pq"))]
-        let ss_pq: Option<Zeroizing<[u8; 32]>> = None;
-
-        let transcript = transcript(&peer.peer_id(), &me.peer_id(), &hs.eph_x25519, &hs.mlkem_ct);
-        let ikm = build_ikm(&ss_x, ss_pq.as_ref());
-        Ok(Self::derive(&ikm, &transcript, Role::Responder))
+        let sk = kem_accept(me, peer, hs)?;
+        Ok(Self {
+            rk: sk,
+            dhs: me.x25519_secret(),            // initial ratchet key = identity X25519
+            dhs_pub: me.public().x25519_bytes(),
+            dhr: None,
+            cks: None,
+            ckr: None,
+            ns: 0,
+            nr: 0,
+            pn: 0,
+        })
     }
 
-    fn derive(ikm: &[u8], transcript: &[u8], role: Role) -> Self {
-        let hk = Hkdf::<Sha256>::new(Some(transcript), ikm);
-        let mut k_i2r = [0u8; 32];
-        let mut k_r2i = [0u8; 32];
-        hk.expand(b"lattice/session/i2r", &mut k_i2r).expect("hkdf len");
-        hk.expand(b"lattice/session/r2i", &mut k_r2i).expect("hkdf len");
-
-        let session = match role {
-            Role::Initiator => Self {
-                send: Chain::new(k_i2r),
-                recv: Chain::new(k_r2i),
-            },
-            Role::Responder => Self {
-                send: Chain::new(k_r2i),
-                recv: Chain::new(k_i2r),
-            },
-        };
-        k_i2r.zeroize();
-        k_r2i.zeroize();
-        session
-    }
-
-    /// Encrypt the next outbound message. Output is `index_le(8) ‖ ciphertext`;
-    /// the index is authenticated as associated data.
+    /// Encrypt the next outbound message. Output is `header ‖ ciphertext`, with
+    /// the header (ratchet pubkey, counters) authenticated as AAD.
     pub fn seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let (mk, next) = self.send.derive();
-        let n = self.send.n;
-        let aad = n.to_le_bytes();
-        let cipher = ChaCha20Poly1305::new_from_slice(&mk[..]).expect("32-byte key");
-        // Fresh single-use key per message => a constant nonce is safe.
-        let ct = cipher
-            .encrypt(Nonce::from_slice(&[0u8; 12]), Payload { msg: plaintext, aad: &aad })
-            .map_err(|_| Error::Crypto("AEAD seal failed".into()))?;
-        self.send.commit(&next);
+        let ck = self
+            .cks
+            .clone()
+            .ok_or_else(|| Error::Crypto("no sending chain yet (receive a message first)".into()))?;
+        let (mk, next) = chain_step(&ck);
 
-        let mut out = Vec::with_capacity(8 + ct.len());
-        out.extend_from_slice(&aad);
+        let mut header = Vec::with_capacity(HEADER_LEN);
+        header.extend_from_slice(&self.dhs_pub);
+        header.extend_from_slice(&self.pn.to_le_bytes());
+        header.extend_from_slice(&self.ns.to_le_bytes());
+
+        let ct = aead_seal(&mk, &header, plaintext)?;
+        self.cks = Some(next);
+        self.ns += 1;
+
+        let mut out = header;
         out.extend_from_slice(&ct);
         Ok(out)
     }
 
     /// Decrypt the next inbound message. In-order only: rejects gaps, reorders,
-    /// and tampering, and does not advance the chain on failure.
+    /// and tampering, and never advances state on failure.
     pub fn open(&mut self, framed: &[u8]) -> Result<Vec<u8>> {
-        if framed.len() < 8 {
+        if framed.len() < HEADER_LEN {
             return Err(Error::Verify("truncated frame".into()));
         }
-        let n = u64::from_le_bytes(framed[..8].try_into().expect("8 bytes"));
-        if n != self.recv.n {
-            return Err(Error::Verify("out-of-order or replayed message".into()));
+        let header = &framed[..HEADER_LEN];
+        let ct = &framed[HEADER_LEN..];
+        let mut their_pub = [0u8; 32];
+        their_pub.copy_from_slice(&framed[..32]);
+        let their_ns = u64::from_le_bytes(framed[40..48].try_into().expect("8 bytes"));
+
+        if self.dhr.as_ref() == Some(&their_pub) {
+            // Same DH chain: pure symmetric ratchet step (no desync on failure).
+            if their_ns != self.nr {
+                return Err(Error::Verify("out-of-order or replayed message".into()));
+            }
+            let ck = self
+                .ckr
+                .clone()
+                .ok_or_else(|| Error::Verify("no receiving chain".into()))?;
+            let (mk, next) = chain_step(&ck);
+            let pt = aead_open(&mk, header, ct)?;
+            self.ckr = Some(next);
+            self.nr += 1;
+            Ok(pt)
+        } else {
+            // New DH chain: ratchet step. In-order => must be its first message.
+            if their_ns != 0 {
+                return Err(Error::Verify(
+                    "skipped messages across a ratchet step are not supported".into(),
+                ));
+            }
+            // Compute the receiving side tentatively; commit only if AEAD passes.
+            let (rk1, ckr_new) = kdf_rk(&self.rk, &dh(&self.dhs, &their_pub));
+            let (mk, next_ckr) = chain_step(&ckr_new);
+            let pt = aead_open(&mk, header, ct)?;
+
+            // Commit receiving side.
+            self.pn = self.ns;
+            self.ns = 0;
+            self.nr = 1;
+            self.dhr = Some(their_pub);
+            self.rk = rk1;
+            self.ckr = Some(next_ckr);
+
+            // Advance the sending side: fresh ratchet key mixed into the root.
+            let (new_dhs, new_pub) = gen_ratchet_key()?;
+            let (rk2, cks_new) = kdf_rk(&self.rk, &dh(&new_dhs, &their_pub));
+            self.rk = rk2;
+            self.cks = Some(cks_new);
+            self.dhs = new_dhs;
+            self.dhs_pub = new_pub;
+
+            Ok(pt)
         }
-        let (mk, next) = self.recv.derive();
-        let aad = n.to_le_bytes();
-        let cipher = ChaCha20Poly1305::new_from_slice(&mk[..]).expect("32-byte key");
-        let pt = cipher
-            .decrypt(
-                Nonce::from_slice(&[0u8; 12]),
-                Payload { msg: &framed[8..], aad: &aad },
-            )
-            .map_err(|_| Error::Verify("AEAD open failed (tampered or wrong key)".into()))?;
-        self.recv.commit(&next); // advance only after success
-        Ok(pt)
     }
+}
+
+// --- handshake (hybrid KEM) ------------------------------------------------
+
+fn kem_initiate(me: &Keypair, peer: &PublicIdentity) -> Result<KemInit> {
+    let mut eb = [0u8; 32];
+    getrandom::getrandom(&mut eb).map_err(|e| Error::Crypto(format!("rng: {e}")))?;
+    let eph = XStaticSecret::from(eb);
+    eb.zeroize();
+    let eph_pub = XPublicKey::from(&eph).to_bytes();
+    let ss_x = Zeroizing::new(
+        eph.diffie_hellman(&XPublicKey::from(peer.x25519_bytes()))
+            .to_bytes(),
+    );
+
+    #[cfg(feature = "pq")]
+    let (mlkem_ct, ss_pq) = {
+        let (ct, ss) = peer.pq_encapsulate()?;
+        (ct, Some(ss))
+    };
+    #[cfg(not(feature = "pq"))]
+    let (mlkem_ct, ss_pq): (Vec<u8>, Option<Zeroizing<[u8; 32]>>) = (Vec::new(), None);
+
+    let transcript = transcript(&me.peer_id(), &peer.peer_id(), &eph_pub, &mlkem_ct);
+    let root = root_key(&build_ikm(&ss_x, ss_pq.as_ref()), &transcript);
+    Ok(KemInit { eph_pub, mlkem_ct, root })
+}
+
+fn kem_accept(me: &Keypair, peer: &PublicIdentity, hs: &Handshake) -> Result<Zeroizing<[u8; 32]>> {
+    let ss_x = me.x25519_dh(&hs.eph_x25519);
+
+    #[cfg(feature = "pq")]
+    let ss_pq = Some(me.pq_decapsulate(&hs.mlkem_ct)?);
+    #[cfg(not(feature = "pq"))]
+    let ss_pq: Option<Zeroizing<[u8; 32]>> = None;
+
+    let transcript = transcript(&peer.peer_id(), &me.peer_id(), &hs.eph_x25519, &hs.mlkem_ct);
+    Ok(root_key(&build_ikm(&ss_x, ss_pq.as_ref()), &transcript))
+}
+
+// --- key schedule primitives ----------------------------------------------
+
+/// Root KDF: mix a DH output into the root key, yielding `(root', chain)`.
+fn kdf_rk(rk: &[u8; 32], dh_out: &[u8; 32]) -> (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) {
+    let hk = Hkdf::<Sha256>::new(Some(rk), dh_out);
+    let mut okm = [0u8; 64];
+    hk.expand(b"lattice/dr/root", &mut okm).expect("hkdf len");
+    let mut root = [0u8; 32];
+    let mut chain = [0u8; 32];
+    root.copy_from_slice(&okm[..32]);
+    chain.copy_from_slice(&okm[32..]);
+    okm.zeroize();
+    (Zeroizing::new(root), Zeroizing::new(chain))
+}
+
+/// Symmetric chain step: `(message_key, next_chain_key)` from a chain key.
+fn chain_step(ck: &[u8; 32]) -> (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) {
+    let hk = Hkdf::<Sha256>::new(None, ck);
+    let mut mk = [0u8; 32];
+    let mut next = [0u8; 32];
+    hk.expand(b"lattice/ratchet/mk", &mut mk).expect("hkdf len");
+    hk.expand(b"lattice/ratchet/ck", &mut next).expect("hkdf len");
+    (Zeroizing::new(mk), Zeroizing::new(next))
+}
+
+fn dh(secret: &XStaticSecret, their_public: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    Zeroizing::new(
+        secret
+            .diffie_hellman(&XPublicKey::from(*their_public))
+            .to_bytes(),
+    )
+}
+
+fn gen_ratchet_key() -> Result<(XStaticSecret, [u8; 32])> {
+    let mut b = [0u8; 32];
+    getrandom::getrandom(&mut b).map_err(|e| Error::Crypto(format!("rng: {e}")))?;
+    let s = XStaticSecret::from(b);
+    b.zeroize();
+    let p = XPublicKey::from(&s).to_bytes();
+    Ok((s, p))
+}
+
+fn root_key(ikm: &[u8], transcript: &[u8]) -> Zeroizing<[u8; 32]> {
+    let hk = Hkdf::<Sha256>::new(Some(transcript), ikm);
+    let mut sk = [0u8; 32];
+    hk.expand(b"lattice/session/root", &mut sk).expect("hkdf len");
+    Zeroizing::new(sk)
+}
+
+// --- AEAD record layer (fresh single-use key per message => constant nonce) -
+
+fn aead_seal(mk: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
+    ChaCha20Poly1305::new_from_slice(mk)
+        .expect("32-byte key")
+        .encrypt(Nonce::from_slice(&[0u8; 12]), Payload { msg: plaintext, aad })
+        .map_err(|_| Error::Crypto("AEAD seal failed".into()))
+}
+
+fn aead_open(mk: &[u8; 32], aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
+    ChaCha20Poly1305::new_from_slice(mk)
+        .expect("32-byte key")
+        .decrypt(Nonce::from_slice(&[0u8; 12]), Payload { msg: ciphertext, aad })
+        .map_err(|_| Error::Verify("AEAD open failed (tampered or wrong key)".into()))
 }
 
 fn transcript(initiator: &PeerId, responder: &PeerId, eph: &[u8; 32], ct: &[u8]) -> Vec<u8> {
@@ -253,17 +338,30 @@ mod tests {
     }
 
     #[test]
-    fn ratchet_advances_over_many_messages() {
+    fn many_turns_drive_dh_ratchet() {
+        // Each direction flip triggers a DH-ratchet step (post-compromise sec).
+        let (mut a, mut b) = pair();
+        for turn in 0..4u8 {
+            let m = [b'a', turn];
+            let ct = a.seal(&m).unwrap();
+            assert_eq!(b.open(&ct).unwrap(), m);
+            let r = [b'b', turn];
+            let ct2 = b.seal(&r).unwrap();
+            assert_eq!(a.open(&ct2).unwrap(), r);
+        }
+    }
+
+    #[test]
+    fn multiple_messages_same_chain() {
         let (mut a, mut b) = pair();
         for i in 0..5u8 {
-            let msg = [b'm', i];
-            let ct = a.seal(&msg).unwrap();
-            assert_eq!(b.open(&ct).unwrap(), msg);
+            let m = [b'm', i];
+            let ct = a.seal(&m).unwrap();
+            assert_eq!(b.open(&ct).unwrap(), m);
         }
-        // Each message used a distinct key: identical plaintext -> different ct.
         let c1 = a.seal(b"dup").unwrap();
         let c2 = a.seal(b"dup").unwrap();
-        assert_ne!(c1, c2, "ratchet must use a fresh key per message");
+        assert_ne!(c1, c2, "fresh key per message");
     }
 
     #[test]
@@ -275,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn tampered_ciphertext_fails_and_does_not_desync() {
+    fn tampered_ciphertext_fails_without_desync() {
         let (mut a, mut b) = pair();
         let m0 = a.seal(b"zero").unwrap();
         let m1 = a.seal(b"one").unwrap();
@@ -285,9 +383,7 @@ mod tests {
         let last = bad.len() - 1;
         bad[last] ^= 0x01;
         assert!(b.open(&bad).is_err(), "tampered frame must fail");
-
-        // The failed open did not advance the chain: the genuine #1 still opens.
-        assert_eq!(b.open(&m1).unwrap(), b"one");
+        assert_eq!(b.open(&m1).unwrap(), b"one", "chain not desynced by failure");
     }
 
     #[test]

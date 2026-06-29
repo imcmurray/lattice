@@ -317,6 +317,13 @@ impl Keypair {
         Zeroizing::new(ss.to_bytes())
     }
 
+    /// The X25519 static agreement secret (re-derived from the seed). The
+    /// session layer uses it to seed the responder's initial DH-ratchet key.
+    /// Sensitive — for in-process handoff to the session only.
+    pub fn x25519_secret(&self) -> XStaticSecret {
+        x_secret(&self.seed)
+    }
+
     /// Decapsulate the ML-KEM shared secret from a ciphertext (session
     /// responder, PQ half of the hybrid KEM).
     #[cfg(feature = "pq")]
