@@ -435,6 +435,7 @@ name = "lattice-caps"
 version = "0.1.0"
 dependencies = [
  "lattice-core",
+ "lattice-identity",
 ]
 
 [[package]]

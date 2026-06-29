@@ -26,6 +26,7 @@ pub mod prelude {
         CryptoSuite, Entry, Error, Identity, Log, PeerId, Result, Seq, Session, Signature, Topic,
         Transport, Verify,
     };
+    pub use lattice_caps::{Action, Capability, ResourceId};
     pub use lattice_identity::{DeviceCert, Keypair, PublicIdentity};
     pub use lattice_log::MemLog;
     pub use lattice_session::{Handshake, SecureSession};

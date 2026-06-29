@@ -11,4 +11,6 @@ workspace = true
 
 [dependencies]
 lattice-core = { path = "../lattice-core" }
-# TODO(caps): pick macaroons- vs UCAN-style token format (ADR-003).
+
+[dev-dependencies]
+lattice-identity = { path = "../lattice-identity" }
