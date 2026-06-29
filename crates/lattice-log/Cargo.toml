@@ -11,4 +11,6 @@ workspace = true
 
 [dependencies]
 lattice-core = { path = "../lattice-core" }
-# TODO(hash): swap placeholder hash for blake3; sigs come from lattice-identity.
+blake3 = "1"
+# Signature verification consumes any `lattice_core::Verify` (the author's
+# public identity) — no dependency on the concrete identity crate needed.

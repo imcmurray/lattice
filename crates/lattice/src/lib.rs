@@ -6,8 +6,11 @@
 //! ```
 //! use lattice::prelude::*;
 //!
-//! let mut log = MemLog::new();
-//! assert_eq!(log.head(), 0);
+//! let me = Keypair::generate(CryptoSuite::Hybrid).unwrap();
+//! let mut log = MemLog::new(me.public().clone());
+//! log.append(b"first message", &me).unwrap();
+//! log.verify().unwrap(); // checks the BLAKE3 chain AND the hybrid signature
+//! assert_eq!(log.head(), 1);
 //! ```
 
 pub use lattice_caps as caps;

@@ -18,12 +18,17 @@ fn main() -> Result<()> {
         me.mnemonic().split_whitespace().count()
     );
 
-    // Author an append-only room log with the real identity.
-    let mut room_log = MemLog::new();
+    // Author an append-only room log with the real identity. The log is bound
+    // to our public identity, so verify() checks the hybrid signature on every
+    // entry, not just the BLAKE3 chain.
+    let mut room_log = MemLog::new(me.public().clone());
     room_log.append(b"hello, lattice", &me)?;
     room_log.append(b"second message", &me)?;
     room_log.verify()?;
-    println!("Appended {} entries; hash chain verified.", room_log.head());
+    println!(
+        "Appended {} entries; BLAKE3 chain + hybrid signatures verified.",
+        room_log.head()
+    );
 
     // Verify a signature against the published public identity.
     let msg = b"sign me";
