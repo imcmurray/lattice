@@ -1,0 +1,14 @@
+[package]
+name = "lattice-log"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Lattice: append-only signed log + CRDT merge (core state primitive)."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+lattice-core = { path = "../lattice-core" }
+# TODO(hash): swap placeholder hash for blake3; sigs come from lattice-identity.

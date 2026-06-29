@@ -1,0 +1,14 @@
+[package]
+name = "lattice-caps"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Lattice: unforgeable, attenuable capability tokens."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+lattice-core = { path = "../lattice-core" }
+# TODO(caps): pick macaroons- vs UCAN-style token format (ADR-003).

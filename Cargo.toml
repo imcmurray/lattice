@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lattice-core",
+    "crates/lattice-identity",
+    "crates/lattice-transport",
+    "crates/lattice-session",
+    "crates/lattice-log",
+    "crates/lattice-caps",
+    "crates/lattice",
+    "examples/chat",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Ian McMurray <ian.mcmurray@gmail.com>"]
+
+# Memory-safety is a first-class requirement: no `unsafe` in any crate we
+# author (DESIGN.md principle #1 / §6.8). Upstream deps may use it; ours may not.
+[workspace.lints.rust]
+unsafe_code = "forbid"

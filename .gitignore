@@ -1,0 +1,5 @@
+/target
+**/*.rs.bk
+
+# Stray file present in the directory before the project existed; not ours.
+/CLAUDE-FABLE-5.md

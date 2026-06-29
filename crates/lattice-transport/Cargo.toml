@@ -1,0 +1,14 @@
+[package]
+name = "lattice-transport"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Lattice: Transport trait + iroh default implementation (the swap seam)."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+lattice-core = { path = "../lattice-core" }
+# TODO(net): iroh (QUIC + holepunch + relay) behind a feature flag; ADR-001.

@@ -1,0 +1,17 @@
+[package]
+name = "lattice-chat-example"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Lattice: north-star validating app — encrypted P2P group chat (scaffold)."
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "lattice-chat"
+path = "src/main.rs"
+
+[dependencies]
+lattice = { path = "../../crates/lattice" }
