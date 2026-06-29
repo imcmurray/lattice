@@ -3,7 +3,7 @@ name = "lattice-transport"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-description = "Lattice: Transport trait + iroh default implementation (the swap seam)."
+description = "Lattice: Transport trait + in-memory loopback impl (iroh QUIC impl next)."
 publish = false
 
 [lints]
@@ -11,4 +11,8 @@ workspace = true
 
 [dependencies]
 lattice-core = { path = "../lattice-core" }
-# TODO(net): iroh (QUIC + holepunch + relay) behind a feature flag; ADR-001.
+tokio = { version = "1", features = ["sync"] }
+# TODO(net): IrohTransport — QUIC + holepunch + relay — as a second impl (ADR-001).
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }

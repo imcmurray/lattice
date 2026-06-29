@@ -9,5 +9,5 @@ pub mod traits;
 pub mod types;
 
 pub use error::{Error, Result};
-pub use traits::{Identity, Log, Session, Stream, Transport, Verify};
+pub use traits::{Connection, Identity, Log, Session, Transport, Verify};
 pub use types::{CryptoSuite, Entry, PeerId, Seq, Signature, Topic};

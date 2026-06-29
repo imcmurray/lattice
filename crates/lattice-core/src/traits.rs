@@ -4,9 +4,17 @@
 use crate::error::Result;
 use crate::types::{Entry, PeerId, Seq, Signature, Topic};
 
-/// Minimal duplex byte-stream marker. Kept dependency-free in the scaffold;
-/// the real impl will bridge to `tokio::io::{AsyncRead, AsyncWrite}`.
-pub trait Stream: Send {}
+/// An established bidirectional connection that carries whole **framed
+/// messages** (not a raw byte stream — the transport owns framing). This keeps
+/// the core dependency-free while the impls bring their own async runtime.
+/// Impls: `MemoryConn` (in-memory loopback) today; iroh QUIC streams next.
+#[allow(async_fn_in_trait)]
+pub trait Connection: Send {
+    /// Send one framed message to the peer.
+    async fn send(&mut self, msg: &[u8]) -> Result<()>;
+    /// Receive the next framed message from the peer.
+    async fn recv(&mut self) -> Result<Vec<u8>>;
+}
 
 /// The signing half of an identity: holds secret key material and produces
 /// signatures. Production identities are post-quantum hybrid (see `CryptoSuite`).
@@ -36,12 +44,12 @@ pub trait Verify {
 /// iroh -> libp2p -> tor-relay is a contained swap (DESIGN.md ADR-001).
 #[allow(async_fn_in_trait)]
 pub trait Transport {
-    /// Connected duplex stream type.
-    type Stream: Stream;
-    /// Open a direct (holepunched, else relayed) stream to a peer.
-    async fn connect(&self, peer: &PeerId) -> Result<Self::Stream>;
-    /// Accept the next inbound stream.
-    async fn accept(&self) -> Result<(PeerId, Self::Stream)>;
+    /// The connection type this transport yields.
+    type Conn: Connection;
+    /// Open a connection to a peer (direct/holepunched, else relayed).
+    async fn connect(&self, peer: &PeerId) -> Result<Self::Conn>;
+    /// Accept the next inbound connection, with the initiator's id.
+    async fn accept(&self) -> Result<(PeerId, Self::Conn)>;
     /// Announce presence on a discovery topic.
     async fn announce(&self, topic: &Topic) -> Result<()>;
     /// Look up peers announcing a topic.

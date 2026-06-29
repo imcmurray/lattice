@@ -16,3 +16,6 @@ lattice-transport = { path = "../lattice-transport" }
 lattice-session = { path = "../lattice-session" }
 lattice-log = { path = "../lattice-log" }
 lattice-caps = { path = "../lattice-caps" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }

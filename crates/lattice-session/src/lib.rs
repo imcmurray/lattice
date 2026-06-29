@@ -24,7 +24,7 @@
 //! documented follow-on. ML-KEM ops live in `lattice-identity`; this crate owns
 //! X25519, the ratchet, and the AEAD.
 
-use lattice_core::{Error, Identity, PeerId, Result, Verify};
+use lattice_core::{Connection, Error, Identity, PeerId, Result, Session, Verify};
 use lattice_identity::{Keypair, PublicIdentity};
 
 use chacha20poly1305::aead::{Aead, Payload};
@@ -310,6 +310,64 @@ fn build_ikm(ss_x: &[u8; 32], ss_pq: Option<&Zeroizing<[u8; 32]>>) -> Zeroizing<
         ikm.extend_from_slice(&pq[..]);
     }
     Zeroizing::new(ikm)
+}
+
+// --- session bound to a transport Connection ------------------------------
+
+fn encode_handshake(hs: &Handshake) -> Vec<u8> {
+    let mut v = Vec::with_capacity(32 + hs.mlkem_ct.len());
+    v.extend_from_slice(&hs.eph_x25519);
+    v.extend_from_slice(&hs.mlkem_ct);
+    v
+}
+
+fn decode_handshake(b: &[u8]) -> Result<Handshake> {
+    if b.len() < 32 {
+        return Err(Error::Verify("short handshake".into()));
+    }
+    let mut eph = [0u8; 32];
+    eph.copy_from_slice(&b[..32]);
+    Ok(Handshake {
+        eph_x25519: eph,
+        mlkem_ct: b[32..].to_vec(),
+    })
+}
+
+/// A [`SecureSession`] bound to a transport [`Connection`]: it performs the
+/// handshake over the wire and then implements the core async [`Session`]
+/// (seal-and-send / receive-and-open). This is the join point between the
+/// crypto and the transport layers.
+pub struct ConnectedSession<C: Connection> {
+    conn: C,
+    session: SecureSession,
+}
+
+impl<C: Connection> ConnectedSession<C> {
+    /// Initiator: send the handshake over `conn`, return the live session.
+    pub async fn initiate(mut conn: C, me: &Keypair, peer: &PublicIdentity) -> Result<Self> {
+        let (hs, session) = SecureSession::initiate(me, peer)?;
+        conn.send(&encode_handshake(&hs)).await?;
+        Ok(Self { conn, session })
+    }
+
+    /// Responder: receive the handshake from `conn`, return the live session.
+    pub async fn accept(mut conn: C, me: &Keypair, peer: &PublicIdentity) -> Result<Self> {
+        let hs = decode_handshake(&conn.recv().await?)?;
+        let session = SecureSession::accept(me, peer, &hs)?;
+        Ok(Self { conn, session })
+    }
+}
+
+impl<C: Connection> Session for ConnectedSession<C> {
+    async fn send(&mut self, plaintext: &[u8]) -> Result<()> {
+        let frame = self.session.seal(plaintext)?;
+        self.conn.send(&frame).await
+    }
+
+    async fn recv(&mut self) -> Result<Vec<u8>> {
+        let frame = self.conn.recv().await?;
+        self.session.open(&frame)
+    }
 }
 
 #[cfg(test)]

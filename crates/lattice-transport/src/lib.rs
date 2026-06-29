@@ -1,31 +1,151 @@
-//! `lattice-transport` — the [`Transport`] trait's default implementation over
-//! iroh (QUIC + holepunch + relay fallback). Stub pending ADR-001 wiring.
+//! `lattice-transport` — the [`Transport`] trait plus an in-memory loopback
+//! implementation for tests and local wiring (DESIGN.md ADR-001).
 //!
-//! This is the single swap seam: alternative impls (libp2p, a Tor/mix relay for
-//! metadata privacy) implement the same trait without touching upper layers.
+//! [`MemoryTransport`] is a real, working [`Transport`]: endpoints register on a
+//! shared [`MemoryNetwork`], `connect` hands one end of an in-process duplex to
+//! the peer's accept queue, and `accept` receives it. It exercises the same
+//! async trait surface the iroh QUIC backend will implement next, so the upper
+//! layers (the session handshake, the app) are written against the trait, not
+//! the backend.
 
-use lattice_core::{PeerId, Result, Stream, Topic, Transport};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
-/// A connected duplex stream. Placeholder until the iroh bridge lands.
-pub struct Conn;
-impl Stream for Conn {}
+use lattice_core::{Connection, Error, PeerId, Result, Topic, Transport};
+use tokio::sync::mpsc;
+use tokio::sync::Mutex as AsyncMutex;
 
-/// Default transport: iroh QUIC with holepunching and relay fallback.
-#[derive(Default)]
-pub struct IrohTransport;
+type Inbox = mpsc::UnboundedSender<(PeerId, MemoryConn)>;
 
-impl Transport for IrohTransport {
-    type Stream = Conn;
-    async fn connect(&self, _peer: &PeerId) -> Result<Conn> {
-        todo!("iroh: resolve endpoint, holepunch (else relay), open stream")
+/// A shared in-process network: a registry of endpoint inboxes by [`PeerId`].
+#[derive(Clone, Default)]
+pub struct MemoryNetwork {
+    listeners: Arc<Mutex<HashMap<PeerId, Inbox>>>,
+}
+
+impl MemoryNetwork {
+    /// Create an empty network.
+    pub fn new() -> Self {
+        Self::default()
     }
-    async fn accept(&self) -> Result<(PeerId, Conn)> {
-        todo!("iroh: accept inbound, verify peer")
+
+    /// Register an endpoint for `id` and return its [`MemoryTransport`] handle.
+    pub fn endpoint(&self, id: PeerId) -> MemoryTransport {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.listeners.lock().unwrap().insert(id.clone(), tx);
+        MemoryTransport {
+            id,
+            net: self.clone(),
+            incoming: AsyncMutex::new(rx),
+        }
     }
+}
+
+/// One end of an in-process duplex connection carrying framed messages.
+pub struct MemoryConn {
+    tx: mpsc::UnboundedSender<Vec<u8>>,
+    rx: mpsc::UnboundedReceiver<Vec<u8>>,
+}
+
+impl MemoryConn {
+    /// Two cross-wired ends: a send on one is a receive on the other.
+    fn pair() -> (Self, Self) {
+        let (t1, r1) = mpsc::unbounded_channel();
+        let (t2, r2) = mpsc::unbounded_channel();
+        (Self { tx: t1, rx: r2 }, Self { tx: t2, rx: r1 })
+    }
+}
+
+impl Connection for MemoryConn {
+    async fn send(&mut self, msg: &[u8]) -> Result<()> {
+        self.tx
+            .send(msg.to_vec())
+            .map_err(|_| Error::Transport("connection closed".into()))
+    }
+
+    async fn recv(&mut self) -> Result<Vec<u8>> {
+        self.rx
+            .recv()
+            .await
+            .ok_or_else(|| Error::Transport("connection closed".into()))
+    }
+}
+
+/// An endpoint on a [`MemoryNetwork`].
+pub struct MemoryTransport {
+    id: PeerId,
+    net: MemoryNetwork,
+    incoming: AsyncMutex<mpsc::UnboundedReceiver<(PeerId, MemoryConn)>>,
+}
+
+impl MemoryTransport {
+    fn inbox_of(&self, peer: &PeerId) -> Result<Inbox> {
+        self.net
+            .listeners
+            .lock()
+            .unwrap()
+            .get(peer)
+            .cloned()
+            .ok_or_else(|| Error::Transport("peer not registered".into()))
+    }
+}
+
+impl Transport for MemoryTransport {
+    type Conn = MemoryConn;
+
+    async fn connect(&self, peer: &PeerId) -> Result<MemoryConn> {
+        let inbox = self.inbox_of(peer)?;
+        let (mine, theirs) = MemoryConn::pair();
+        inbox
+            .send((self.id.clone(), theirs))
+            .map_err(|_| Error::Transport("peer not listening".into()))?;
+        Ok(mine)
+    }
+
+    async fn accept(&self) -> Result<(PeerId, MemoryConn)> {
+        self.incoming
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or_else(|| Error::Transport("endpoint closed".into()))
+    }
+
     async fn announce(&self, _topic: &Topic) -> Result<()> {
-        todo!("iroh/DHT: announce topic membership")
+        Ok(()) // registration is implicit via `endpoint`
     }
+
     async fn lookup(&self, _topic: &Topic) -> Result<Vec<PeerId>> {
-        todo!("iroh/DHT: resolve peers for topic")
+        Ok(self.net.listeners.lock().unwrap().keys().cloned().collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn connect_accept_roundtrip() {
+        let net = MemoryNetwork::new();
+        let alice = PeerId([1u8; 32]);
+        let bob = PeerId([2u8; 32]);
+        let a = net.endpoint(alice.clone());
+        let b = net.endpoint(bob.clone());
+
+        let mut a_conn = a.connect(&bob).await.unwrap();
+        let (from, mut b_conn) = b.accept().await.unwrap();
+        assert_eq!(from, alice);
+
+        a_conn.send(b"ping").await.unwrap();
+        assert_eq!(b_conn.recv().await.unwrap(), b"ping");
+        b_conn.send(b"pong").await.unwrap();
+        assert_eq!(a_conn.recv().await.unwrap(), b"pong");
+    }
+
+    #[tokio::test]
+    async fn connect_unknown_peer_fails() {
+        let net = MemoryNetwork::new();
+        let a = net.endpoint(PeerId([1u8; 32]));
+        assert!(a.connect(&PeerId([9u8; 32])).await.is_err());
     }
 }
