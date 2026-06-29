@@ -12,7 +12,7 @@ workspace = true
 [features]
 default = ["pq"]
 # Post-quantum half of the hybrid. On by default; CryptoSuite::Hybrid requires it.
-pq = ["dep:ml-dsa", "dep:ml-kem"]
+pq = ["dep:ml-dsa", "dep:ml-kem", "dep:getrandom"]
 
 [dependencies]
 lattice-core = { path = "../lattice-core" }
@@ -31,5 +31,6 @@ zeroize = "1"
 # Post-quantum (optional, default-on). FIPS 204 / FIPS 203 (RustCrypto).
 ml-dsa = { version = "0.1", optional = true }
 ml-kem = { version = "0.3", optional = true }
+getrandom = { version = "0.2", optional = true }
 
 [dev-dependencies]

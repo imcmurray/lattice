@@ -36,7 +36,10 @@ use ml_dsa::{
     Verifier as DsaVerifier, VerifyingKey as DsaVerifyingKey,
 };
 #[cfg(feature = "pq")]
-use ml_kem::{DecapsulationKey, KeyExport, MlKem768, Seed as MlKemSeed};
+use ml_kem::{
+    B32 as MlKemB32, Decapsulate, DecapsulationKey, EncapsulationKey, Key as MlKemKey, KeyExport,
+    MlKem768, Seed as MlKemSeed,
+};
 
 #[cfg(feature = "pq")]
 type MlKemDk = DecapsulationKey<MlKem768>;
@@ -157,6 +160,25 @@ impl PublicIdentity {
     /// Encoded ML-KEM encapsulation key (for PQ key agreement); empty if classical.
     pub fn ml_kem_bytes(&self) -> &[u8] {
         &self.ml_kem
+    }
+
+    /// Encapsulate a fresh shared secret to this identity's ML-KEM public key,
+    /// returning `(ciphertext_bytes, shared_secret)`. Used by the session
+    /// initiator (DESIGN.md §5.1, hybrid KEM).
+    #[cfg(feature = "pq")]
+    pub fn pq_encapsulate(&self) -> Result<(Vec<u8>, Zeroizing<[u8; 32]>)> {
+        let key = MlKemKey::<EncapsulationKey<MlKem768>>::try_from(self.ml_kem.as_slice())
+            .map_err(|_| Error::Crypto("malformed ML-KEM encapsulation key".into()))?;
+        let ek = EncapsulationKey::<MlKem768>::new(&key)
+            .map_err(|_| Error::Crypto("invalid ML-KEM encapsulation key".into()))?;
+        let mut m = [0u8; 32];
+        getrandom::getrandom(&mut m).map_err(|e| Error::Crypto(format!("rng: {e}")))?;
+        let mm = MlKemB32::try_from(&m[..]).map_err(|_| Error::Crypto("kem coin".into()))?;
+        m.zeroize();
+        let (ct, ss) = ek.encapsulate_deterministic(&mm);
+        let mut ssb = [0u8; 32];
+        ssb.copy_from_slice(ss.as_slice());
+        Ok((ct.as_slice().to_vec(), Zeroizing::new(ssb)))
     }
 
     fn compute_peer_id(
@@ -285,6 +307,27 @@ impl Keypair {
     /// The backup mnemonic. Treat as a long-lived root secret (ADR-004).
     pub fn mnemonic(&self) -> &str {
         &self.mnemonic
+    }
+
+    /// X25519 Diffie-Hellman between our static agreement secret and a peer's
+    /// public key (session responder / classical half of the hybrid KEM).
+    pub fn x25519_dh(&self, their_public: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+        let sk = x_secret(&self.seed);
+        let ss = sk.diffie_hellman(&XPublicKey::from(*their_public));
+        Zeroizing::new(ss.to_bytes())
+    }
+
+    /// Decapsulate the ML-KEM shared secret from a ciphertext (session
+    /// responder, PQ half of the hybrid KEM).
+    #[cfg(feature = "pq")]
+    pub fn pq_decapsulate(&self, ciphertext: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
+        let dk = mlkem_dk(&self.seed);
+        let ss = dk
+            .decapsulate_slice(ciphertext)
+            .map_err(|_| Error::Crypto("ML-KEM decapsulation failed".into()))?;
+        let mut b = [0u8; 32];
+        b.copy_from_slice(ss.as_slice());
+        Ok(Zeroizing::new(b))
     }
 
     /// Authorize a device's Ed25519 key under this root identity, returning a

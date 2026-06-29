@@ -35,5 +35,18 @@ fn main() -> Result<()> {
     let sig = me.sign(msg);
     println!("Signature verifies: {}", me.public().verify(msg, &sig));
 
+    // Establish a hybrid-KEM (X25519 + ML-KEM-768) secure session with a peer
+    // and exchange an end-to-end encrypted message.
+    let bob = Keypair::generate(CryptoSuite::Hybrid)?;
+    let (handshake, mut alice_session) = SecureSession::initiate(&me, bob.public())?;
+    let mut bob_session = SecureSession::accept(&bob, me.public(), &handshake)?;
+
+    let ciphertext = alice_session.seal(b"meet at the usual place")?;
+    let plaintext = bob_session.open(&ciphertext)?;
+    println!(
+        "Hybrid-KEM session established; Bob decrypted: {:?}",
+        String::from_utf8_lossy(&plaintext)
+    );
+
     Ok(())
 }

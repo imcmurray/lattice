@@ -28,5 +28,6 @@ pub mod prelude {
     };
     pub use lattice_identity::{DeviceCert, Keypair, PublicIdentity};
     pub use lattice_log::MemLog;
+    pub use lattice_session::{Handshake, SecureSession};
     pub use lattice_transport::IrohTransport;
 }

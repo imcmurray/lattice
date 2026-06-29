@@ -154,7 +154,7 @@ Crate status: **pinned & wired** in `lattice-identity` — `ed25519-dalek` 2, `x
 |---|---|---|
 | Identity signatures | Ed25519 + ML-DSA-65 hybrid (AND-verify) | **Done** |
 | Identity key material | carries X25519 + ML-KEM-768 public keys | **Done** (keys derived & published) |
-| Session confidentiality | hybrid KEM handshake (X25519 + ML-KEM-768) → HKDF → ratchet | **Pending** — `lattice-session` stub; **the urgent HNDL gap** |
+| Session confidentiality | hybrid KEM (X25519 + ML-KEM-768) → HKDF combiner → ChaCha20-Poly1305 | **Done** — one-pass handshake + AEAD record layer; per-message ratchet still pending |
 | Transport (iroh/QUIC-TLS) | independent; app-layer session crypto is the real protection | out of our hands; do not rely on it for E2E |
 | Capabilities | signed with the hybrid identity | inherited once caps sign via `Identity` |
 

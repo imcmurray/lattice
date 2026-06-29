@@ -3,12 +3,27 @@ name = "lattice-session"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-description = "Lattice: Noise handshake + Double-Ratchet forward-secret sessions."
+description = "Lattice: hybrid-KEM handshake (X25519 + ML-KEM) + AEAD forward-secret sessions."
 publish = false
 
 [lints]
 workspace = true
 
+[features]
+default = ["pq"]
+# Post-quantum half of the hybrid KEM. Delegated to lattice-identity, which owns
+# the ML-KEM keys; this feature just turns the PQ leg of the handshake on.
+pq = ["lattice-identity/pq"]
+
 [dependencies]
 lattice-core = { path = "../lattice-core" }
-# TODO(crypto): snow (Noise), chacha20poly1305 (AEAD), ratchet impl.
+lattice-identity = { path = "../lattice-identity" }
+
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hkdf = "0.13"
+sha2 = "0.11"
+chacha20poly1305 = "0.10"
+getrandom = "0.2"
+zeroize = "1"
+
+[dev-dependencies]
