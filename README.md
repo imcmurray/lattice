@@ -4,6 +4,10 @@ A security-forward, 100% Rust peer-to-peer application framework — the
 Holepunch/Keet model redesigned with clean trait seams, post-quantum-hybrid
 identity, and a swappable transport substrate.
 
+> **Not a lattice-cryptography library.** "Lattice" refers to the peer-to-peer
+> *mesh* topology — not the lattice-based PQ crypto it happens to use under the
+> hood (ML-KEM / ML-DSA). (Name is a working codename; revisit before any public push.)
+
 > **Status: working v0.1** (local git, no remote). The full stack is implemented
 > and tested — PQ-hybrid identity with BIP39 recovery, a BLAKE3 signed log, a
 > hybrid-KEM + Double-Ratchet secure channel, capability tokens, and both an
