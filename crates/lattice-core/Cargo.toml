@@ -3,6 +3,7 @@ name = "lattice-core"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
 description = "Lattice: shared types, error model, and trait contracts."
 publish = false
 

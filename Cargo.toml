@@ -15,6 +15,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 authors = ["Ian McMurray <ian.mcmurray@gmail.com>"]
+license = "MIT"
 
 # Memory-safety is a first-class requirement: no `unsafe` in any crate we
 # author (DESIGN.md principle #1 / §6.8). Upstream deps may use it; ours may not.

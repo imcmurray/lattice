@@ -3,6 +3,7 @@ name = "lattice-transport"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
 description = "Lattice: Transport trait, in-memory loopback impl, and iroh QUIC backend."
 publish = false
 

@@ -3,6 +3,7 @@ name = "lattice"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
 description = "Lattice: security-forward, 100% Rust peer-to-peer application framework."
 publish = false
 

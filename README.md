@@ -89,3 +89,23 @@ if either restarted and lost its state, they fall back to a fresh handshake. The
 persistent identity keeps each side's PeerId stable across reconnects. Press
 Ctrl-D on either side to quit.
 
+## Acknowledgements
+
+Lattice stands on the shoulders of excellent open-source work — sincere thanks
+to the people behind these projects:
+
+- **[iroh](https://github.com/n0-computer/iroh)** (n0) — QUIC peer-to-peer transport, relays, and hole-punching.
+- **[RustCrypto](https://github.com/RustCrypto)** — `ml-kem` &amp; `ml-dsa` (ML-KEM / ML-DSA), `sha2`, `hkdf`, `chacha20poly1305`, and `zeroize`.
+- **[dalek-cryptography](https://github.com/dalek-cryptography)** — `ed25519-dalek` and `x25519-dalek`.
+- **[BLAKE3](https://github.com/BLAKE3-team/BLAKE3)** — the hash behind the append-only log.
+- **[age](https://github.com/str4d/rage)** (str4d; spec by @FiloSottile) — at-rest encryption of the identity mnemonic.
+- **[keyring-rs](https://crates.io/crates/keyring)** — cross-platform OS keychain access.
+- **[bip39](https://crates.io/crates/bip39)** — mnemonic identity recovery.
+- **[Tokio](https://github.com/tokio-rs/tokio)** — the async runtime.
+
+…and the wider Rust ecosystem (`serde`, `postcard`, `hex`, `rpassword`, and more). Any mistakes in how we use these are ours, not theirs.
+
+## License
+
+[MIT](./LICENSE) © 2026 Ian McMurray. The post-quantum guarantees, of course, are courtesy of mathematics, which is unlicensed.
+

@@ -3,6 +3,7 @@ name = "lattice-identity"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
 description = "Lattice: post-quantum hybrid keypair = identity (BIP39 + HKDF derived)."
 publish = false
 
