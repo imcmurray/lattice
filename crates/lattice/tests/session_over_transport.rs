@@ -18,7 +18,11 @@ async fn encrypted_session_over_memory_transport() {
     // Connect: Alice dials Bob; Bob accepts.
     let alice_conn = alice_ep.connect(&bob.peer_id()).await.unwrap();
     let (from, bob_conn) = bob_ep.accept().await.unwrap();
-    assert_eq!(from, alice.peer_id(), "accepted connection reports the dialer");
+    assert_eq!(
+        from,
+        alice.peer_id(),
+        "accepted connection reports the dialer"
+    );
 
     // Run the handshake over the connection.
     let mut a = ConnectedSession::initiate(alice_conn, &alice, bob.public())
@@ -52,8 +56,12 @@ async fn session_resumes_across_a_dropped_connection() {
     // Initial connect + handshake + a round-trip.
     let aconn = alice_ep.connect(&bob.peer_id()).await.unwrap();
     let (_, bconn) = bob_ep.accept().await.unwrap();
-    let mut a = ConnectedSession::initiate(aconn, &alice, bob.public()).await.unwrap();
-    let mut b = ConnectedSession::accept(bconn, &bob, alice.public()).await.unwrap();
+    let mut a = ConnectedSession::initiate(aconn, &alice, bob.public())
+        .await
+        .unwrap();
+    let mut b = ConnectedSession::accept(bconn, &bob, alice.public())
+        .await
+        .unwrap();
     a.send(b"msg-1").await.unwrap();
     assert_eq!(b.recv().await.unwrap(), b"msg-1");
     b.send(b"reply-1").await.unwrap();
@@ -88,8 +96,12 @@ async fn resume_tolerates_a_frame_lost_in_the_gap() {
 
     let aconn = alice_ep.connect(&bob.peer_id()).await.unwrap();
     let (_, bconn) = bob_ep.accept().await.unwrap();
-    let mut a = ConnectedSession::initiate(aconn, &alice, bob.public()).await.unwrap();
-    let mut b = ConnectedSession::accept(bconn, &bob, alice.public()).await.unwrap();
+    let mut a = ConnectedSession::initiate(aconn, &alice, bob.public())
+        .await
+        .unwrap();
+    let mut b = ConnectedSession::accept(bconn, &bob, alice.public())
+        .await
+        .unwrap();
     a.send(b"delivered").await.unwrap();
     assert_eq!(b.recv().await.unwrap(), b"delivered");
 

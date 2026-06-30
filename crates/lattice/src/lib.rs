@@ -22,11 +22,11 @@ pub use lattice_transport as transport;
 
 /// Common imports for building a Lattice app.
 pub mod prelude {
+    pub use lattice_caps::{Action, Capability, ResourceId};
     pub use lattice_core::{
         Connection, CryptoSuite, Entry, Error, Identity, Log, PeerId, Result, Seq, Session,
         Signature, Topic, Transport, Verify,
     };
-    pub use lattice_caps::{Action, Capability, ResourceId};
     pub use lattice_identity::{DeviceCert, Keypair, PublicIdentity};
     pub use lattice_log::MemLog;
     pub use lattice_session::{ConnectedSession, Handshake, SecureSession};

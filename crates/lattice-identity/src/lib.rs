@@ -35,14 +35,14 @@ use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(feature = "pq")]
 use ml_dsa::{
-    B32, EncodedVerifyingKey as DsaEncodedVk, Keypair as DsaKeypair, MlDsa65,
-    Signature as DsaSignature, SignatureEncoding, Signer as DsaSigner, SigningKey as DsaSigningKey,
-    Verifier as DsaVerifier, VerifyingKey as DsaVerifyingKey,
+    EncodedVerifyingKey as DsaEncodedVk, Keypair as DsaKeypair, MlDsa65, Signature as DsaSignature,
+    SignatureEncoding, Signer as DsaSigner, SigningKey as DsaSigningKey, Verifier as DsaVerifier,
+    VerifyingKey as DsaVerifyingKey, B32,
 };
 #[cfg(feature = "pq")]
 use ml_kem::{
-    B32 as MlKemB32, Decapsulate, DecapsulationKey, EncapsulationKey, Key as MlKemKey, KeyExport,
-    MlKem768, Seed as MlKemSeed,
+    Decapsulate, DecapsulationKey, EncapsulationKey, Key as MlKemKey, KeyExport, MlKem768,
+    Seed as MlKemSeed, B32 as MlKemB32,
 };
 
 #[cfg(feature = "pq")]
@@ -58,7 +58,8 @@ const DEVICE_CERT_DOMAIN: &[u8] = b"lattice-device-cert-v1";
 
 fn hkdf_expand(seed: &[u8; 64], info: &[u8], out: &mut [u8]) {
     let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), seed);
-    hk.expand(info, out).expect("HKDF expand length within bounds");
+    hk.expand(info, out)
+        .expect("HKDF expand length within bounds");
 }
 
 fn ed_signing(seed: &[u8; 64]) -> EdSigningKey {
@@ -345,7 +346,8 @@ impl Keypair {
     /// Recover an identity from its BIP39 mnemonic. Reproduces the same keys
     /// and [`PeerId`] as the original (DESIGN.md ADR-004 recovery).
     pub fn from_mnemonic(suite: CryptoSuite, phrase: &str) -> Result<Self> {
-        let m = Mnemonic::parse(phrase).map_err(|e| Error::Crypto(format!("mnemonic parse: {e}")))?;
+        let m =
+            Mnemonic::parse(phrase).map_err(|e| Error::Crypto(format!("mnemonic parse: {e}")))?;
         Self::from_parsed(suite, m)
     }
 
@@ -566,7 +568,11 @@ mod tests {
         let kp = Keypair::generate(CryptoSuite::Hybrid).unwrap();
         let bytes = kp.public().to_bytes();
         let parsed = PublicIdentity::from_bytes(&bytes).unwrap();
-        assert_eq!(parsed.peer_id(), kp.peer_id(), "round-trip preserves identity");
+        assert_eq!(
+            parsed.peer_id(),
+            kp.peer_id(),
+            "round-trip preserves identity"
+        );
         // A signature from the original verifies under the parsed public id.
         let sig = kp.sign(b"wire");
         assert!(parsed.verify(b"wire", &sig));
@@ -578,7 +584,10 @@ mod tests {
         let device = Keypair::generate(CryptoSuite::Hybrid).unwrap();
         let cert = root.authorize_device(device.public().ed25519_bytes());
 
-        assert!(cert.verify(root.public()), "cert must verify under its root");
+        assert!(
+            cert.verify(root.public()),
+            "cert must verify under its root"
+        );
 
         let imposter = Keypair::generate(CryptoSuite::Hybrid).unwrap();
         assert!(

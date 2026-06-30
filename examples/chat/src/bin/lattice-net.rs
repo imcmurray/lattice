@@ -55,7 +55,11 @@ async fn run() -> Result<()> {
     // Persistent identity: OS keychain if available, else an age-encrypted file.
     let loaded = IdentityStore::open_default().load_or_create(CryptoSuite::Hybrid)?;
     let me = loaded.keypair;
-    let note = if loaded.created { " (new identity created)" } else { "" };
+    let note = if loaded.created {
+        " (new identity created)"
+    } else {
+        ""
+    };
     eprintln!(
         "[lattice-net] identity {:?} [stored via {:?}]{note}",
         me.peer_id(),
@@ -147,7 +151,10 @@ async fn accept_or_resume(
     if mode == MODE_RESUME {
         if let Some(sess) = sessions.remove(&peer_id) {
             conn.send(&[DECISION_RESUMED]).await?;
-            eprintln!("[lattice-net] {:?} resumed — no re-handshake — type messages:", peer_id);
+            eprintln!(
+                "[lattice-net] {:?} resumed — no re-handshake — type messages:",
+                peer_id
+            );
             return Ok((peer_id, ConnectedSession::resume(conn, sess)));
         }
     }
@@ -155,7 +162,10 @@ async fn accept_or_resume(
     sessions.remove(&peer_id); // drop any stale session for this peer
     conn.send(&[DECISION_FRESH]).await?;
     let cs = ConnectedSession::accept(conn, me, &peer).await?;
-    eprintln!("[lattice-net] {:?} connected (fresh session) — type messages:", peer_id);
+    eprintln!(
+        "[lattice-net] {:?} connected (fresh session) — type messages:",
+        peer_id
+    );
     Ok((peer_id, cs))
 }
 
@@ -198,7 +208,11 @@ async fn dial_once(
     let peer = PublicIdentity::from_bytes(&peer_bytes)?;
 
     // Preamble: [mode] ++ our identity bundle. Resume if we kept a session.
-    let mode = if kept.is_some() { MODE_RESUME } else { MODE_FRESH };
+    let mode = if kept.is_some() {
+        MODE_RESUME
+    } else {
+        MODE_FRESH
+    };
     let mut preamble = vec![mode];
     preamble.extend_from_slice(&me.public().to_bytes());
     conn.send(&preamble).await?;
@@ -208,14 +222,20 @@ async fn dial_once(
 
     let cs = if resumed {
         let sess = kept.take().expect("resume decision implies a kept session");
-        eprintln!("[lattice-net] resumed with {:?} — no re-handshake — type messages:", peer.peer_id());
+        eprintln!(
+            "[lattice-net] resumed with {:?} — no re-handshake — type messages:",
+            peer.peer_id()
+        );
         ConnectedSession::resume(conn, sess)
     } else {
         if kept.take().is_some() {
             eprintln!("[lattice-net] peer couldn't resume — fresh handshake");
         }
         let cs = ConnectedSession::initiate(conn, me, &peer).await?;
-        eprintln!("[lattice-net] connected to {:?} (fresh session) — type messages:", peer.peer_id());
+        eprintln!(
+            "[lattice-net] connected to {:?} (fresh session) — type messages:",
+            peer.peer_id()
+        );
         cs
     };
 

@@ -145,7 +145,10 @@ mod tests {
     fn issue_and_verify() {
         let (owner, grantee, res) = setup();
         let cap = Capability::issue(&owner, grantee.peer_id(), res, Action::Append);
-        assert!(cap.verify(owner.public()), "valid cap verifies under issuer");
+        assert!(
+            cap.verify(owner.public()),
+            "valid cap verifies under issuer"
+        );
 
         let imposter = Keypair::generate(CryptoSuite::Hybrid).unwrap();
         assert!(

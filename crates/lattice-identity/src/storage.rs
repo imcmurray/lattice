@@ -109,21 +109,36 @@ impl IdentityStore {
             let backend = self.persist(&phrase)?;
             let bak = self.dir.join("identity.legacy.bak");
             let _ = std::fs::rename(&legacy, &bak);
-            return Ok(LoadedIdentity { keypair, backend, created: false, migrated: true });
+            return Ok(LoadedIdentity {
+                keypair,
+                backend,
+                created: false,
+                migrated: true,
+            });
         }
 
         // Load an existing identity.
         if let Some(phrase) = self.try_load(&cfg)? {
             let keypair = Keypair::from_mnemonic(suite, &phrase)?;
             let backend = cfg.backend.unwrap_or(StorageBackend::Keyring);
-            return Ok(LoadedIdentity { keypair, backend, created: false, migrated: false });
+            return Ok(LoadedIdentity {
+                keypair,
+                backend,
+                created: false,
+                migrated: false,
+            });
         }
 
         // First run: generate and persist.
         let keypair = Keypair::generate(suite)?;
         let phrase = Zeroizing::new(keypair.mnemonic().to_string());
         let backend = self.persist(&phrase)?;
-        Ok(LoadedIdentity { keypair, backend, created: true, migrated: false })
+        Ok(LoadedIdentity {
+            keypair,
+            backend,
+            created: true,
+            migrated: false,
+        })
     }
 
     fn try_load(&self, cfg: &Config) -> Result<Option<Zeroizing<String>>> {
@@ -191,7 +206,9 @@ impl IdentityStore {
     }
 
     fn write_config(&self, backend: StorageBackend) -> Result<()> {
-        let cfg = Config { backend: Some(backend) };
+        let cfg = Config {
+            backend: Some(backend),
+        };
         let s = toml::to_string(&cfg).map_err(|e| Error::Other(format!("config encode: {e}")))?;
         std::fs::write(self.config_path(), s).map_err(|e| io("write config", e))
     }
@@ -201,7 +218,9 @@ impl IdentityStore {
 
 /// Whether to try the OS keychain (disabled by `LATTICE_STORAGE=age`).
 fn keyring_enabled() -> bool {
-    std::env::var("LATTICE_STORAGE").map(|v| v != "age").unwrap_or(true)
+    std::env::var("LATTICE_STORAGE")
+        .map(|v| v != "age")
+        .unwrap_or(true)
 }
 
 fn keyring_save(mnemonic: &str) -> bool {
@@ -287,7 +306,11 @@ mod tests {
 
         let again = store.load_or_create(CryptoSuite::Hybrid).unwrap();
         assert!(!again.created);
-        assert_eq!(first.keypair.peer_id(), again.keypair.peer_id(), "stable identity");
+        assert_eq!(
+            first.keypair.peer_id(),
+            again.keypair.peer_id(),
+            "stable identity"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -306,10 +329,20 @@ mod tests {
         let store = IdentityStore::with_dir(tmp.clone());
         let loaded = store.load_or_create(CryptoSuite::Hybrid).unwrap();
         assert!(loaded.migrated);
-        assert_eq!(loaded.keypair.peer_id(), original.peer_id(), "migration preserves identity");
+        assert_eq!(
+            loaded.keypair.peer_id(),
+            original.peer_id(),
+            "migration preserves identity"
+        );
         assert!(tmp.join("identity.age").exists(), "re-encrypted");
-        assert!(tmp.join("identity.legacy.bak").exists(), "plaintext backed up, not deleted");
-        assert!(!tmp.join("identity").exists(), "plaintext removed from active path");
+        assert!(
+            tmp.join("identity.legacy.bak").exists(),
+            "plaintext backed up, not deleted"
+        );
+        assert!(
+            !tmp.join("identity").exists(),
+            "plaintext removed from active path"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

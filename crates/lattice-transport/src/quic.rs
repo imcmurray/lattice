@@ -38,7 +38,9 @@ pub async fn write_frame(s: &mut SendStream, msg: &[u8]) -> Result<()> {
 /// Read one length-prefixed frame from a QUIC recv stream.
 pub async fn read_frame(r: &mut RecvStream) -> Result<Vec<u8>> {
     let mut len = [0u8; 4];
-    r.read_exact(&mut len).await.map_err(|e| terr("read len", e))?;
+    r.read_exact(&mut len)
+        .await
+        .map_err(|e| terr("read len", e))?;
     let n = u32::from_be_bytes(len) as usize;
     let mut buf = vec![0u8; n];
     r.read_exact(&mut buf)
@@ -135,7 +137,11 @@ impl Transport for IrohTransport {
     async fn connect(&self, peer: &PeerId) -> Result<IrohConn> {
         // Connect by endpoint id (relies on discovery to resolve the address).
         let id = EndpointId::from_bytes(&peer.0).map_err(|e| terr("endpoint id", e))?;
-        let conn = self.ep.connect(id, ALPN).await.map_err(|e| terr("connect", e))?;
+        let conn = self
+            .ep
+            .connect(id, ALPN)
+            .await
+            .map_err(|e| terr("connect", e))?;
         let (send, recv) = conn.open_bi().await.map_err(|e| terr("open_bi", e))?;
         Ok(IrohConn { send, recv })
     }

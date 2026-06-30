@@ -131,7 +131,11 @@ struct KemInit {
 impl SecureSession {
     /// Initiator side: produce a [`Handshake`] and the local session.
     pub fn initiate(me: &Keypair, peer: &PublicIdentity) -> Result<(Handshake, Self)> {
-        let KemInit { eph_pub, mlkem_ct, root: sk } = kem_initiate(me, peer)?;
+        let KemInit {
+            eph_pub,
+            mlkem_ct,
+            root: sk,
+        } = kem_initiate(me, peer)?;
 
         // Double Ratchet init (Alice): fresh ratchet key, peer's static as DHr.
         let (dhs, dhs_pub) = gen_ratchet_key()?;
@@ -149,9 +153,16 @@ impl SecureSession {
             nr: 0,
             pn: 0,
         };
-        let session = Self { core, skipped: Skipped::default() };
+        let session = Self {
+            core,
+            skipped: Skipped::default(),
+        };
         Ok((
-            Handshake { eph_x25519: eph_pub, ratchet_pub: dhs_pub, mlkem_ct },
+            Handshake {
+                eph_x25519: eph_pub,
+                ratchet_pub: dhs_pub,
+                mlkem_ct,
+            },
             session,
         ))
     }
@@ -177,17 +188,19 @@ impl SecureSession {
         // receiving chain (matching the initiator's sending chain) and a fresh
         // sending chain, so we can send before receiving.
         dh_ratchet(&mut core, hs.ratchet_pub)?;
-        Ok(Self { core, skipped: Skipped::default() })
+        Ok(Self {
+            core,
+            skipped: Skipped::default(),
+        })
     }
 
     /// Encrypt the next outbound message. Output is `header ‖ ciphertext`, with
     /// the header (ratchet pubkey, counters) authenticated as AAD.
     pub fn seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
         let c = &mut self.core;
-        let ck = c
-            .cks
-            .clone()
-            .ok_or_else(|| Error::Crypto("no sending chain yet (receive a message first)".into()))?;
+        let ck = c.cks.clone().ok_or_else(|| {
+            Error::Crypto("no sending chain yet (receive a message first)".into())
+        })?;
         let (mk, next) = chain_step(&ck);
 
         let mut header = Vec::with_capacity(HEADER_LEN);
@@ -263,7 +276,11 @@ impl SecureSession {
 /// Derive (and stash) receiving-chain message keys for indices `[nr, until)`,
 /// advancing the chain. Bounded by `MAX_SKIP` to prevent a forged header from
 /// forcing unbounded key derivation.
-fn skip_recv(w: &mut RatchetCore, fresh: &mut Vec<(SkippedId, MessageKey)>, until: u64) -> Result<()> {
+fn skip_recv(
+    w: &mut RatchetCore,
+    fresh: &mut Vec<(SkippedId, MessageKey)>,
+    until: u64,
+) -> Result<()> {
     if until <= w.nr {
         return Ok(()); // target is current or already passed (replay handled in open)
     }
@@ -328,7 +345,11 @@ fn kem_initiate(me: &Keypair, peer: &PublicIdentity) -> Result<KemInit> {
 
     let transcript = transcript(&me.peer_id(), &peer.peer_id(), &eph_pub, &mlkem_ct);
     let root = root_key(&build_ikm(&ss_x, ss_pq.as_ref()), &transcript);
-    Ok(KemInit { eph_pub, mlkem_ct, root })
+    Ok(KemInit {
+        eph_pub,
+        mlkem_ct,
+        root,
+    })
 }
 
 fn kem_accept(me: &Keypair, peer: &PublicIdentity, hs: &Handshake) -> Result<Zeroizing<[u8; 32]>> {
@@ -364,7 +385,8 @@ fn chain_step(ck: &[u8; 32]) -> (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) {
     let mut mk = [0u8; 32];
     let mut next = [0u8; 32];
     hk.expand(b"lattice/ratchet/mk", &mut mk).expect("hkdf len");
-    hk.expand(b"lattice/ratchet/ck", &mut next).expect("hkdf len");
+    hk.expand(b"lattice/ratchet/ck", &mut next)
+        .expect("hkdf len");
     (Zeroizing::new(mk), Zeroizing::new(next))
 }
 
@@ -388,7 +410,8 @@ fn gen_ratchet_key() -> Result<(XStaticSecret, [u8; 32])> {
 fn root_key(ikm: &[u8], transcript: &[u8]) -> Zeroizing<[u8; 32]> {
     let hk = Hkdf::<Sha256>::new(Some(transcript), ikm);
     let mut sk = [0u8; 32];
-    hk.expand(b"lattice/session/root", &mut sk).expect("hkdf len");
+    hk.expand(b"lattice/session/root", &mut sk)
+        .expect("hkdf len");
     Zeroizing::new(sk)
 }
 
@@ -397,14 +420,26 @@ fn root_key(ikm: &[u8], transcript: &[u8]) -> Zeroizing<[u8; 32]> {
 fn aead_seal(mk: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
     ChaCha20Poly1305::new_from_slice(mk)
         .expect("32-byte key")
-        .encrypt(Nonce::from_slice(&[0u8; 12]), Payload { msg: plaintext, aad })
+        .encrypt(
+            Nonce::from_slice(&[0u8; 12]),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| Error::Crypto("AEAD seal failed".into()))
 }
 
 fn aead_open(mk: &[u8; 32], aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
     ChaCha20Poly1305::new_from_slice(mk)
         .expect("32-byte key")
-        .decrypt(Nonce::from_slice(&[0u8; 12]), Payload { msg: ciphertext, aad })
+        .decrypt(
+            Nonce::from_slice(&[0u8; 12]),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .map_err(|_| Error::Verify("AEAD open failed (tampered or wrong key)".into()))
 }
 
@@ -616,7 +651,10 @@ mod tests {
             last = a.seal(format!("m{i}").as_bytes()).unwrap();
         }
         // First message Bob sees is index MAX_SKIP+1 → gap exceeds the cap.
-        assert!(b.open(&last).is_err(), "gap beyond MAX_SKIP must be rejected");
+        assert!(
+            b.open(&last).is_err(),
+            "gap beyond MAX_SKIP must be rejected"
+        );
     }
 
     #[test]
@@ -630,7 +668,11 @@ mod tests {
         let last = bad.len() - 1;
         bad[last] ^= 0x01;
         assert!(b.open(&bad).is_err(), "tampered frame must fail");
-        assert_eq!(b.open(&m1).unwrap(), b"one", "chain not desynced by failure");
+        assert_eq!(
+            b.open(&m1).unwrap(),
+            b"one",
+            "chain not desynced by failure"
+        );
     }
 
     #[test]
@@ -639,6 +681,9 @@ mod tests {
         let (hs, mut a) = SecureSession::initiate(&alice, bob.public()).unwrap();
         let mut e = SecureSession::accept(&eve, alice.public(), &hs).unwrap();
         let ct = a.seal(b"for bob only").unwrap();
-        assert!(e.open(&ct).is_err(), "non-intended responder must not decrypt");
+        assert!(
+            e.open(&ct).is_err(),
+            "non-intended responder must not decrypt"
+        );
     }
 }
