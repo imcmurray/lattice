@@ -482,6 +482,20 @@ impl<C: Connection> ConnectedSession<C> {
     pub fn into_parts(self) -> (C, SecureSession) {
         (self.conn, self.session)
     }
+
+    /// Resume an existing [`SecureSession`] over a fresh connection **without
+    /// re-handshaking** (session resumption after a transport drop).
+    ///
+    /// The ratchet is transport-independent, so the channel simply continues:
+    /// counters and chains carry over, and the skipped-key cache absorbs any
+    /// frames lost during the gap (no desync). Both peers must still hold their
+    /// ratchet state — if either restarted (lost its in-memory session), do a
+    /// fresh [`ConnectedSession::initiate`]/[`ConnectedSession::accept`] instead.
+    /// Note: a message in flight at the moment of the drop is *not* recovered;
+    /// reliable redelivery (acks/resend) is a separate layer.
+    pub fn resume(conn: C, session: SecureSession) -> Self {
+        Self { conn, session }
+    }
 }
 
 impl<C: Connection> Session for ConnectedSession<C> {
