@@ -74,9 +74,11 @@ recoverable from the mnemonic. The ticket carries A's address + public
 identity so B can authenticate the handshake (trust-on-first-use). Both machines
 need outbound internet to reach the n0 relays for discovery/holepunching.
 
-**Reconnect:** the session survives drops. If the connection breaks, the
-listener returns to waiting and the dialer re-dials the same ticket with
-exponential backoff (1→30s), then both re-handshake into a fresh session — no
-restart needed (the persistent identity keeps each side's PeerId stable across
-reconnects). Press Ctrl-D on either side to quit.
+**Reconnect & resume:** the session survives drops. If the connection breaks,
+the listener returns to waiting and the dialer re-dials the same ticket with
+exponential backoff (1→30s). If both sides still hold their session (a transient
+network blip), they **resume the same ratchet with no re-handshake** (ADR-006);
+if either restarted and lost its state, they fall back to a fresh handshake. The
+persistent identity keeps each side's PeerId stable across reconnects. Press
+Ctrl-D on either side to quit.
 
