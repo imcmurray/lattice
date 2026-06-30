@@ -1,14 +1,21 @@
 # Lattice (working name)
 
+[![CI](https://github.com/imcmurray/lattice/actions/workflows/ci.yml/badge.svg)](https://github.com/imcmurray/lattice/actions/workflows/ci.yml)
+[![Live demo](https://img.shields.io/badge/demo-imcmurray.github.io%2Flattice-35e0d0?logo=github&logoColor=white)](https://imcmurray.github.io/lattice/)
+[![Built with Rust](https://img.shields.io/badge/built%20with-Rust-9d8bff?logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![status: experimental](https://img.shields.io/badge/status-experimental%20%C2%B7%20unaudited-e8a33d)](#status)
+
+**🔗 Live demo &amp; docs: [imcmurray.github.io/lattice](https://imcmurray.github.io/lattice/)** — or build it yourself below.
+
 A security-forward, 100% Rust peer-to-peer application framework — the
 Holepunch/Keet model redesigned with clean trait seams, post-quantum-hybrid
 identity, and a swappable transport substrate.
 
 > **Not a lattice-cryptography library.** "Lattice" refers to the peer-to-peer
 > *mesh* topology — not the lattice-based PQ crypto it happens to use under the
-> hood (ML-KEM / ML-DSA). (Name is a working codename; revisit before any public push.)
+> hood (ML-KEM / ML-DSA). "Lattice" is a working codename and may be renamed.
 
-> **Status: working v0.1** (local git, no remote). The full stack is implemented
+> **Status: working v0.1** (public, experimental). The full stack is implemented
 > and tested — PQ-hybrid identity with BIP39 recovery, a BLAKE3 signed log, a
 > hybrid-KEM + Double-Ratchet secure channel, capability tokens, and both an
 > in-memory and an iroh QUIC transport. The `lattice-net` CLI does real
