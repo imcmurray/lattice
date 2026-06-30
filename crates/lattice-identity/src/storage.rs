@@ -5,6 +5,8 @@
 //!
 //! - **Keyring (primary):** the OS keychain (macOS Keychain, Windows Credential
 //!   Manager, Linux Secret Service). Seamless, no passphrase. Used when available.
+//!   The entry is stored under service `lattice`, account `identity-mnemonic`
+//!   (look there in your OS keychain manager).
 //! - **age file (fallback):** an `age` scrypt/passphrase-encrypted file at
 //!   `<dir>/identity.age`, for headless/server hosts with no keychain. The
 //!   passphrase comes from `LATTICE_PASSPHRASE` or an interactive prompt.

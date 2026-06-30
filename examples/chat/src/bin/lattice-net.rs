@@ -40,18 +40,19 @@ async fn run() -> Result<()> {
     // Persistent identity: OS keychain if available, else an age-encrypted file.
     let loaded = IdentityStore::open_default().load_or_create(CryptoSuite::Hybrid)?;
     let me = loaded.keypair;
-    let note = if loaded.created {
-        " (new identity created)"
-    } else if loaded.migrated {
-        " (migrated from legacy plaintext → re-encrypted)"
-    } else {
-        ""
-    };
+    let note = if loaded.created { " (new identity created)" } else { "" };
     eprintln!(
         "[lattice-net] identity {:?} [stored via {:?}]{note}",
         me.peer_id(),
         loaded.backend
     );
+    if loaded.migrated {
+        eprintln!(
+            "[lattice-net] ⚠ migrated your legacy plaintext identity into secure storage ({:?}). \
+             The old file is backed up at <dir>/identity.legacy.bak — delete it once you've confirmed things work.",
+            loaded.backend
+        );
+    }
 
     // Read stdin once and reuse it across reconnects (typed input isn't lost).
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
