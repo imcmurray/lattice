@@ -9,6 +9,7 @@
 
 use iroh::endpoint::presets;
 pub use iroh::endpoint::{RecvStream, SendStream};
+use iroh::endpoint::Connection as IrohConnection;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use lattice_core::{Connection, Error, PeerId, Result, Topic, Transport};
 use serde::{Deserialize, Serialize};
@@ -49,8 +50,47 @@ pub async fn read_frame(r: &mut RecvStream) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// A snapshot of a live connection's selected-path health.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkInfo {
+    /// `true` if the selected path is a direct (hole-punched / LAN) IP path;
+    /// `false` if traffic is currently relayed.
+    pub direct: bool,
+    /// Round-trip time in milliseconds on the selected path, once measured.
+    pub rtt_ms: Option<u64>,
+}
+
+/// A lightweight, clonable handle for querying a live connection's link health
+/// without owning its streams (the connection stays alive through the streams).
+/// Lets a caller poll path + latency after [`IrohConn::into_split`].
+#[derive(Clone)]
+pub struct ConnHandle(IrohConnection);
+
+impl ConnHandle {
+    /// Snapshot the currently selected path's kind (direct vs relay) and RTT.
+    /// Re-read live on each call, so it reflects a relay→direct upgrade.
+    pub fn link(&self) -> LinkInfo {
+        let paths = self.0.paths();
+        let chosen = paths
+            .iter()
+            .find(|p| p.is_selected())
+            .or_else(|| paths.iter().next());
+        match chosen {
+            Some(p) => {
+                let ms = p.rtt().as_millis() as u64;
+                LinkInfo {
+                    direct: p.is_ip(),
+                    rtt_ms: (ms != 0).then_some(ms),
+                }
+            }
+            None => LinkInfo { direct: false, rtt_ms: None },
+        }
+    }
+}
+
 /// A framed connection over an iroh QUIC bi-stream.
 pub struct IrohConn {
+    conn: IrohConnection,
     send: SendStream,
     recv: RecvStream,
 }
@@ -60,6 +100,11 @@ impl IrohConn {
     /// stays compatible with [`write_frame`]/[`read_frame`]).
     pub fn into_split(self) -> (SendStream, RecvStream) {
         (self.send, self.recv)
+    }
+
+    /// A clonable handle to keep querying link health after [`IrohConn::into_split`].
+    pub fn handle(&self) -> ConnHandle {
+        ConnHandle(self.conn.clone())
     }
 }
 
@@ -115,7 +160,7 @@ impl IrohTransport {
             .await
             .map_err(|e| terr("connect", e))?;
         let (send, recv) = conn.open_bi().await.map_err(|e| terr("open_bi", e))?;
-        Ok((t.app_identity, IrohConn { send, recv }))
+        Ok((t.app_identity, IrohConn { conn, send, recv }))
     }
 
     /// Accept one inbound connection's first bi-stream.
@@ -127,7 +172,7 @@ impl IrohTransport {
             .ok_or_else(|| Error::Transport("endpoint closed".into()))?;
         let conn = incoming.await.map_err(|e| terr("accept", e))?;
         let (send, recv) = conn.accept_bi().await.map_err(|e| terr("accept_bi", e))?;
-        Ok(IrohConn { send, recv })
+        Ok(IrohConn { conn, send, recv })
     }
 }
 
@@ -143,7 +188,7 @@ impl Transport for IrohTransport {
             .await
             .map_err(|e| terr("connect", e))?;
         let (send, recv) = conn.open_bi().await.map_err(|e| terr("open_bi", e))?;
-        Ok(IrohConn { send, recv })
+        Ok(IrohConn { conn, send, recv })
     }
 
     async fn accept(&self) -> Result<(PeerId, IrohConn)> {
@@ -155,7 +200,7 @@ impl Transport for IrohTransport {
         let conn = incoming.await.map_err(|e| terr("accept", e))?;
         let peer = PeerId(*conn.remote_id().as_bytes());
         let (send, recv) = conn.accept_bi().await.map_err(|e| terr("accept_bi", e))?;
-        Ok((peer, IrohConn { send, recv }))
+        Ok((peer, IrohConn { conn, send, recv }))
     }
 
     async fn announce(&self, _topic: &Topic) -> Result<()> {
