@@ -60,6 +60,9 @@ type SkippedId = ([u8; 32], u64);
 pub struct Handshake {
     /// Ephemeral X25519 public key (KEM handshake).
     pub eph_x25519: [u8; 32],
+    /// Initiator's initial DH-ratchet public key — lets the responder ratchet
+    /// immediately at accept, so either side may send first.
+    pub ratchet_pub: [u8; 32],
     /// ML-KEM ciphertext (empty when the `pq` feature is off).
     pub mlkem_ct: Vec<u8>,
 }
@@ -147,14 +150,19 @@ impl SecureSession {
             pn: 0,
         };
         let session = Self { core, skipped: Skipped::default() };
-        Ok((Handshake { eph_x25519: eph_pub, mlkem_ct }, session))
+        Ok((
+            Handshake { eph_x25519: eph_pub, ratchet_pub: dhs_pub, mlkem_ct },
+            session,
+        ))
     }
 
     /// Responder side: consume the [`Handshake`] and derive the session. The
-    /// responder has no sending chain until it receives the first message.
+    /// handshake carries the initiator's initial ratchet key, so the responder
+    /// performs its first DH-ratchet step right away — giving it a sending chain
+    /// immediately, so either party may send first.
     pub fn accept(me: &Keypair, peer: &PublicIdentity, hs: &Handshake) -> Result<Self> {
         let sk = kem_accept(me, peer, hs)?;
-        let core = RatchetCore {
+        let mut core = RatchetCore {
             rk: sk,
             dhs: me.x25519_secret(), // initial ratchet key = identity X25519
             dhs_pub: me.public().x25519_bytes(),
@@ -165,6 +173,10 @@ impl SecureSession {
             nr: 0,
             pn: 0,
         };
+        // Eager first ratchet against the initiator's ratchet key: sets up our
+        // receiving chain (matching the initiator's sending chain) and a fresh
+        // sending chain, so we can send before receiving.
+        dh_ratchet(&mut core, hs.ratchet_pub)?;
         Ok(Self { core, skipped: Skipped::default() })
     }
 
@@ -419,21 +431,25 @@ fn build_ikm(ss_x: &[u8; 32], ss_pq: Option<&Zeroizing<[u8; 32]>>) -> Zeroizing<
 // --- session bound to a transport Connection ------------------------------
 
 fn encode_handshake(hs: &Handshake) -> Vec<u8> {
-    let mut v = Vec::with_capacity(32 + hs.mlkem_ct.len());
+    let mut v = Vec::with_capacity(64 + hs.mlkem_ct.len());
     v.extend_from_slice(&hs.eph_x25519);
+    v.extend_from_slice(&hs.ratchet_pub);
     v.extend_from_slice(&hs.mlkem_ct);
     v
 }
 
 fn decode_handshake(b: &[u8]) -> Result<Handshake> {
-    if b.len() < 32 {
+    if b.len() < 64 {
         return Err(Error::Verify("short handshake".into()));
     }
     let mut eph = [0u8; 32];
+    let mut ratchet_pub = [0u8; 32];
     eph.copy_from_slice(&b[..32]);
+    ratchet_pub.copy_from_slice(&b[32..64]);
     Ok(Handshake {
         eph_x25519: eph,
-        mlkem_ct: b[32..].to_vec(),
+        ratchet_pub,
+        mlkem_ct: b[64..].to_vec(),
     })
 }
 
@@ -503,6 +519,17 @@ mod tests {
         assert_eq!(b.open(&ct).unwrap(), b"hello bob");
         let ct2 = b.seal(b"hi alice").unwrap();
         assert_eq!(a.open(&ct2).unwrap(), b"hi alice");
+    }
+
+    #[test]
+    fn responder_can_send_first() {
+        // Regression: the responder (b) must be able to send before receiving.
+        let (mut a, mut b) = pair();
+        let ct = b.seal(b"responder speaks first").unwrap();
+        assert_eq!(a.open(&ct).unwrap(), b"responder speaks first");
+        // And the initiator can still reply afterwards.
+        let ct2 = a.seal(b"initiator replies").unwrap();
+        assert_eq!(b.open(&ct2).unwrap(), b"initiator replies");
     }
 
     #[test]
