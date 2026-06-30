@@ -149,6 +149,55 @@ impl PublicIdentity {
     pub fn suite(&self) -> CryptoSuite {
         self.suite
     }
+
+    /// Canonical wire encoding of the public key bundle (for sharing over a
+    /// transport or in a ticket): `suite ‖ ed25519 ‖ x25519 ‖ len·ml_dsa ‖ len·ml_kem`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(1 + 64 + 8 + self.ml_dsa.len() + self.ml_kem.len());
+        v.push(suite_tag(self.suite));
+        v.extend_from_slice(&self.ed25519);
+        v.extend_from_slice(&self.x25519);
+        v.extend_from_slice(&(self.ml_dsa.len() as u32).to_le_bytes());
+        v.extend_from_slice(&self.ml_dsa);
+        v.extend_from_slice(&(self.ml_kem.len() as u32).to_le_bytes());
+        v.extend_from_slice(&self.ml_kem);
+        v
+    }
+
+    /// Parse a public identity from [`PublicIdentity::to_bytes`], recomputing
+    /// (and thereby binding) the `PeerId` from the key material.
+    pub fn from_bytes(b: &[u8]) -> Result<Self> {
+        let need = |have: usize, want: usize| -> Result<()> {
+            if have < want {
+                Err(Error::Crypto("truncated public identity".into()))
+            } else {
+                Ok(())
+            }
+        };
+        need(b.len(), 1 + 64 + 4)?;
+        let suite = suite_from_tag(b[0])?;
+        let mut ed25519 = [0u8; 32];
+        let mut x25519 = [0u8; 32];
+        ed25519.copy_from_slice(&b[1..33]);
+        x25519.copy_from_slice(&b[33..65]);
+        let dsa_len = u32::from_le_bytes(b[65..69].try_into().expect("4 bytes")) as usize;
+        let p = 69 + dsa_len;
+        need(b.len(), p + 4)?;
+        let ml_dsa = b[69..p].to_vec();
+        let kem_len = u32::from_le_bytes(b[p..p + 4].try_into().expect("4 bytes")) as usize;
+        let end = p + 4 + kem_len;
+        need(b.len(), end)?;
+        let ml_kem = b[p + 4..end].to_vec();
+        let peer_id = Self::compute_peer_id(suite, &ed25519, &x25519, &ml_dsa, &ml_kem);
+        Ok(Self {
+            suite,
+            ed25519,
+            x25519,
+            ml_dsa,
+            ml_kem,
+            peer_id,
+        })
+    }
     /// Ed25519 public key bytes.
     pub fn ed25519_bytes(&self) -> [u8; 32] {
         self.ed25519
@@ -205,6 +254,14 @@ fn suite_tag(suite: CryptoSuite) -> u8 {
     match suite {
         CryptoSuite::Classical => 0,
         CryptoSuite::Hybrid => 1,
+    }
+}
+
+fn suite_from_tag(tag: u8) -> Result<CryptoSuite> {
+    match tag {
+        0 => Ok(CryptoSuite::Classical),
+        1 => Ok(CryptoSuite::Hybrid),
+        _ => Err(Error::Crypto("unknown crypto-suite tag".into())),
     }
 }
 
@@ -498,6 +555,17 @@ mod tests {
         let last = sig.0.len() - 1;
         sig.0[last] ^= 0x01;
         assert!(!kp.public().verify(b"payload", &sig));
+    }
+
+    #[test]
+    fn public_identity_serialization_roundtrip() {
+        let kp = Keypair::generate(CryptoSuite::Hybrid).unwrap();
+        let bytes = kp.public().to_bytes();
+        let parsed = PublicIdentity::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.peer_id(), kp.peer_id(), "round-trip preserves identity");
+        // A signature from the original verifies under the parsed public id.
+        let sig = kp.sign(b"wire");
+        assert!(parsed.verify(b"wire", &sig));
     }
 
     #[test]

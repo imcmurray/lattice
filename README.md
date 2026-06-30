@@ -23,10 +23,41 @@ See [`DESIGN.md`](./DESIGN.md) for the full architecture and threat model.
 | `lattice` | Umbrella API crate + `prelude` |
 | `examples/chat` | North-star validating app (encrypted group chat) |
 
-## Build
+## Build & test
 
 ```bash
 cargo build --workspace
 cargo test  --workspace
-cargo run   -p lattice-chat-example
+cargo run   -p lattice-chat-example --bin lattice-chat   # local in-process demo
 ```
+
+## Try it between two devices
+
+The `lattice-net` binary is a real P2P chat: PQ-hybrid identities, a hybrid-KEM
++ Double-Ratchet handshake, end-to-end encryption, over an iroh QUIC connection
+(relay + holepunch, so it works across NATs). Build it on both machines:
+
+```bash
+cargo build -p lattice-chat-example --bin lattice-net   # pulls in the `iroh` feature
+```
+
+**Device A** (listener) — prints a ticket:
+
+```bash
+./target/debug/lattice-net listen
+# === TICKET (copy to the other device) ===
+# 7b22616464...   <- copy this whole blob
+```
+
+**Device B** (dialer) — paste A's ticket:
+
+```bash
+./target/debug/lattice-net connect 7b22616464...
+```
+
+Once both show "secure session established", type a line on either side and it
+appears, decrypted, on the other. Each side generates a fresh identity per run;
+the ticket carries A's address + public identity so B can authenticate the
+handshake (trust-on-first-use). Both machines need outbound internet to reach
+the n0 relays for discovery/holepunching.
+

@@ -15,6 +15,11 @@ use lattice_core::{Connection, Error, PeerId, Result, Topic, Transport};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex as AsyncMutex;
 
+#[cfg(feature = "iroh")]
+mod quic;
+#[cfg(feature = "iroh")]
+pub use quic::{read_frame, write_frame, IrohConn, IrohTransport, RecvStream, SendStream, ALPN};
+
 type Inbox = mpsc::UnboundedSender<(PeerId, MemoryConn)>;
 
 /// A shared in-process network: a registry of endpoint inboxes by [`PeerId`].

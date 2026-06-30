@@ -356,6 +356,12 @@ impl<C: Connection> ConnectedSession<C> {
         let session = SecureSession::accept(me, peer, &hs)?;
         Ok(Self { conn, session })
     }
+
+    /// Split into the underlying connection and the ratchet session, e.g. to
+    /// drive full-duplex I/O on the two halves of the connection concurrently.
+    pub fn into_parts(self) -> (C, SecureSession) {
+        (self.conn, self.session)
+    }
 }
 
 impl<C: Connection> Session for ConnectedSession<C> {

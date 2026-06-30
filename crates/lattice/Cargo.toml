@@ -9,6 +9,11 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+default = []
+# Enable the networked iroh QUIC transport backend.
+iroh = ["lattice-transport/iroh"]
+
 [dependencies]
 lattice-core = { path = "../lattice-core" }
 lattice-identity = { path = "../lattice-identity" }

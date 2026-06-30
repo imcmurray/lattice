@@ -3,7 +3,7 @@ name = "lattice-chat-example"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-description = "Lattice: north-star validating app — encrypted P2P group chat (scaffold)."
+description = "Lattice: local demo (lattice-chat) + networked P2P chat CLI (lattice-net)."
 publish = false
 
 [lints]
@@ -13,5 +13,8 @@ workspace = true
 name = "lattice-chat"
 path = "src/main.rs"
 
+# `lattice-net` (src/bin/lattice-net.rs) is auto-discovered.
+
 [dependencies]
-lattice = { path = "../../crates/lattice" }
+lattice = { path = "../../crates/lattice", features = ["iroh"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util"] }
