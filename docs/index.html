@@ -1,0 +1,551 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Lattice — serverless, post-quantum peer-to-peer</title>
+<meta name="description" content="Lattice is an experimental peer-to-peer framework: identities are keys on your own devices, messages flow directly between peers, and every exchange is encrypted with a classical + post-quantum hybrid." />
+<!-- NOTE: replace the repo URL placeholders (github.com/imcmurray/lattice) with your actual repo before publishing. -->
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --ink: #070a14;
+    --ink-2: #0c1020;
+    --ink-3: #11162a;
+    --line: rgba(166, 178, 224, 0.12);
+    --line-strong: rgba(166, 178, 224, 0.22);
+    --text: #eaecf6;
+    --muted: #9098b6;
+    --faint: #646c8a;
+    --aqua: #35e0d0;   /* classical leg */
+    --violet: #9d8bff; /* post-quantum leg */
+    --grad: linear-gradient(115deg, var(--aqua), var(--violet));
+    --maxw: 1080px;
+    --r: 14px;
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+
+  body {
+    margin: 0;
+    background: var(--ink);
+    color: var(--text);
+    font-family: "IBM Plex Sans", system-ui, -apple-system, sans-serif;
+    font-size: 17px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+
+  h1, h2, h3, .display { font-family: "Space Grotesk", system-ui, sans-serif; }
+  .mono { font-family: "IBM Plex Mono", ui-monospace, monospace; }
+
+  a { color: inherit; }
+  .wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 24px; }
+
+  .accent { color: var(--aqua); }
+  .grad-text {
+    background: var(--grad);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  /* ---- nav ---- */
+  .nav {
+    position: sticky; top: 0; z-index: 50;
+    backdrop-filter: blur(12px);
+    background: color-mix(in srgb, var(--ink) 72%, transparent);
+    border-bottom: 1px solid var(--line);
+  }
+  .nav-inner { display: flex; align-items: center; gap: 28px; height: 64px; }
+  .brand { display: flex; align-items: center; gap: 11px; font-family: "Space Grotesk"; font-weight: 600; font-size: 19px; letter-spacing: -0.01em; }
+  .brand .mark { width: 22px; height: 22px; }
+  .nav-links { display: flex; gap: 26px; margin-left: auto; }
+  .nav-links a { color: var(--muted); text-decoration: none; font-size: 15px; transition: color .18s; }
+  .nav-links a:hover { color: var(--text); }
+  .nav-cta {
+    text-decoration: none; font-size: 14.5px; font-weight: 500;
+    padding: 8px 15px; border-radius: 9px;
+    border: 1px solid var(--line-strong); color: var(--text);
+    transition: border-color .18s, background .18s;
+  }
+  .nav-cta:hover { border-color: var(--aqua); background: rgba(53,224,208,0.06); }
+  @media (max-width: 720px) { .nav-links { display: none; } }
+
+  /* ---- hero ---- */
+  .hero { position: relative; padding: clamp(64px, 12vh, 130px) 0 80px; overflow: hidden; }
+  #mesh { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 0; opacity: .55; }
+  .hero::after {
+    content: ""; position: absolute; inset: 0; z-index: 1; pointer-events: none;
+    background: radial-gradient(120% 80% at 70% 0%, transparent 30%, var(--ink) 78%);
+  }
+  .hero-inner { position: relative; z-index: 2; max-width: 760px; }
+  .eyebrow {
+    display: inline-flex; align-items: center; gap: 10px;
+    font-family: "IBM Plex Mono"; font-size: 13px; letter-spacing: 0.04em;
+    color: var(--muted); text-transform: lowercase;
+    padding: 6px 13px; border: 1px solid var(--line); border-radius: 100px;
+    margin-bottom: 26px;
+  }
+  .eyebrow .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--grad); box-shadow: 0 0 12px var(--aqua); }
+  h1.hero-title {
+    font-size: clamp(38px, 6.2vw, 68px); line-height: 1.04; font-weight: 600;
+    letter-spacing: -0.025em; margin: 0 0 22px;
+  }
+  .hero-sub { font-size: clamp(17px, 2.1vw, 21px); color: var(--muted); max-width: 600px; margin: 0 0 34px; }
+  .hero-sub strong { color: var(--text); font-weight: 500; }
+  .cta-row { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; }
+  .btn {
+    text-decoration: none; font-weight: 600; font-size: 16px;
+    padding: 13px 22px; border-radius: 11px; transition: transform .15s, box-shadow .2s, border-color .18s;
+    display: inline-flex; align-items: center; gap: 9px;
+  }
+  .btn-primary { background: var(--grad); color: #06121a; box-shadow: 0 8px 30px -8px rgba(53,224,208,0.5); }
+  .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 14px 40px -10px rgba(124,124,255,0.55); }
+  .btn-ghost { border: 1px solid var(--line-strong); color: var(--text); }
+  .btn-ghost:hover { border-color: var(--violet); transform: translateY(-2px); }
+  .hero-meta { margin-top: 30px; display: flex; gap: 22px; flex-wrap: wrap; color: var(--faint); font-size: 13.5px; font-family: "IBM Plex Mono"; }
+  .hero-meta span { display: inline-flex; align-items: center; gap: 8px; }
+  .hero-meta b { color: var(--muted); font-weight: 500; }
+
+  .alert {
+    margin-top: 44px; max-width: 660px; position: relative; z-index: 2;
+    display: flex; gap: 13px; align-items: flex-start;
+    padding: 14px 18px; border-radius: 12px;
+    background: rgba(157,139,255,0.07); border: 1px solid rgba(157,139,255,0.25);
+    font-size: 14.5px; color: var(--muted);
+  }
+  .alert b { color: var(--text); font-weight: 600; }
+  .alert .ico { color: var(--violet); flex: none; margin-top: 1px; }
+
+  /* ---- section scaffolding ---- */
+  section { padding: 92px 0; border-top: 1px solid var(--line); }
+  .sec-eyebrow { font-family: "IBM Plex Mono"; font-size: 13px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--aqua); margin: 0 0 14px; }
+  .sec-title { font-size: clamp(28px, 4vw, 40px); font-weight: 600; letter-spacing: -0.02em; margin: 0 0 18px; line-height: 1.1; }
+  .sec-lead { color: var(--muted); max-width: 640px; font-size: 18px; margin: 0 0 50px; }
+
+  /* ---- feature cards ---- */
+  .cards { display: grid; grid-template-columns: repeat(2, 1fr); gap: 18px; }
+  @media (max-width: 720px) { .cards { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--ink-2); border: 1px solid var(--line); border-radius: var(--r);
+    padding: 28px; transition: border-color .2s, transform .2s, background .2s;
+  }
+  .card:hover { border-color: var(--line-strong); transform: translateY(-3px); background: var(--ink-3); }
+  .card .badge { width: 38px; height: 38px; border-radius: 10px; display: grid; place-items: center; margin-bottom: 18px; background: rgba(53,224,208,0.1); border: 1px solid rgba(53,224,208,0.22); }
+  .card:nth-child(even) .badge { background: rgba(157,139,255,0.1); border-color: rgba(157,139,255,0.24); }
+  .card h3 { font-size: 19px; margin: 0 0 9px; font-weight: 600; letter-spacing: -0.01em; }
+  .card p { margin: 0; color: var(--muted); font-size: 15.5px; line-height: 1.6; }
+
+  /* ---- architecture stack ---- */
+  .stack { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+  .layer {
+    display: grid; grid-template-columns: 190px 1fr; gap: 20px; align-items: center;
+    padding: 16px 20px; border: 1px solid var(--line); border-radius: 12px; background: var(--ink-2);
+    transition: border-color .2s, transform .15s;
+  }
+  .layer:hover { border-color: var(--line-strong); transform: translatex(4px); }
+  .layer .lname { font-family: "IBM Plex Mono"; font-size: 14px; color: var(--text); font-weight: 500; }
+  .layer .ldesc { color: var(--muted); font-size: 15px; }
+  .layer.seam { border-color: rgba(53,224,208,0.3); background: linear-gradient(90deg, rgba(53,224,208,0.06), transparent); }
+  .layer.seam .lname { color: var(--aqua); }
+  @media (max-width: 640px) { .layer { grid-template-columns: 1fr; gap: 5px; } }
+
+  /* ---- hybrid handshake diagram ---- */
+  .hybrid { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; align-items: center; gap: 16px; margin-top: 44px; }
+  .leg { padding: 22px; border-radius: 14px; border: 1px solid var(--line); background: var(--ink-2); text-align: center; }
+  .leg.classical { border-color: rgba(53,224,208,0.3); }
+  .leg.pq { border-color: rgba(157,139,255,0.3); }
+  .leg .tag { font-family: "IBM Plex Mono"; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 8px; }
+  .leg.classical .tag { color: var(--aqua); }
+  .leg.pq .tag { color: var(--violet); }
+  .leg .alg { font-family: "Space Grotesk"; font-size: 17px; font-weight: 600; }
+  .leg small { display: block; color: var(--faint); font-size: 13px; margin-top: 4px; }
+  .op { font-family: "Space Grotesk"; font-size: 24px; color: var(--faint); }
+  .leg.result { border: 1px solid var(--line-strong); background: linear-gradient(135deg, rgba(53,224,208,0.08), rgba(157,139,255,0.08)); }
+  .leg.result .tag { background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .hybrid-note { margin-top: 22px; color: var(--muted); font-size: 15px; }
+  @media (max-width: 760px) { .hybrid { grid-template-columns: 1fr; } .op { transform: rotate(90deg); } }
+
+  /* ---- security split ---- */
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  @media (max-width: 720px) { .split { grid-template-columns: 1fr; } }
+  .panel { border: 1px solid var(--line); border-radius: var(--r); padding: 28px; background: var(--ink-2); }
+  .panel h3 { margin: 0 0 18px; font-size: 18px; display: flex; align-items: center; gap: 10px; }
+  .panel ul { list-style: none; margin: 0; padding: 0; }
+  .panel li { padding: 9px 0 9px 28px; position: relative; color: var(--muted); font-size: 15.5px; border-top: 1px solid var(--line); }
+  .panel li:first-child { border-top: none; }
+  .panel li::before { position: absolute; left: 0; top: 9px; font-family: "IBM Plex Mono"; font-size: 14px; }
+  .panel.have li::before { content: "+"; color: var(--aqua); }
+  .panel.not li::before { content: "—"; color: var(--faint); }
+  .panel.not h3 { color: var(--muted); }
+
+  /* ---- try it / code ---- */
+  .steps { display: flex; flex-direction: column; gap: 26px; }
+  .step { display: grid; grid-template-columns: 44px 1fr; gap: 20px; }
+  .step .n { font-family: "Space Grotesk"; font-weight: 600; font-size: 17px; width: 44px; height: 44px; border-radius: 11px; display: grid; place-items: center; border: 1px solid var(--line-strong); color: var(--aqua); }
+  .step h3 { margin: 6px 0 6px; font-size: 18px; }
+  .step p { margin: 0 0 14px; color: var(--muted); font-size: 15.5px; }
+  .code { position: relative; background: #05070f; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  .code pre { margin: 0; padding: 18px 20px; overflow-x: auto; font-family: "IBM Plex Mono"; font-size: 14px; line-height: 1.7; color: #cdd3ee; }
+  .code .tok-c { color: var(--faint); }       /* comment */
+  .code .tok-f { color: var(--aqua); }         /* command */
+  .copy { position: absolute; top: 10px; right: 10px; background: var(--ink-3); border: 1px solid var(--line-strong); color: var(--muted); font-size: 12px; font-family: "IBM Plex Mono"; padding: 5px 10px; border-radius: 7px; cursor: pointer; transition: color .15s, border-color .15s; }
+  .copy:hover { color: var(--text); border-color: var(--aqua); }
+
+  /* ---- roadmap ---- */
+  .road { display: grid; grid-template-columns: 1fr 1fr; gap: 40px; }
+  @media (max-width: 720px) { .road { grid-template-columns: 1fr; } }
+  .road h3 { font-size: 15px; font-family: "IBM Plex Mono"; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 16px; }
+  .road ul { list-style: none; margin: 0; padding: 0; }
+  .road li { padding: 10px 0 10px 26px; position: relative; border-top: 1px solid var(--line); color: var(--text); font-size: 15.5px; }
+  .road li:first-child { border-top: none; }
+  .road .done li::before { content: "✓"; position: absolute; left: 0; color: var(--aqua); }
+  .road .next li { color: var(--muted); }
+  .road .next li::before { content: "→"; position: absolute; left: 0; color: var(--faint); }
+
+  /* ---- footer ---- */
+  footer { border-top: 1px solid var(--line); padding: 54px 0 70px; color: var(--faint); }
+  .foot-top { display: flex; justify-content: space-between; gap: 30px; flex-wrap: wrap; align-items: flex-start; }
+  .foot-links { display: flex; gap: 24px; flex-wrap: wrap; }
+  .foot-links a { color: var(--muted); text-decoration: none; font-size: 15px; }
+  .foot-links a:hover { color: var(--text); }
+  .disclaimer { margin-top: 30px; font-size: 13.5px; line-height: 1.6; max-width: 720px; }
+
+  /* ---- reveal ---- */
+  .reveal { opacity: 0; transform: translateY(18px); transition: opacity .6s ease, transform .6s ease; }
+  .reveal.in { opacity: 1; transform: none; }
+  @media (prefers-reduced-motion: reduce) { .reveal { opacity: 1; transform: none; transition: none; } }
+
+  :focus-visible { outline: 2px solid var(--aqua); outline-offset: 3px; border-radius: 4px; }
+</style>
+</head>
+<body>
+
+<!-- mesh wordmark, reused -->
+<svg width="0" height="0" style="position:absolute"><defs>
+  <linearGradient id="lg" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#35e0d0"/><stop offset="1" stop-color="#9d8bff"/>
+  </linearGradient>
+</defs></svg>
+
+<nav class="nav">
+  <div class="wrap nav-inner">
+    <span class="brand">
+      <svg class="mark" viewBox="0 0 24 24" fill="none" stroke="url(#lg)" stroke-width="1.6">
+        <circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="12" cy="18" r="2"/>
+        <path d="M5 6 L19 6 M5 6 L12 18 M19 6 L12 18"/>
+      </svg>
+      Lattice
+    </span>
+    <div class="nav-links">
+      <a href="#what">What</a>
+      <a href="#how">How it works</a>
+      <a href="#security">Security</a>
+      <a href="#try">Try it</a>
+    </div>
+    <a class="nav-cta" href="https://github.com/imcmurray/lattice">GitHub ↗</a>
+  </div>
+</nav>
+
+<header class="hero">
+  <canvas id="mesh" aria-hidden="true"></canvas>
+  <div class="wrap">
+    <div class="hero-inner">
+      <span class="eyebrow"><span class="dot"></span>peer-to-peer · post-quantum · serverless</span>
+      <h1 class="hero-title">Talk directly. <span class="grad-text">No servers.</span> No future computer reads it.</h1>
+      <p class="hero-sub">Lattice is an experimental framework for building peer-to-peer apps where your identity is a key on <strong>your own devices</strong>, messages flow <strong>straight between peers</strong>, and every exchange is sealed with a <strong>classical + post-quantum hybrid</strong> — secure even against the quantum computers that don't exist yet.</p>
+      <div class="cta-row">
+        <a class="btn btn-primary" href="#try">Try the chat →</a>
+        <a class="btn btn-ghost" href="https://github.com/imcmurray/lattice">Read the design</a>
+      </div>
+      <div class="hero-meta">
+        <span><b>100%</b> Rust</span>
+        <span><b>0</b> servers</span>
+        <span><b>ML-KEM + ML-DSA</b> post-quantum</span>
+        <span><b>Double Ratchet</b> forward secrecy</span>
+      </div>
+    </div>
+    <div class="alert">
+      <svg class="ico" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>
+      <div><b>Experimental — not security-audited.</b> Lattice is a working research project under a placeholder codename. The cryptography is implemented against current standards but has had no external review. Build it, read it, break it — but don't trust it with secrets that matter yet.</div>
+    </div>
+  </div>
+</header>
+
+<section id="what">
+  <div class="wrap">
+    <p class="sec-eyebrow reveal">The idea</p>
+    <h2 class="sec-title reveal">Built on what a server can't take away.</h2>
+    <p class="sec-lead reveal">There's no account to breach, no inbox on someone else's machine, no central party to subpoena or shut down. The hard parts — identity, encrypted sessions, NAT-traversing connectivity, access control — are handled for you behind small, swappable interfaces.</p>
+    <div class="cards">
+      <div class="card reveal">
+        <div class="badge"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="var(--aqua)" stroke-width="1.8"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><path d="M8 7l8 9M16 7l-8 9"/></svg></div>
+        <h3>No servers, by design</h3>
+        <p>Peers find each other and connect directly (relay-assisted hole-punching), and your data lives on your devices. A company can't leak what it never holds.</p>
+      </div>
+      <div class="card reveal">
+        <div class="badge"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="var(--violet)" stroke-width="1.8"><path d="M12 2 4 6v6c0 5 3.5 8 8 10 4.5-2 8-5 8-10V6z"/><path d="M9.5 12l2 2 3.5-4"/></svg></div>
+        <h3>Post-quantum from day one</h3>
+        <p>Every primitive pairs a battle-tested classical algorithm with a NIST-standardized post-quantum one. Secure if <em>either</em> half holds — a hedge in both directions.</p>
+      </div>
+      <div class="card reveal">
+        <div class="badge"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="var(--aqua)" stroke-width="1.8"><path d="M4 12h16M4 12l4-4M4 12l4 4M20 12l-4-4M20 12l-4 4"/></svg></div>
+        <h3>Forward secrecy that heals</h3>
+        <p>A Double Ratchet rolls keys forward on every message and re-keys on every reply — so a stolen key can't unlock the past, and the session recovers after a compromise.</p>
+      </div>
+      <div class="card reveal">
+        <div class="badge"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="var(--violet)" stroke-width="1.8"><circle cx="12" cy="8" r="4"/><path d="M5 21c0-3.5 3-6 7-6s7 2.5 7 6"/></svg></div>
+        <h3>Your keys are your identity</h3>
+        <p>An identity is a keypair you recover from a mnemonic — no signup, no password database. Stored in your OS keychain, or an encrypted file on headless hosts.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="how">
+  <div class="wrap">
+    <p class="sec-eyebrow reveal">How it works</p>
+    <h2 class="sec-title reveal">Clean layers, one swappable seam.</h2>
+    <p class="sec-lead reveal">Each layer is a trait with a single job; dependencies point one way. The transport is the only place the network is named — in-memory today, iroh QUIC over relays and hole-punching for the real thing, anything behind the same interface tomorrow.</p>
+    <div class="stack">
+      <div class="layer reveal"><span class="lname">app</span><span class="ldesc">your application — e.g. the <code class="mono">lattice-net</code> chat</span></div>
+      <div class="layer reveal"><span class="lname">caps</span><span class="ldesc">signed, offline-verifiable capability tokens — access by holding a key, not by a server's say-so</span></div>
+      <div class="layer reveal"><span class="lname">log</span><span class="ldesc">append-only BLAKE3 hash chain with a signature on every entry — tamper-evident, fails closed</span></div>
+      <div class="layer reveal"><span class="lname">session</span><span class="ldesc">hybrid-KEM handshake + Double Ratchet — forward secrecy and post-compromise security</span></div>
+      <div class="layer reveal"><span class="lname">identity</span><span class="ldesc">post-quantum hybrid keypair, recoverable from a BIP39 mnemonic; device delegation</span></div>
+      <div class="layer seam reveal"><span class="lname">transport ←</span><span class="ldesc">the swap seam — in-memory loopback &amp; iroh QUIC (relay + hole-punch) behind one trait</span></div>
+    </div>
+
+    <h3 style="font-size:20px;margin:54px 0 0;font-weight:600;letter-spacing:-0.01em;" class="reveal">Why "hybrid" is the whole point</h3>
+    <div class="hybrid reveal">
+      <div class="leg classical">
+        <div class="tag">classical</div>
+        <div class="alg">X25519</div>
+        <small>fast, proven, today</small>
+      </div>
+      <div class="op">+</div>
+      <div class="leg pq">
+        <div class="tag">post-quantum</div>
+        <div class="alg">ML-KEM-768</div>
+        <small>FIPS 203, future-proof</small>
+      </div>
+      <div class="op">→</div>
+      <div class="leg result">
+        <div class="tag">one session key</div>
+        <div class="alg">HKDF</div>
+        <small>combined, never XOR</small>
+      </div>
+    </div>
+    <p class="hybrid-note reveal">An eavesdropper recording your traffic today, hoping to decrypt it once quantum computers arrive, gets nothing — the key is safe unless <em>both</em> X25519 and ML-KEM fall. Signatures work the same way: Ed25519 alongside ML-DSA, and both must verify.</p>
+  </div>
+</section>
+
+<section id="security">
+  <div class="wrap">
+    <p class="sec-eyebrow reveal">Straight talk on security</p>
+    <h2 class="sec-title reveal">What it protects — and what it doesn't, yet.</h2>
+    <p class="sec-lead reveal">Trust comes from being specific. Here's the honest line between what's built and tested and what's still ahead.</p>
+    <div class="split">
+      <div class="panel have reveal">
+        <h3>Protected today</h3>
+        <ul>
+          <li>End-to-end message confidentiality &amp; integrity</li>
+          <li>Post-quantum hybrid key exchange and signatures</li>
+          <li>Forward secrecy + post-compromise security (Double Ratchet)</li>
+          <li>No central server to breach, log, or compel</li>
+          <li>Memory-safe core — <code class="mono">#![forbid(unsafe_code)]</code> throughout</li>
+          <li>At-rest identity encryption (keychain / age)</li>
+        </ul>
+      </div>
+      <div class="panel not reveal">
+        <h3>Not yet (and we say so)</h3>
+        <ul>
+          <li>External security audit — none performed</li>
+          <li>Metadata privacy — who-talks-to-whom is not hidden</li>
+          <li>Strong Sybil resistance</li>
+          <li>Reliable redelivery of a message lost at the instant of a drop</li>
+          <li>A finalized name — "Lattice" is a working codename</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="try">
+  <div class="wrap">
+    <p class="sec-eyebrow reveal">Try it</p>
+    <h2 class="sec-title reveal">Two machines, one ticket.</h2>
+    <p class="sec-lead reveal">Lattice is a native app — there's nothing to run in this browser. Build the <code class="mono">lattice-net</code> CLI on two computers (or two terminals), and chat end-to-end encrypted over the real transport. You'll need Rust and outbound internet for the relays.</p>
+    <div class="steps">
+      <div class="step reveal">
+        <div class="n">1</div>
+        <div>
+          <h3>Build it</h3>
+          <p>Clone the repo and build the chat binary on each machine.</p>
+          <div class="code"><button class="copy">copy</button><pre><span class="tok-c"># on each machine</span>
+<span class="tok-f">git</span> clone https://github.com/imcmurray/lattice
+<span class="tok-f">cd</span> lattice
+<span class="tok-f">cargo</span> build -p lattice-chat-example --bin lattice-net</pre></div>
+        </div>
+      </div>
+      <div class="step reveal">
+        <div class="n">2</div>
+        <div>
+          <h3>Listen — and share the ticket</h3>
+          <p>Device A starts listening and prints a ticket (its address + public identity).</p>
+          <div class="code"><button class="copy">copy</button><pre><span class="tok-f">./target/debug/lattice-net</span> listen
+<span class="tok-c"># === TICKET (copy to the other device) ===</span>
+<span class="tok-c"># c20df9fb228f…  (a long hex blob — copy all of it)</span></pre></div>
+        </div>
+      </div>
+      <div class="step reveal">
+        <div class="n">3</div>
+        <div>
+          <h3>Connect and chat</h3>
+          <p>Device B dials the ticket. Once both show "secure session established," type a line on either side — it appears, decrypted, on the other.</p>
+          <div class="code"><button class="copy">copy</button><pre><span class="tok-f">./target/debug/lattice-net</span> connect c20df9fb228f…</pre></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="status">
+  <div class="wrap">
+    <p class="sec-eyebrow reveal">Status</p>
+    <h2 class="sec-title reveal">Where v0.1 stands.</h2>
+    <p class="sec-lead reveal">Live-validated locally as a two-party encrypted chat with reconnect &amp; resumption. The remaining frontier is a run across two physically separate networks, and the bigger features below.</p>
+    <div class="road">
+      <div>
+        <h3 class="done-h">Working now</h3>
+        <ul class="done">
+          <li>PQ-hybrid identity with mnemonic recovery</li>
+          <li>BLAKE3 signed append-only log</li>
+          <li>Hybrid-KEM + Double-Ratchet session</li>
+          <li>Out-of-order &amp; dropped-frame tolerance</li>
+          <li>iroh QUIC transport + the lattice-net CLI</li>
+          <li>Reconnect with session resumption</li>
+        </ul>
+      </div>
+      <div>
+        <h3>On the roadmap</h3>
+        <ul class="next">
+          <li>Multi-writer rooms (CRDT-merged logs)</li>
+          <li>Metadata privacy (Tor / mix transport)</li>
+          <li>Reliable redelivery (acks + resend)</li>
+          <li>External security audit</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="foot-top">
+      <span class="brand">
+        <svg class="mark" viewBox="0 0 24 24" fill="none" stroke="url(#lg)" stroke-width="1.6">
+          <circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="12" cy="18" r="2"/>
+          <path d="M5 6 L19 6 M5 6 L12 18 M19 6 L12 18"/>
+        </svg>
+        Lattice
+      </span>
+      <div class="foot-links">
+        <a href="https://github.com/imcmurray/lattice">GitHub</a>
+        <a href="https://github.com/imcmurray/lattice/blob/main/DESIGN.md">Design &amp; threat model</a>
+        <a href="https://github.com/imcmurray/lattice/blob/main/HANDOFF.md">Handoff doc</a>
+        <a href="#try">Try it</a>
+      </div>
+    </div>
+    <p class="disclaimer">Lattice is an experimental, unaudited research project; "Lattice" is a working codename and not affiliated with any other product of that name, nor is it a lattice-cryptography library (the name refers to the peer-to-peer mesh). Don't rely on it to protect information whose disclosure would harm you. Built in Rust with iroh, RustCrypto (ML-KEM / ML-DSA / Ed25519 / X25519), BLAKE3, and age.</p>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  /* ---- peer mesh: nodes connect directly, no center ---- */
+  var canvas = document.getElementById('mesh');
+  if (canvas) {
+    var ctx = canvas.getContext('2d');
+    var nodes = [], w, h, dpr = Math.min(window.devicePixelRatio || 1, 2);
+    function size() {
+      var r = canvas.getBoundingClientRect();
+      w = r.width; h = r.height;
+      canvas.width = w * dpr; canvas.height = h * dpr;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      var count = Math.max(14, Math.min(46, Math.floor(w * h / 26000)));
+      nodes = [];
+      for (var i = 0; i < count; i++) {
+        nodes.push({
+          x: Math.random() * w, y: Math.random() * h,
+          vx: (Math.random() - 0.5) * 0.25, vy: (Math.random() - 0.5) * 0.25
+        });
+      }
+    }
+    function draw() {
+      ctx.clearRect(0, 0, w, h);
+      for (var i = 0; i < nodes.length; i++) {
+        var a = nodes[i];
+        for (var j = i + 1; j < nodes.length; j++) {
+          var b = nodes[j], dx = a.x - b.x, dy = a.y - b.y, d = Math.hypot(dx, dy);
+          if (d < 150) {
+            var t = 1 - d / 150;
+            ctx.strokeStyle = 'rgba(120,170,235,' + (t * 0.32).toFixed(3) + ')';
+            ctx.lineWidth = 1;
+            ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+          }
+        }
+      }
+      for (var k = 0; k < nodes.length; k++) {
+        var n = nodes[k];
+        ctx.fillStyle = k % 3 === 0 ? 'rgba(157,139,255,0.9)' : 'rgba(53,224,208,0.85)';
+        ctx.beginPath(); ctx.arc(n.x, n.y, 2.1, 0, 6.283); ctx.fill();
+      }
+    }
+    function step() {
+      for (var i = 0; i < nodes.length; i++) {
+        var n = nodes[i];
+        n.x += n.vx; n.y += n.vy;
+        if (n.x < 0 || n.x > w) n.vx *= -1;
+        if (n.y < 0 || n.y > h) n.vy *= -1;
+      }
+      draw();
+      raf = requestAnimationFrame(step);
+    }
+    var raf;
+    size(); draw();
+    if (!reduce) step();
+    var rt;
+    window.addEventListener('resize', function () {
+      clearTimeout(rt); rt = setTimeout(function () { cancelAnimationFrame(raf); size(); draw(); if (!reduce) step(); }, 150);
+    });
+  }
+
+  /* ---- scroll reveal ---- */
+  var io = ('IntersectionObserver' in window) ? new IntersectionObserver(function (entries) {
+    entries.forEach(function (e) { if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); } });
+  }, { threshold: 0.12 }) : null;
+  document.querySelectorAll('.reveal').forEach(function (el) { if (io) io.observe(el); else el.classList.add('in'); });
+
+  /* ---- copy buttons ---- */
+  document.querySelectorAll('.copy').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var pre = btn.parentElement.querySelector('pre');
+      var text = pre.innerText.split('\n').filter(function (l) { return l.trim() && l.trim()[0] !== '#'; }).join('\n');
+      navigator.clipboard.writeText(text).then(function () {
+        var old = btn.textContent; btn.textContent = 'copied'; setTimeout(function () { btn.textContent = old; }, 1400);
+      });
+    });
+  });
+})();
+</script>
+</body>
+</html>
