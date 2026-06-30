@@ -226,7 +226,7 @@ Rooted/compromised device; nation-state traffic-analysis of the social graph (A7
 ## 7. Proposed crate layout
 
 ```
-P2P/                      (cargo workspace root)
+Lattice/                  (cargo workspace root)
 ├─ Cargo.toml             workspace, shared lints (forbid unsafe), pinned versions
 ├─ DESIGN.md              (this file)
 ├─ deny.toml              cargo-deny policy
