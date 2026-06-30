@@ -22,6 +22,10 @@
 
 use lattice_core::{CryptoSuite, Error, Identity, PeerId, Result, Signature, Verify};
 
+/// At-rest identity storage (keychain / age-encrypted file). `storage` feature.
+#[cfg(feature = "storage")]
+pub mod storage;
+
 use bip39::Mnemonic;
 use ed25519_dalek::{Signer as _, SigningKey as EdSigningKey, VerifyingKey as EdVerifyingKey};
 use hkdf::Hkdf;

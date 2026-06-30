@@ -64,9 +64,11 @@ cargo build -p lattice-chat-example --bin lattice-net   # pulls in the `iroh` fe
 
 Once both show "secure session established", type a line on either side and it
 appears, decrypted, on the other. Each device has a **persistent identity**: a
-BIP39 mnemonic generated on first run and saved to `~/.lattice/identity`
-(`0600`; override with `LATTICE_IDENTITY_FILE`), so its PeerId is stable across
-runs and recoverable from the mnemonic. The ticket carries A's address + public
+BIP39 mnemonic stored at rest under `~/.lattice/` — in the **OS keychain** when
+available, else an **age-encrypted file** (`identity.age`, `0600`; passphrase via
+`LATTICE_PASSPHRASE` or prompt; `LATTICE_STORAGE=age` forces the file backend;
+`LATTICE_DIR` overrides the dir). The PeerId is stable across runs and
+recoverable from the mnemonic. The ticket carries A's address + public
 identity so B can authenticate the handshake (trust-on-first-use). Both machines
 need outbound internet to reach the n0 relays for discovery/holepunching.
 

@@ -16,5 +16,5 @@ path = "src/main.rs"
 # `lattice-net` (src/bin/lattice-net.rs) is auto-discovered.
 
 [dependencies]
-lattice = { path = "../../crates/lattice", features = ["iroh"] }
+lattice = { path = "../../crates/lattice", features = ["iroh", "storage"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "time", "sync"] }

@@ -3,77 +3,20 @@
 //! On device A:  `lattice-net listen`            → prints a TICKET
 //! On device B:  `lattice-net connect <ticket>`  → dials A
 //!
-//! Each side loads a persistent PQ-hybrid identity (from a saved BIP39 mnemonic,
-//! generated on first run), exchanges public identities, runs the hybrid-KEM +
-//! Double-Ratchet handshake over an iroh QUIC connection (relay + holepunch),
-//! then relays stdin lines as end-to-end-encrypted messages. Because the
-//! identity persists, this device keeps a stable PeerId across runs.
+//! Each side loads a persistent PQ-hybrid identity via [`IdentityStore`] (OS
+//! keychain, else an age-encrypted file), exchanges public identities, runs the
+//! hybrid-KEM + Double-Ratchet handshake over an iroh QUIC connection (relay +
+//! holepunch), then relays stdin lines as end-to-end-encrypted messages.
+//! Because the identity persists, this device keeps a stable PeerId across runs.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use lattice::identity::storage::IdentityStore;
 use lattice::prelude::*;
 use lattice::transport::{read_frame, write_frame, IrohConn, IrohTransport};
 use tokio::io::{AsyncBufReadExt, BufReader, Lines, Stdin};
 use tokio::sync::{Mutex, Notify};
-
-/// Where the persistent mnemonic lives. Override with `LATTICE_IDENTITY_FILE`.
-fn identity_path() -> PathBuf {
-    if let Ok(p) = std::env::var("LATTICE_IDENTITY_FILE") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".lattice").join("identity")
-}
-
-/// Load the identity from its saved BIP39 mnemonic, or generate one and persist
-/// it on first run — so this device keeps a stable PeerId across runs (ADR-004).
-fn load_or_create_identity() -> Result<Keypair> {
-    let path = identity_path();
-    if path.exists() {
-        let phrase = std::fs::read_to_string(&path)
-            .map_err(|e| Error::Other(format!("read identity {}: {e}", path.display())))?;
-        let kp = Keypair::from_mnemonic(CryptoSuite::Hybrid, phrase.trim())?;
-        eprintln!("[lattice-net] loaded identity from {}", path.display());
-        Ok(kp)
-    } else {
-        let kp = Keypair::generate(CryptoSuite::Hybrid)?;
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)
-                .map_err(|e| Error::Other(format!("mkdir {}: {e}", dir.display())))?;
-        }
-        write_secret(&path, kp.mnemonic())?;
-        eprintln!(
-            "[lattice-net] new identity saved to {} — this mnemonic is your recovery secret, keep it safe",
-            path.display()
-        );
-        Ok(kp)
-    }
-}
-
-/// Write the mnemonic owner-readable only (0600 on Unix, created atomically).
-fn write_secret(path: &PathBuf, mnemonic: &str) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(|e| Error::Other(format!("create {}: {e}", path.display())))?;
-        f.write_all(mnemonic.as_bytes())
-            .map_err(|e| Error::Other(format!("write {}: {e}", path.display())))?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, mnemonic)
-            .map_err(|e| Error::Other(format!("write {}: {e}", path.display())))?;
-    }
-    Ok(())
-}
 
 #[tokio::main]
 async fn main() {
@@ -93,8 +36,22 @@ enum Outcome {
 
 async fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let me = load_or_create_identity()?;
-    eprintln!("[lattice-net] your identity: {:?}", me.peer_id());
+
+    // Persistent identity: OS keychain if available, else an age-encrypted file.
+    let loaded = IdentityStore::open_default().load_or_create(CryptoSuite::Hybrid)?;
+    let me = loaded.keypair;
+    let note = if loaded.created {
+        " (new identity created)"
+    } else if loaded.migrated {
+        " (migrated from legacy plaintext → re-encrypted)"
+    } else {
+        ""
+    };
+    eprintln!(
+        "[lattice-net] identity {:?} [stored via {:?}]{note}",
+        me.peer_id(),
+        loaded.backend
+    );
 
     // Read stdin once and reuse it across reconnects (typed input isn't lost).
     let mut lines = BufReader::new(tokio::io::stdin()).lines();

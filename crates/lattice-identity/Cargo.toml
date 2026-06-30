@@ -13,6 +13,9 @@ workspace = true
 default = ["pq"]
 # Post-quantum half of the hybrid. On by default; CryptoSuite::Hybrid requires it.
 pq = ["dep:ml-dsa", "dep:ml-kem", "dep:getrandom"]
+# At-rest identity storage (OS keychain primary, age-encrypted file fallback).
+# Off by default — pulls platform keychain + age deps; apps opt in.
+storage = ["dep:keyring", "dep:age", "dep:rpassword", "dep:toml", "dep:serde", "dep:getrandom"]
 
 [dependencies]
 lattice-core = { path = "../lattice-core" }
@@ -32,5 +35,12 @@ zeroize = "1"
 ml-dsa = { version = "0.1", optional = true }
 ml-kem = { version = "0.3", optional = true }
 getrandom = { version = "0.2", optional = true }
+
+# At-rest storage (feature = "storage").
+keyring = { version = "4", optional = true }
+age = { version = "0.11", optional = true }
+rpassword = { version = "7", optional = true }
+toml = { version = "1", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
 
 [dev-dependencies]
