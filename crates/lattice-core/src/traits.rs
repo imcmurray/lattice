@@ -7,7 +7,8 @@ use crate::types::{Entry, PeerId, Seq, Signature, Topic};
 /// An established bidirectional connection that carries whole **framed
 /// messages** (not a raw byte stream — the transport owns framing). This keeps
 /// the core dependency-free while the impls bring their own async runtime.
-/// Impls: `MemoryConn` (in-memory loopback) today; iroh QUIC streams next.
+/// Impls: `MemoryConn` (in-memory loopback) and iroh QUIC streams
+/// (`lattice-transport`, `iroh` feature).
 #[allow(async_fn_in_trait)]
 pub trait Connection: Send {
     /// Send one framed message to the peer.

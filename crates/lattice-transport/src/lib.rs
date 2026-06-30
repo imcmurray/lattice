@@ -1,12 +1,13 @@
-//! `lattice-transport` — the [`Transport`] trait plus an in-memory loopback
-//! implementation for tests and local wiring (DESIGN.md ADR-001).
+//! `lattice-transport` — the [`Transport`]/`Connection` trait surface plus two
+//! backends: an in-memory loopback ([`MemoryTransport`], always available) and an
+//! iroh QUIC backend (`IrohTransport`, behind the `iroh` feature). See DESIGN.md
+//! ADR-001.
 //!
 //! [`MemoryTransport`] is a real, working [`Transport`]: endpoints register on a
 //! shared [`MemoryNetwork`], `connect` hands one end of an in-process duplex to
-//! the peer's accept queue, and `accept` receives it. It exercises the same
-//! async trait surface the iroh QUIC backend will implement next, so the upper
-//! layers (the session handshake, the app) are written against the trait, not
-//! the backend.
+//! the peer's accept queue, and `accept` receives it. The upper layers (the
+//! session handshake, the app) are written against the trait, so the iroh
+//! backend (see `src/quic.rs`) drops in without touching them.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

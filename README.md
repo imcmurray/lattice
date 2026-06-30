@@ -4,9 +4,12 @@ A security-forward, 100% Rust peer-to-peer application framework — the
 Holepunch/Keet model redesigned with clean trait seams, post-quantum-hybrid
 identity, and a swappable transport substrate.
 
-> **Status: pre-alpha scaffold.** Trait shapes are settled; most layers are
-> stubs (`todo!`). The append-only log (`lattice-log`) is the one primitive
-> implemented end-to-end today, with tests.
+> **Status: working v0.1** (local git, no remote). The full stack is implemented
+> and tested — PQ-hybrid identity with BIP39 recovery, a BLAKE3 signed log, a
+> hybrid-KEM + Double-Ratchet secure channel, capability tokens, and both an
+> in-memory and an iroh QUIC transport. The `lattice-net` CLI does real
+> two-device chat. 25 tests; `clippy -D warnings` clean. *"Lattice" is a working
+> codename.*
 
 See [`DESIGN.md`](./DESIGN.md) for the full architecture and threat model.
 
@@ -15,13 +18,13 @@ See [`DESIGN.md`](./DESIGN.md) for the full architecture and threat model.
 | Crate | Role |
 |---|---|
 | `lattice-core` | Shared types, error model, trait contracts (zero deps) |
-| `lattice-identity` | PQ-hybrid keypair = identity |
-| `lattice-transport` | `Transport` trait + iroh default impl (the swap seam) |
-| `lattice-session` | Noise handshake + Double-Ratchet (forward secrecy) |
-| `lattice-log` | Append-only signed log + CRDT merge (hand-built core primitive) |
-| `lattice-caps` | Unforgeable, attenuable capability tokens |
+| `lattice-identity` | PQ-hybrid keypair = identity (Ed25519+ML-DSA, X25519+ML-KEM); BIP39 recovery; device certs |
+| `lattice-log` | Append-only BLAKE3 hash chain with per-entry hybrid-signature verification |
+| `lattice-session` | Hybrid-KEM handshake + Double Ratchet (forward secrecy + post-compromise security) |
+| `lattice-caps` | UCAN-style signed capability tokens (single-hop) |
+| `lattice-transport` | `Transport`/`Connection` traits + in-memory loopback + iroh QUIC backend (feature `iroh`) |
 | `lattice` | Umbrella API crate + `prelude` |
-| `examples/chat` | North-star validating app (encrypted group chat) |
+| `examples/chat` | `lattice-chat` (local one-process demo) and `lattice-net` (real two-device P2P chat) |
 
 ## Build & test
 

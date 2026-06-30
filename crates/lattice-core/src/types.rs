@@ -18,7 +18,8 @@ impl fmt::Debug for PeerId {
     }
 }
 
-/// A hybrid signature (classical + post-quantum). Opaque bytes in the scaffold.
+/// A hybrid signature (classical + post-quantum), carried as length-prefixed
+/// opaque bytes (the classical and PQ component signatures concatenated).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Signature(pub Vec<u8>);
 

@@ -2,7 +2,7 @@
 
 > **Working codename:** *Lattice* (a P2P mesh; placeholder, easy to rename).
 > **One line:** A 100% Rust, security-forward peer-to-peer application framework — the Holepunch/Keet model, redesigned with clean trait boundaries, post-quantum-hybrid identity, and a transport substrate you can swap.
-> **Status:** Design draft v0.1 — pre-scaffold. Nothing here is load-bearing yet; this doc is the contract we build to.
+> **Status:** v0.1 implemented (local git, no remote). This doc is both the design contract and a map of what's built — per-section notes and the §5.1 status table mark done vs pending. The full stack (identity, signed log, hybrid-KEM + Double-Ratchet session, capabilities, in-memory + iroh transport) is implemented and tested; the `lattice-net` CLI does real two-device chat.
 
 ---
 
@@ -58,13 +58,13 @@ It is explicitly a **framework for others to build on**, not a single app. The n
 │  append-only signed log + CRDT merge → replicated state     │  ← we hand-build
 ├───────────────────────────────────────────────────────────┤
 │  Session crypto (lattice-session)                           │
-│  Noise handshake + Double-Ratchet (forward secrecy)         │
+│  hybrid-KEM handshake + Double Ratchet (FS + PCS)           │
 ├───────────────────────────────────────────────────────────┤
 │  Identity (lattice-identity)                                │
 │  PQ-hybrid keypair = identity; rotation, multi-device       │
 ├───────────────────────────────────────────────────────────┤
 │  Transport TRAIT (lattice-transport)                        │  ← the swap seam
-│    default impl: iroh  (QUIC, holepunch, relay fallback)    │
+│    impls: in-memory + iroh QUIC (relay, holepunch)          │
 │    future impls: libp2p, tor/mix-relay (metadata privacy)   │
 ├───────────────────────────────────────────────────────────┤
 │  Core (lattice-core)                                        │
@@ -85,41 +85,48 @@ Dependencies point downward only. No layer reaches around another. The `Transpor
 
 ---
 
-## 4. Core traits (sketch — final form lands in code)
+## 4. Core traits (as implemented)
+
+These are the actual `lattice-core` contracts; concrete impls live in sibling crates.
 
 ```rust
-// lattice-core — illustrative, not final
-pub trait Identity {
-    fn peer_id(&self) -> PeerId;                       // stable, derived from public keys
-    fn sign(&self, msg: &[u8]) -> Signature;           // hybrid: Ed25519 + ML-DSA
-    fn verify(id: &PeerId, msg: &[u8], sig: &Signature) -> bool;
+pub trait Identity {                 // signing half — holds secret keys
+    fn peer_id(&self) -> PeerId;
+    fn sign(&self, msg: &[u8]) -> Signature;                  // hybrid: Ed25519 + ML-DSA
+}
+pub trait Verify {                   // verifying half — a published public identity, no secrets
+    fn peer_id(&self) -> PeerId;
+    fn verify(&self, msg: &[u8], sig: &Signature) -> bool;    // every component must verify
 }
 
-pub trait Transport {
-    type Stream: AsyncRead + AsyncWrite + Send + Unpin;
-    async fn connect(&self, peer: &PeerId) -> Result<Self::Stream>;
-    async fn accept(&self) -> Result<(PeerId, Self::Stream)>;
-    async fn announce(&self, topic: &Topic) -> Result<()>;     // discoverability
+pub trait Connection: Send {         // an established channel carrying framed messages
+    async fn send(&mut self, msg: &[u8]) -> Result<()>;
+    async fn recv(&mut self) -> Result<Vec<u8>>;
+}
+pub trait Transport {                // the swap seam — MemoryTransport today, IrohTransport (feature)
+    type Conn: Connection;
+    async fn connect(&self, peer: &PeerId) -> Result<Self::Conn>;
+    async fn accept(&self) -> Result<(PeerId, Self::Conn)>;
+    async fn announce(&self, topic: &Topic) -> Result<()>;
     async fn lookup(&self, topic: &Topic) -> Result<Vec<PeerId>>;
 }
 
-pub trait Session {                                   // wraps a Transport::Stream
-    async fn establish(stream: impl Stream, me: &impl Identity, them: &PeerId)
-        -> Result<Self>;                              // Noise handshake + verify identity
-    async fn send(&mut self, plaintext: &[u8]) -> Result<()>;  // ratchet forward
+pub trait Session {                  // an encrypted channel (ConnectedSession impls it)
+    async fn send(&mut self, plaintext: &[u8]) -> Result<()>;
     async fn recv(&mut self) -> Result<Vec<u8>>;
 }
 
-pub trait Log {                                       // append-only, signed
-    fn append(&mut self, payload: &[u8], by: &impl Identity) -> Result<Seq>;
-    fn verify(&self) -> Result<()>;                   // full-chain signature check
+pub trait Log {                      // append-only, BLAKE3 hash chain, single-writer
+    fn append(&mut self, payload: &[u8], by: &dyn Identity) -> Result<Seq>;
+    fn verify(&self) -> Result<()>;  // full hash + signature chain check; fails closed
     fn get(&self, seq: Seq) -> Result<Option<Entry>>;
     fn head(&self) -> Seq;
-    async fn replicate(&mut self, peer: &mut impl Session) -> Result<()>;
 }
 ```
 
-CRDT merge for multi-writer state lives above `Log` (each writer owns a single-writer log; rooms are *sets* of logs merged deterministically). This mirrors how Keet models a group chat as many single-writer feeds, not one shared mutable table.
+Why `Identity`/`Verify` are split: a signature can't be checked against a `PeerId` (it's only a hash of the public keys), so verification lives on the public-identity side, which holds the actual key bundle.
+
+*Planned (ADR-002):* CRDT merge for multi-writer state above `Log` — each writer owns a single-writer log; rooms are *sets* of logs merged deterministically, mirroring how Keet models a group chat as many single-writer feeds, not one shared mutable table.
 
 ---
 
@@ -223,23 +230,22 @@ Rooted/compromised device; nation-state traffic-analysis of the social graph (A7
 
 ---
 
-## 7. Proposed crate layout
+## 7. Crate layout
 
 ```
 Lattice/                  (cargo workspace root)
 ├─ Cargo.toml             workspace, shared lints (forbid unsafe), pinned versions
-├─ DESIGN.md              (this file)
+├─ DESIGN.md  README.md   design + threat model, and overview / run guide
 ├─ deny.toml              cargo-deny policy
 ├─ crates/
-│  ├─ lattice-core/       types, errors, traits, crypto-suite selection
-│  ├─ lattice-identity/   PQ-hybrid keypair, PeerId, sign/verify, rotation
-│  ├─ lattice-transport/  Transport trait + iroh default impl + relay
-│  ├─ lattice-session/    Noise handshake + Double-Ratchet
-│  ├─ lattice-log/        append-only signed log + CRDT merge   (hand-built)
-│  ├─ lattice-caps/       capability tokens
-│  └─ lattice/            umbrella API crate (Room/Document/Peer) re-exporting the above
-└─ examples/
-   └─ chat/               north-star validating app (encrypted group chat)
+│  ├─ lattice-core/       types, errors, traits (Identity/Verify/Connection/Transport/Session/Log)
+│  ├─ lattice-identity/   PQ-hybrid keypair, PeerId, BIP39 recovery, device certs
+│  ├─ lattice-log/        append-only BLAKE3 hash chain + per-entry hybrid-sig verify
+│  ├─ lattice-session/    hybrid-KEM handshake + Double Ratchet + ConnectedSession
+│  ├─ lattice-caps/       UCAN-style signed capability tokens (single-hop)
+│  ├─ lattice-transport/  Transport/Connection traits; MemoryTransport; iroh QUIC (feature `iroh`, src/quic.rs)
+│  └─ lattice/            umbrella API crate + prelude (feature `iroh` re-exports IrohTransport)
+└─ examples/chat/         lattice-chat (local one-process demo) + lattice-net (two-device P2P chat CLI)
 ```
 
 ---

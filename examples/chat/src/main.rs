@@ -1,9 +1,9 @@
-//! Lattice example: encrypted P2P group chat (scaffold).
+//! Lattice local demo (`lattice-chat`) — the whole stack in one process.
 //!
-//! Exercises the layers that are real today end to end: a real PQ-hybrid
-//! identity authors an append-only log, the hash chain verifies, and a
-//! signature checks against the published public identity. Networking,
-//! sessions, and a UI land as the stubbed layers are filled in.
+//! A PQ-hybrid identity authors a BLAKE3 signed log (verified), then two
+//! identities establish a hybrid-KEM + Double-Ratchet session and exchange an
+//! end-to-end-encrypted message. For the real networked version across two
+//! machines, see the `lattice-net` binary.
 
 use lattice::prelude::*;
 
@@ -11,7 +11,7 @@ fn main() -> Result<()> {
     // A real post-quantum-hybrid identity (Ed25519+ML-DSA / X25519+ML-KEM),
     // derived from a fresh 24-word mnemonic.
     let me = Keypair::generate(CryptoSuite::Hybrid)?;
-    println!("Lattice chat — scaffold");
+    println!("Lattice local demo");
     println!("Identity peer_id: {:?}", me.peer_id());
     println!(
         "Backup mnemonic: {} words (kept secret; this is the recovery key)",
