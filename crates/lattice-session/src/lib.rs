@@ -19,10 +19,18 @@
 //!   after one round trip → *post-compromise security*. Message headers carry
 //!   the sender's current ratchet public key.
 //!
-//! Honest boundary: delivery is **in-order** (no skipped-message-key storage),
-//! so out-of-order or dropped messages are rejected rather than buffered — the
-//! documented follow-on. ML-KEM ops live in `lattice-identity`; this crate owns
-//! X25519, the ratchet, and the AEAD.
+//! Out-of-order and dropped messages are handled by a **bounded skipped-key
+//! cache**: when a message arrives ahead of the expected index, the intervening
+//! message keys are derived and stashed (capped at `MAX_SKIP` per step and
+//! `MAX_SKIPPED_KEYS` total, FIFO-evicted, so a forged header can't force
+//! unbounded work). [`SecureSession::open`] performs the skip + ratchet on a
+//! *scratch copy* of the state and commits only after the AEAD verifies, so a
+//! forged or tampered frame can never advance or desync the ratchet.
+//!
+//! ML-KEM ops live in `lattice-identity`; this crate owns X25519, the ratchet,
+//! and the AEAD.
+
+use std::collections::{HashMap, VecDeque};
 
 use lattice_core::{Connection, Error, Identity, PeerId, Result, Session, Verify};
 use lattice_identity::{Keypair, PublicIdentity};
@@ -37,6 +45,16 @@ use zeroize::{Zeroize, Zeroizing};
 const HS_DOMAIN: &[u8] = b"lattice-session-hs-v1";
 const HEADER_LEN: usize = 32 + 8 + 8; // ratchet pubkey ‖ prev-chain-len ‖ msg-index
 
+/// Max messages skipped (keys derived) in a single ratchet step — DoS guard.
+const MAX_SKIP: u64 = 1000;
+/// Max skipped message keys retained across the session — FIFO-evicted.
+const MAX_SKIPPED_KEYS: usize = 2048;
+
+/// A symmetric message key.
+type MessageKey = Zeroizing<[u8; 32]>;
+/// Identifies a skipped message: `(sender ratchet pubkey, message index)`.
+type SkippedId = ([u8; 32], u64);
+
 /// The initiator's one-pass handshake message, sent to the responder.
 #[derive(Clone, Debug)]
 pub struct Handshake {
@@ -46,17 +64,58 @@ pub struct Handshake {
     pub mlkem_ct: Vec<u8>,
 }
 
+/// The mutable Double-Ratchet state. Cloned into a scratch copy on `open` so
+/// changes can be discarded if the message fails to authenticate.
+#[derive(Clone)]
+struct RatchetCore {
+    rk: Zeroizing<[u8; 32]>,          // root key
+    dhs: XStaticSecret,               // our current ratchet secret
+    dhs_pub: [u8; 32],                // our current ratchet public
+    dhr: Option<[u8; 32]>,            // their current ratchet public
+    cks: Option<Zeroizing<[u8; 32]>>, // sending chain key
+    ckr: Option<Zeroizing<[u8; 32]>>, // receiving chain key
+    ns: u64,                          // messages sent in current chain
+    nr: u64,                          // messages received in current chain
+    pn: u64,                          // messages in previous sending chain
+}
+
+/// Bounded store of skipped message keys, keyed by `(ratchet pubkey, index)`.
+#[derive(Default)]
+struct Skipped {
+    map: HashMap<SkippedId, MessageKey>,
+    order: VecDeque<SkippedId>, // insertion order for FIFO eviction
+}
+
+impl Skipped {
+    fn insert(&mut self, key: SkippedId, mk: MessageKey) {
+        if self.map.contains_key(&key) {
+            return;
+        }
+        while self.map.len() >= MAX_SKIPPED_KEYS {
+            match self.order.pop_front() {
+                Some(old) => {
+                    self.map.remove(&old);
+                }
+                None => break,
+            }
+        }
+        self.order.push_back(key);
+        self.map.insert(key, mk);
+    }
+
+    fn get(&self, key: &SkippedId) -> Option<MessageKey> {
+        self.map.get(key).cloned()
+    }
+
+    fn remove(&mut self, key: &SkippedId) {
+        self.map.remove(key); // stale `order` entry is harmless (no-op on evict)
+    }
+}
+
 /// An established secure channel running a Double Ratchet.
 pub struct SecureSession {
-    rk: Zeroizing<[u8; 32]>,            // root key
-    dhs: XStaticSecret,                 // our current ratchet secret
-    dhs_pub: [u8; 32],                  // our current ratchet public
-    dhr: Option<[u8; 32]>,              // their current ratchet public
-    cks: Option<Zeroizing<[u8; 32]>>,   // sending chain key
-    ckr: Option<Zeroizing<[u8; 32]>>,   // receiving chain key
-    ns: u64,                            // messages sent in current chain
-    nr: u64,                            // messages received in current chain
-    pn: u64,                            // messages in previous sending chain
+    core: RatchetCore,
+    skipped: Skipped,
 }
 
 /// Output of the initiator's hybrid-KEM handshake.
@@ -76,7 +135,7 @@ impl SecureSession {
         let dhr = peer.x25519_bytes();
         let (rk, cks) = kdf_rk(&sk, &dh(&dhs, &dhr));
 
-        let session = Self {
+        let core = RatchetCore {
             rk,
             dhs,
             dhs_pub,
@@ -87,6 +146,7 @@ impl SecureSession {
             nr: 0,
             pn: 0,
         };
+        let session = Self { core, skipped: Skipped::default() };
         Ok((Handshake { eph_x25519: eph_pub, mlkem_ct }, session))
     }
 
@@ -94,9 +154,9 @@ impl SecureSession {
     /// responder has no sending chain until it receives the first message.
     pub fn accept(me: &Keypair, peer: &PublicIdentity, hs: &Handshake) -> Result<Self> {
         let sk = kem_accept(me, peer, hs)?;
-        Ok(Self {
+        let core = RatchetCore {
             rk: sk,
-            dhs: me.x25519_secret(),            // initial ratchet key = identity X25519
+            dhs: me.x25519_secret(), // initial ratchet key = identity X25519
             dhs_pub: me.public().x25519_bytes(),
             dhr: None,
             cks: None,
@@ -104,34 +164,38 @@ impl SecureSession {
             ns: 0,
             nr: 0,
             pn: 0,
-        })
+        };
+        Ok(Self { core, skipped: Skipped::default() })
     }
 
     /// Encrypt the next outbound message. Output is `header ‖ ciphertext`, with
     /// the header (ratchet pubkey, counters) authenticated as AAD.
     pub fn seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let ck = self
+        let c = &mut self.core;
+        let ck = c
             .cks
             .clone()
             .ok_or_else(|| Error::Crypto("no sending chain yet (receive a message first)".into()))?;
         let (mk, next) = chain_step(&ck);
 
         let mut header = Vec::with_capacity(HEADER_LEN);
-        header.extend_from_slice(&self.dhs_pub);
-        header.extend_from_slice(&self.pn.to_le_bytes());
-        header.extend_from_slice(&self.ns.to_le_bytes());
+        header.extend_from_slice(&c.dhs_pub);
+        header.extend_from_slice(&c.pn.to_le_bytes());
+        header.extend_from_slice(&c.ns.to_le_bytes());
 
         let ct = aead_seal(&mk, &header, plaintext)?;
-        self.cks = Some(next);
-        self.ns += 1;
+        c.cks = Some(next);
+        c.ns += 1;
 
         let mut out = header;
         out.extend_from_slice(&ct);
         Ok(out)
     }
 
-    /// Decrypt the next inbound message. In-order only: rejects gaps, reorders,
-    /// and tampering, and never advances state on failure.
+    /// Decrypt the next inbound message. Handles in-order, out-of-order, and
+    /// across-ratchet delivery via the bounded skipped-key cache. All state
+    /// changes happen on a scratch copy and are committed only after the AEAD
+    /// verifies — a tampered/forged frame never advances or desyncs the ratchet.
     pub fn open(&mut self, framed: &[u8]) -> Result<Vec<u8>> {
         if framed.len() < HEADER_LEN {
             return Err(Error::Verify("truncated frame".into()));
@@ -140,53 +204,93 @@ impl SecureSession {
         let ct = &framed[HEADER_LEN..];
         let mut their_pub = [0u8; 32];
         their_pub.copy_from_slice(&framed[..32]);
+        let their_pn = u64::from_le_bytes(framed[32..40].try_into().expect("8 bytes"));
         let their_ns = u64::from_le_bytes(framed[40..48].try_into().expect("8 bytes"));
 
-        if self.dhr.as_ref() == Some(&their_pub) {
-            // Same DH chain: pure symmetric ratchet step (no desync on failure).
-            if their_ns != self.nr {
-                return Err(Error::Verify("out-of-order or replayed message".into()));
-            }
-            let ck = self
-                .ckr
-                .clone()
-                .ok_or_else(|| Error::Verify("no receiving chain".into()))?;
-            let (mk, next) = chain_step(&ck);
+        // 1) Already-skipped key (out-of-order arrival of a previously-skipped
+        //    message). Get + verify + remove-on-success: a failure keeps the key.
+        let sk_key = (their_pub, their_ns);
+        if let Some(mk) = self.skipped.get(&sk_key) {
             let pt = aead_open(&mk, header, ct)?;
-            self.ckr = Some(next);
-            self.nr += 1;
-            Ok(pt)
-        } else {
-            // New DH chain: ratchet step. In-order => must be its first message.
-            if their_ns != 0 {
-                return Err(Error::Verify(
-                    "skipped messages across a ratchet step are not supported".into(),
-                ));
-            }
-            // Compute the receiving side tentatively; commit only if AEAD passes.
-            let (rk1, ckr_new) = kdf_rk(&self.rk, &dh(&self.dhs, &their_pub));
-            let (mk, next_ckr) = chain_step(&ckr_new);
-            let pt = aead_open(&mk, header, ct)?;
-
-            // Commit receiving side.
-            self.pn = self.ns;
-            self.ns = 0;
-            self.nr = 1;
-            self.dhr = Some(their_pub);
-            self.rk = rk1;
-            self.ckr = Some(next_ckr);
-
-            // Advance the sending side: fresh ratchet key mixed into the root.
-            let (new_dhs, new_pub) = gen_ratchet_key()?;
-            let (rk2, cks_new) = kdf_rk(&self.rk, &dh(&new_dhs, &their_pub));
-            self.rk = rk2;
-            self.cks = Some(cks_new);
-            self.dhs = new_dhs;
-            self.dhs_pub = new_pub;
-
-            Ok(pt)
+            self.skipped.remove(&sk_key);
+            return Ok(pt);
         }
+
+        // 2) Work on a scratch copy; collect newly-skipped keys to commit later.
+        let mut w = self.core.clone();
+        let mut fresh: Vec<(SkippedId, MessageKey)> = Vec::new();
+
+        if w.dhr.as_ref() != Some(&their_pub) {
+            // New DH chain: drain the rest of the current receiving chain (its
+            // length is `their_pn`), then perform the DH ratchet step.
+            skip_recv(&mut w, &mut fresh, their_pn)?;
+            dh_ratchet(&mut w, their_pub)?;
+        }
+        // Skip within the current receiving chain up to the message index.
+        skip_recv(&mut w, &mut fresh, their_ns)?;
+
+        // 3) Derive the target message key (index == their_ns) and decrypt.
+        let ckr = w
+            .ckr
+            .clone()
+            .ok_or_else(|| Error::Verify("no receiving chain".into()))?;
+        let (mk, next) = chain_step(&ckr);
+        let pt = aead_open(&mk, header, ct)?; // failure → discard `w` and `fresh`
+
+        // 4) Commit: advance the scratch state, then store skipped keys.
+        w.ckr = Some(next);
+        w.nr += 1;
+        self.core = w;
+        for (k, mk) in fresh {
+            self.skipped.insert(k, mk);
+        }
+        Ok(pt)
     }
+}
+
+/// Derive (and stash) receiving-chain message keys for indices `[nr, until)`,
+/// advancing the chain. Bounded by `MAX_SKIP` to prevent a forged header from
+/// forcing unbounded key derivation.
+fn skip_recv(w: &mut RatchetCore, fresh: &mut Vec<(SkippedId, MessageKey)>, until: u64) -> Result<()> {
+    if until <= w.nr {
+        return Ok(()); // target is current or already passed (replay handled in open)
+    }
+    if until - w.nr > MAX_SKIP {
+        return Err(Error::Verify("too many skipped messages".into()));
+    }
+    let (dhr, mut ck) = match (w.dhr, &w.ckr) {
+        (Some(p), Some(c)) => (p, c.clone()),
+        _ => return Ok(()), // no receiving chain yet
+    };
+    while w.nr < until {
+        let (mk, next) = chain_step(&ck);
+        fresh.push(((dhr, w.nr), mk));
+        ck = next;
+        w.nr += 1;
+    }
+    w.ckr = Some(ck);
+    Ok(())
+}
+
+/// Perform a DH ratchet step on the scratch state: re-key the root from the
+/// peer's new ratchet public key, reset chains, and generate our next key.
+fn dh_ratchet(w: &mut RatchetCore, their_pub: [u8; 32]) -> Result<()> {
+    w.pn = w.ns;
+    w.ns = 0;
+    w.nr = 0;
+    w.dhr = Some(their_pub);
+
+    let (rk1, ckr) = kdf_rk(&w.rk, &dh(&w.dhs, &their_pub));
+    w.rk = rk1;
+    w.ckr = Some(ckr);
+
+    let (new_dhs, new_pub) = gen_ratchet_key()?;
+    let (rk2, cks) = kdf_rk(&w.rk, &dh(&new_dhs, &their_pub));
+    w.rk = rk2;
+    w.cks = Some(cks);
+    w.dhs = new_dhs;
+    w.dhs_pub = new_pub;
+    Ok(())
 }
 
 // --- handshake (hybrid KEM) ------------------------------------------------
@@ -429,11 +533,49 @@ mod tests {
     }
 
     #[test]
-    fn out_of_order_is_rejected() {
+    fn out_of_order_within_chain_is_delivered() {
         let (mut a, mut b) = pair();
-        let _m0 = a.seal(b"first").unwrap();
+        let m0 = a.seal(b"first").unwrap();
         let m1 = a.seal(b"second").unwrap();
-        assert!(b.open(&m1).is_err(), "skipping m0 must be rejected");
+        let m2 = a.seal(b"third").unwrap();
+        // Deliver out of order: 2, then 0, then 1.
+        assert_eq!(b.open(&m2).unwrap(), b"third"); // skips + caches keys 0,1
+        assert_eq!(b.open(&m0).unwrap(), b"first"); // from cache
+        assert_eq!(b.open(&m1).unwrap(), b"second"); // from cache
+    }
+
+    #[test]
+    fn out_of_order_across_ratchet_is_delivered() {
+        let (mut a, mut b) = pair();
+        // Establish the chains in both directions first.
+        let a0 = a.seal(b"a0").unwrap();
+        assert_eq!(b.open(&a0).unwrap(), b"a0");
+        let b0 = b.seal(b"b0").unwrap();
+        assert_eq!(a.open(&b0).unwrap(), b"b0");
+        // Alice sends two on her new chain; deliver the second one first.
+        let a1 = a.seal(b"a1").unwrap();
+        let a2 = a.seal(b"a2").unwrap();
+        assert_eq!(b.open(&a2).unwrap(), b"a2");
+        assert_eq!(b.open(&a1).unwrap(), b"a1"); // from skipped cache
+    }
+
+    #[test]
+    fn replay_is_rejected() {
+        let (mut a, mut b) = pair();
+        let m0 = a.seal(b"once").unwrap();
+        assert_eq!(b.open(&m0).unwrap(), b"once");
+        assert!(b.open(&m0).is_err(), "a consumed message must not replay");
+    }
+
+    #[test]
+    fn gap_beyond_max_skip_is_rejected() {
+        let (mut a, mut b) = pair();
+        let mut last = Vec::new();
+        for i in 0..(MAX_SKIP + 2) {
+            last = a.seal(format!("m{i}").as_bytes()).unwrap();
+        }
+        // First message Bob sees is index MAX_SKIP+1 → gap exceeds the cap.
+        assert!(b.open(&last).is_err(), "gap beyond MAX_SKIP must be rejected");
     }
 
     #[test]

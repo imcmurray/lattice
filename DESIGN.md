@@ -161,13 +161,13 @@ Crate status: **pinned & wired** in `lattice-identity` — `ed25519-dalek` 2, `x
 |---|---|---|
 | Identity signatures | Ed25519 + ML-DSA-65 hybrid (AND-verify) | **Done** |
 | Identity key material | carries X25519 + ML-KEM-768 public keys | **Done** (keys derived & published) |
-| Session confidentiality | hybrid KEM (X25519 + ML-KEM-768) → HKDF combiner → Double Ratchet → ChaCha20-Poly1305 | **Done** — handshake + Double Ratchet (forward secrecy + post-compromise security); skipped-key / out-of-order handling pending |
+| Session confidentiality | hybrid KEM (X25519 + ML-KEM-768) → HKDF combiner → Double Ratchet → ChaCha20-Poly1305 | **Done** — handshake + Double Ratchet (forward secrecy + post-compromise security) + bounded skipped-key cache (out-of-order / dropped frames) |
 | Access control | UCAN-style signed capabilities (offline-verifiable) | **Done** — single-hop grants; multi-hop delegation pending |
 | Transport (iroh/QUIC-TLS) | independent; app-layer session crypto is the real protection | out of our hands; do not rely on it for E2E |
 | Capabilities | signed with the hybrid identity | inherited once caps sign via `Identity` |
 
 **Caveats recorded honestly:**
-- **PQ ≠ forward secrecy** — orthogonal, and the session now has both axes: the PQ-hybrid handshake protects the *initial* secret; the Double Ratchet provides per-message *forward secrecy* (symmetric chain) and *post-compromise security* (DH ratchet re-keys the root each direction flip). Still pending: skipped-message-key storage (out-of-order delivery). Note the DH ratchet's healing leg is classical X25519 — fully-PQ ratcheting remains open research.
+- **PQ ≠ forward secrecy** — orthogonal, and the session has both axes: the PQ-hybrid handshake protects the *initial* secret; the Double Ratchet provides per-message *forward secrecy* (symmetric chain) and *post-compromise security* (DH ratchet re-keys the root each direction flip). Out-of-order / dropped frames are handled by a bounded skipped-key cache (`MAX_SKIP` per step, FIFO-evicted total), and `open` skips/ratchets on a scratch copy committed only on AEAD success — so a forged header can't advance the ratchet. Note the DH ratchet's healing leg is classical X25519 — fully-PQ ratcheting remains open research.
 - **Size/bandwidth cost is real** — ML-DSA-65 signatures ≈ 3.3 KB and ML-KEM-768 keys ≈ 1.2 KB, vs. 64 B for Ed25519. In a system that gossips keys and signs every log entry this is a genuine budget; measure early and consider signing batch roots rather than every entry.
 - **Until the session KEM lands, message confidentiality is classical-only and therefore HNDL-exposed.** This is the next PQ priority.
 
