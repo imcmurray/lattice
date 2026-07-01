@@ -5,9 +5,17 @@ yanked = "deny"
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Internal workspace crates are referenced by path with a "*" version; keep the
+# wildcard ban for external crates but allow it for our own path deps.
+allow-wildcard-paths = true
 
 [licenses]
-allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "MPL-2.0", "Unicode-3.0"]
+# All permissive / public-domain-equivalent. Unlicense + CC0-1.0 are common in
+# the Rust ecosystem (e.g. tiny-keccak, notify); Zlib is a permissive BSD-alike.
+allow = [
+    "MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "MPL-2.0",
+    "Unicode-3.0", "Unlicense", "CC0-1.0", "Zlib", "CDLA-Permissive-2.0",
+]
 confidence-threshold = 0.9
 
 [sources]
