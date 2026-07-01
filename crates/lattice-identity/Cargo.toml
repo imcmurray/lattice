@@ -35,7 +35,7 @@ zeroize = "1"
 # Post-quantum (optional, default-on). FIPS 204 / FIPS 203 (RustCrypto).
 ml-dsa = { version = "0.1", optional = true }
 ml-kem = { version = "0.3", optional = true }
-getrandom = { version = "0.2", optional = true }
+getrandom = { version = "0.4", optional = true }
 
 # At-rest storage (feature = "storage").
 keyring = { version = "4", optional = true }
