@@ -8,8 +8,8 @@
 //! opaque here (the `lattice-identity` `PublicIdentity` encoding).
 
 use iroh::endpoint::presets;
-pub use iroh::endpoint::{RecvStream, SendStream};
 use iroh::endpoint::Connection as IrohConnection;
+pub use iroh::endpoint::{RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use lattice_core::{Connection, Error, PeerId, Result, Topic, Transport};
 use serde::{Deserialize, Serialize};
@@ -83,7 +83,10 @@ impl ConnHandle {
                     rtt_ms: (ms != 0).then_some(ms),
                 }
             }
-            None => LinkInfo { direct: false, rtt_ms: None },
+            None => LinkInfo {
+                direct: false,
+                rtt_ms: None,
+            },
         }
     }
 }
