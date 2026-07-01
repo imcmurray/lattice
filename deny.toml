@@ -1,6 +1,14 @@
 # cargo-deny — supply-chain gates (DESIGN.md §6.8). Run: `cargo deny check`.
 [advisories]
 yanked = "deny"
+# Documented exceptions: unmaintained (NOT vulnerable) transitive crates with no
+# upgrade path available. Real vulnerabilities — and any newly-flagged crate —
+# still fail CI. Revisit and remove these as upstreams drop the dependencies.
+ignore = [
+    "RUSTSEC-2023-0089",  # atomic-polyfill unmaintained (transitive)
+    "RUSTSEC-2024-0436",  # paste unmaintained (transitive; macro helper)
+    "RUSTSEC-2026-0173",  # proc-macro-error2 unmaintained (transitive)
+]
 
 [bans]
 multiple-versions = "warn"
