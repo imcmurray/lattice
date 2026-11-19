@@ -67,8 +67,8 @@ async fn run() -> Result<()> {
     );
     if loaded.migrated {
         eprintln!(
-            "[lattice-net] ⚠ migrated your legacy plaintext identity into secure storage ({:?}). \
-             The old file is backed up at <dir>/identity.legacy.bak — delete it once you've confirmed things work.",
+            "[lattice-net] ⚠ migrated your legacy plaintext identity into secure storage ({:?}); \
+             the legacy plaintext file was removed.",
             loaded.backend
         );
     }
@@ -136,11 +136,11 @@ async fn listen(me: Keypair, mut lines: StdinLines) -> Result<()> {
 
 /// Read the dialer's preamble; resume a kept session if asked and available,
 /// otherwise run a fresh handshake. Returns the peer id and the live session.
-async fn accept_or_resume(
-    mut conn: IrohConn,
+async fn accept_or_resume<C: Connection>(
+    mut conn: C,
     me: &Keypair,
     sessions: &mut HashMap<PeerId, SecureSession>,
-) -> Result<(PeerId, ConnectedSession<IrohConn>)> {
+) -> Result<(PeerId, ConnectedSession<C>)> {
     let preamble = conn.recv().await?;
     let mode = *preamble
         .first()
@@ -148,20 +148,23 @@ async fn accept_or_resume(
     let peer = PublicIdentity::from_bytes(&preamble[1..])?;
     let peer_id = peer.peer_id();
 
-    if mode == MODE_RESUME {
+    if mode == MODE_RESUME && sessions.contains_key(&peer_id) {
+        // Send first: a failed send leaves the kept session in place.
+        conn.send(&[DECISION_RESUMED]).await?;
         if let Some(sess) = sessions.remove(&peer_id) {
-            conn.send(&[DECISION_RESUMED]).await?;
             eprintln!(
                 "[lattice-net] {:?} resumed — no re-handshake — type messages:",
                 peer_id
             );
             return Ok((peer_id, ConnectedSession::resume(conn, sess)));
         }
+        return Err(Error::Verify("kept session vanished during resume".into()));
     }
     // Fresh handshake (requested, or resume with no kept session).
-    sessions.remove(&peer_id); // drop any stale session for this peer
     conn.send(&[DECISION_FRESH]).await?;
     let cs = ConnectedSession::accept(conn, me, &peer).await?;
+    // Only a successful handshake replaces the stale session for this peer.
+    sessions.remove(&peer_id);
     eprintln!(
         "[lattice-net] {:?} connected (fresh session) — type messages:",
         peer_id
@@ -221,7 +224,9 @@ async fn dial_once(
     let resumed = decision.first() == Some(&DECISION_RESUMED);
 
     let cs = if resumed {
-        let sess = kept.take().expect("resume decision implies a kept session");
+        let sess = kept
+            .take()
+            .ok_or_else(|| Error::Verify("peer claimed resume but no session is kept".into()))?;
         eprintln!(
             "[lattice-net] resumed with {:?} — no re-handshake — type messages:",
             peer.peer_id()
@@ -305,4 +310,77 @@ async fn chat(
     let _ = reader.await;
     let recovered = Arc::try_unwrap(secure).ok().map(|m| m.into_inner());
     Ok((outcome, recovered))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id() -> Keypair {
+        Keypair::generate(CryptoSuite::Hybrid).unwrap()
+    }
+
+    /// Connected in-memory pair: (dialer end, listener end).
+    async fn pair() -> (MemoryConn, MemoryConn) {
+        let net = MemoryNetwork::new();
+        let (a, b) = (PeerId([1u8; 32]), PeerId([2u8; 32]));
+        let ta = net.endpoint(a);
+        let tb = net.endpoint(b.clone());
+        let dial = ta.connect(&b).await.unwrap();
+        let (_, listen) = tb.accept().await.unwrap();
+        (dial, listen)
+    }
+
+    fn stale(alice: &Keypair, bob: &Keypair) -> HashMap<PeerId, SecureSession> {
+        let (_, s) = SecureSession::initiate(bob, alice.public()).unwrap();
+        HashMap::from([(alice.peer_id(), s)])
+    }
+
+    async fn preamble(conn: &mut MemoryConn, mode: u8, who: &Keypair) {
+        let mut p = vec![mode];
+        p.extend_from_slice(&who.public().to_bytes());
+        conn.send(&p).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn forged_initiator_keeps_stale_session() {
+        let (alice, bob, eve) = (id(), id(), id());
+        let mut sessions = stale(&alice, &bob);
+        let (mut dial, listen) = pair().await;
+        preamble(&mut dial, MODE_FRESH, &alice).await;
+        // Eve's handshake, claimed to come from Alice.
+        let _dialer = ConnectedSession::initiate(dial, &eve, bob.public())
+            .await
+            .unwrap();
+        let r = accept_or_resume(listen, &bob, &mut sessions).await;
+        assert!(r.is_err());
+        assert!(sessions.contains_key(&alice.peer_id()));
+    }
+
+    #[tokio::test]
+    async fn genuine_fresh_handshake_replaces_stale_session() {
+        let (alice, bob) = (id(), id());
+        let mut sessions = stale(&alice, &bob);
+        let (mut dial, listen) = pair().await;
+        preamble(&mut dial, MODE_FRESH, &alice).await;
+        // Keep the dialer end alive so the listener's decision byte can be sent.
+        let _dialer = ConnectedSession::initiate(dial, &alice, bob.public())
+            .await
+            .unwrap();
+        let r = accept_or_resume(listen, &bob, &mut sessions).await;
+        assert!(r.is_ok());
+        assert!(!sessions.contains_key(&alice.peer_id()));
+    }
+
+    #[tokio::test]
+    async fn resume_with_kept_session_succeeds() {
+        let (alice, bob) = (id(), id());
+        let mut sessions = stale(&alice, &bob);
+        let (mut dial, listen) = pair().await;
+        preamble(&mut dial, MODE_RESUME, &alice).await;
+        let r = accept_or_resume(listen, &bob, &mut sessions).await;
+        assert!(r.is_ok());
+        assert_eq!(dial.recv().await.unwrap(), vec![DECISION_RESUMED]);
+        assert!(!sessions.contains_key(&alice.peer_id()));
+    }
 }

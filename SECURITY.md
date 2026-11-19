@@ -6,6 +6,18 @@
 > and BLAKE3-chained signed logs — but none of it has had external review. Do
 > not use it to protect information whose disclosure would harm you.
 
+## Known limitations
+
+- Lattice is experimental, and this patch is not an external audit.
+- The handshake initiator is authenticated by a hybrid signature (Ed25519 and
+  ML-DSA) over the v2 handshake transcript (`lattice-session-hs-v2`).
+- Compromise of a long-term identity still decrypts recorded sessions. The KEM
+  targets the responder's static X25519 and ML-KEM keys, and the responder's
+  first ratchet secret is that static X25519 key.
+- The `lattice-net` listen ticket is an unsigned bearer token for reachability.
+  The Lattice identity is not bound to the iroh endpoint id.
+- `lattice-net` must not be used for real secrets.
+
 ## Reporting a vulnerability
 
 Please report security issues **privately** — don't open a public issue or PR.

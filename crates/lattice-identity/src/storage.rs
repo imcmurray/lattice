@@ -13,8 +13,12 @@
 //!
 //! The chosen backend is recorded in `<dir>/config.toml`. A legacy plaintext
 //! `<dir>/identity` file (from earlier versions) is migrated on first load:
-//! re-encrypted under the new scheme, with the plaintext renamed to
-//! `identity.legacy.bak` (not deleted) so nothing is lost.
+//! re-encrypted under the new scheme, and the plaintext file is then deleted
+//! (no `.bak` copy is kept).
+//!
+//! Keyring errors other than "no entry" are fatal (fail closed): nothing is
+//! generated or written. On hosts without a working keychain set
+//! `LATTICE_STORAGE=age` to use the encrypted-file backend.
 //!
 //! Env overrides: `LATTICE_DIR` (storage dir, default `~/.lattice`),
 //! `LATTICE_PASSPHRASE` (age passphrase, skips the prompt),
@@ -93,6 +97,14 @@ impl IdentityStore {
     /// Load the stored identity, migrating a legacy plaintext file if present,
     /// or generate and persist a fresh one on first use.
     pub fn load_or_create(&self, suite: CryptoSuite) -> Result<LoadedIdentity> {
+        self.load_or_create_with(suite, keyring_load)
+    }
+
+    fn load_or_create_with(
+        &self,
+        suite: CryptoSuite,
+        keyring_load: impl Fn() -> Result<Option<Zeroizing<String>>>,
+    ) -> Result<LoadedIdentity> {
         std::fs::create_dir_all(&self.dir).map_err(|e| io("create dir", e))?;
         let cfg = self.read_config();
 
@@ -107,8 +119,12 @@ impl IdentityStore {
             );
             let keypair = Keypair::from_mnemonic(suite, &phrase)?;
             let backend = self.persist(&phrase)?;
-            let bak = self.dir.join("identity.legacy.bak");
-            let _ = std::fs::rename(&legacy, &bak);
+            std::fs::remove_file(&legacy).map_err(|e| {
+                Error::Other(format!(
+                    "remove legacy plaintext identity {}: {e}",
+                    legacy.display()
+                ))
+            })?;
             return Ok(LoadedIdentity {
                 keypair,
                 backend,
@@ -118,7 +134,7 @@ impl IdentityStore {
         }
 
         // Load an existing identity.
-        if let Some(phrase) = self.try_load(&cfg)? {
+        if let Some(phrase) = self.try_load(&cfg, &keyring_load)? {
             let keypair = Keypair::from_mnemonic(suite, &phrase)?;
             let backend = cfg.backend.unwrap_or(StorageBackend::Keyring);
             return Ok(LoadedIdentity {
@@ -141,9 +157,13 @@ impl IdentityStore {
         })
     }
 
-    fn try_load(&self, cfg: &Config) -> Result<Option<Zeroizing<String>>> {
+    fn try_load(
+        &self,
+        cfg: &Config,
+        keyring_load: &dyn Fn() -> Result<Option<Zeroizing<String>>>,
+    ) -> Result<Option<Zeroizing<String>>> {
         match cfg.backend {
-            Some(StorageBackend::Keyring) => Ok(keyring_load()),
+            Some(StorageBackend::Keyring) => keyring_load(),
             Some(StorageBackend::AgeFile) => {
                 if self.age_path().exists() {
                     Ok(Some(self.age_load()?))
@@ -154,7 +174,7 @@ impl IdentityStore {
             None => {
                 // No recorded backend: probe keychain, then an age file.
                 if keyring_enabled() {
-                    if let Some(p) = keyring_load() {
+                    if let Some(p) = keyring_load()? {
                         return Ok(Some(p));
                     }
                 }
@@ -229,27 +249,53 @@ fn keyring_save(mnemonic: &str) -> bool {
         .is_ok()
 }
 
-fn keyring_load() -> Option<Zeroizing<String>> {
-    keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
-        .and_then(|e| e.get_password())
-        .ok()
-        .map(Zeroizing::new)
+fn keyring_err(e: keyring::Error) -> Error {
+    Error::Other(format!(
+        "keyring load failed: {e} (set LATTICE_STORAGE=age to use the encrypted-file backend)"
+    ))
+}
+
+fn keyring_load() -> Result<Option<Zeroizing<String>>> {
+    match keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
+        Ok(e) => map_keyring_get(e.get_password()),
+        Err(e) => Err(keyring_err(e)),
+    }
+}
+
+/// Map a keyring read: only "no entry" is `None`; every other error is fatal.
+fn map_keyring_get(
+    r: std::result::Result<String, keyring::Error>,
+) -> Result<Option<Zeroizing<String>>> {
+    match r {
+        Ok(s) => Ok(Some(Zeroizing::new(s))),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(keyring_err(e)),
+    }
+}
+
+fn validate_passphrase(p: Zeroizing<String>) -> Result<Zeroizing<String>> {
+    if p.trim().is_empty() {
+        return Err(Error::Other("empty passphrase is not allowed".into()));
+    }
+    Ok(p)
 }
 
 fn passphrase(confirm: bool) -> Result<Zeroizing<String>> {
     if let Ok(p) = std::env::var("LATTICE_PASSPHRASE") {
-        return Ok(Zeroizing::new(p));
+        return validate_passphrase(Zeroizing::new(p));
     }
-    let p = rpassword::prompt_password("Lattice identity passphrase: ")
-        .map_err(|e| io("read passphrase", e))?;
+    let p = validate_passphrase(Zeroizing::new(
+        rpassword::prompt_password("Lattice identity passphrase: ")
+            .map_err(|e| io("read passphrase", e))?,
+    ))?;
     if confirm {
         let again = rpassword::prompt_password("Confirm passphrase: ")
             .map_err(|e| io("read passphrase", e))?;
-        if p != again {
+        if *p != again {
             return Err(Error::Other("passphrases do not match".into()));
         }
     }
-    Ok(Zeroizing::new(p))
+    Ok(p)
 }
 
 fn secret(p: &Zeroizing<String>) -> age::secrecy::SecretString {
@@ -336,14 +382,61 @@ mod tests {
         );
         assert!(tmp.join("identity.age").exists(), "re-encrypted");
         assert!(
-            tmp.join("identity.legacy.bak").exists(),
-            "plaintext backed up, not deleted"
+            !tmp.join("identity.legacy.bak").exists(),
+            "no backup of the plaintext is kept"
         );
-        assert!(
-            !tmp.join("identity").exists(),
-            "plaintext removed from active path"
+        assert!(!tmp.join("identity").exists(), "plaintext deleted");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn keyring_not_found_maps_to_none() {
+        assert!(matches!(
+            map_keyring_get(Err(keyring::Error::NoEntry)),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn keyring_other_errors_are_fatal() {
+        let r = map_keyring_get(Err(keyring::Error::Invalid("a".into(), "b".into())));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn keyring_success_maps_to_some() {
+        assert!(matches!(map_keyring_get(Ok("words".into())), Ok(Some(_))));
+    }
+
+    #[test]
+    fn keyring_error_creates_nothing() {
+        let tmp = std::env::temp_dir().join(format!("lattice-kr-err-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let cfg = "backend = \"keyring\"\n";
+        std::fs::write(tmp.join("config.toml"), cfg).unwrap();
+
+        let store = IdentityStore::with_dir(tmp.clone());
+        let r = store.load_or_create_with(CryptoSuite::Hybrid, || Err(Error::Other("boom".into())));
+        assert!(r.is_err());
+        assert!(!tmp.join("identity.age").exists());
+        assert_eq!(
+            std::fs::read_to_string(tmp.join("config.toml")).unwrap(),
+            cfg
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn passphrase_validation() {
+        for bad in ["", "   ", "\t\n"] {
+            assert!(validate_passphrase(Zeroizing::new(bad.to_string())).is_err());
+        }
+        for good in ["correct horse battery staple", " x "] {
+            let v = validate_passphrase(Zeroizing::new(good.to_string())).unwrap();
+            assert_eq!(v.as_str(), good);
+        }
     }
 }

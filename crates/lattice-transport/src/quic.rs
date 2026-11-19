@@ -5,7 +5,9 @@
 //! preserving in-order delivery for the Double Ratchet. Tickets carry our
 //! address plus an opaque app-identity blob so the dialer can authenticate the
 //! handshake. The transport is identity-agnostic: the app-identity bytes are
-//! opaque here (the `lattice-identity` `PublicIdentity` encoding).
+//! opaque here (the `lattice-identity` `PublicIdentity` encoding). `read_frame`
+//! rejects any frame whose declared length exceeds 64 KiB ([`MAX_FRAME_LEN`])
+//! before allocating.
 
 use iroh::endpoint::presets;
 use iroh::endpoint::Connection as IrohConnection;
@@ -27,6 +29,20 @@ struct Ticket {
     app_identity: Vec<u8>,
 }
 
+/// Largest frame body `read_frame` will accept (64 KiB).
+pub const MAX_FRAME_LEN: usize = 65_536;
+
+/// Validate a received length prefix before allocating. Pure; no I/O, no allocation.
+fn check_frame_len(n: u32) -> Result<usize> {
+    let n = n as usize;
+    if n > MAX_FRAME_LEN {
+        return Err(Error::Transport(format!(
+            "frame too large: {n} > {MAX_FRAME_LEN}"
+        )));
+    }
+    Ok(n)
+}
+
 /// Write one length-prefixed frame to a QUIC send stream.
 pub async fn write_frame(s: &mut SendStream, msg: &[u8]) -> Result<()> {
     s.write_all(&(msg.len() as u32).to_be_bytes())
@@ -42,7 +58,7 @@ pub async fn read_frame(r: &mut RecvStream) -> Result<Vec<u8>> {
     r.read_exact(&mut len)
         .await
         .map_err(|e| terr("read len", e))?;
-    let n = u32::from_be_bytes(len) as usize;
+    let n = check_frame_len(u32::from_be_bytes(len))?;
     let mut buf = vec![0u8; n];
     r.read_exact(&mut buf)
         .await
@@ -212,5 +228,25 @@ impl Transport for IrohTransport {
 
     async fn lookup(&self, _topic: &Topic) -> Result<Vec<PeerId>> {
         Ok(vec![]) // topic-based discovery is future work
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_frames_are_rejected() {
+        assert!(matches!(
+            check_frame_len(u32::MAX),
+            Err(Error::Transport(_))
+        ));
+        assert!(matches!(check_frame_len(65_537), Err(Error::Transport(_))));
+    }
+
+    #[test]
+    fn boundary_frames_are_accepted() {
+        assert_eq!(check_frame_len(65_536).unwrap(), 65_536);
+        assert_eq!(check_frame_len(0).unwrap(), 0);
     }
 }
