@@ -10,9 +10,10 @@
 //!
 //! Reconnects use **session resumption** (ADR-006): on a drop, each side keeps
 //! its `SecureSession`; the dialer's reconnect preamble signals `resume`, and if
-//! the listener still holds that peer's session both rebind to the new
-//! connection with no re-handshake. If either side lost its state (e.g. a
-//! restart), they fall back to a fresh handshake.
+//! the listener still holds that peer's session both sides exchange HMAC proofs
+//! keyed by the session's secret (`lattice-resume-v1`); only when both verify do
+//! they rebind to the new connection with no re-handshake. If either side lost
+//! its state (e.g. a restart), they fall back to a fresh handshake.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,16 +21,24 @@ use std::time::Duration;
 
 use lattice::identity::storage::IdentityStore;
 use lattice::prelude::*;
+use lattice::session::{resume_nonce, ResumeRole};
 use lattice::transport::{read_frame, write_frame, IrohConn, IrohTransport};
 use tokio::io::{AsyncBufReadExt, BufReader, Lines, Stdin};
 use tokio::sync::{Mutex, Notify};
 
-// Connection preamble: the dialer's first frame is [mode] ++ its identity bundle.
+// Connection preamble: the dialer's first frame is
+// [mode] ++ dialer_nonce[32] ++ its identity bundle (nonce is zero for fresh).
 const MODE_FRESH: u8 = 0;
 const MODE_RESUME: u8 = 1;
-// The listener's reply byte: did it resume an existing session?
+// The listener's reply: fresh handshake, or a resume challenge
+// [DECISION_CHALLENGE] ++ listener_nonce[32] ++ listener_tag[32]; the dialer then
+// answers with its own 32-byte tag (see `ResumeRole`). Resuming needs both proofs.
 const DECISION_FRESH: u8 = 0;
+// Legacy unauthenticated resume: no longer sent; a dialer receiving it errors.
 const DECISION_RESUMED: u8 = 1;
+const DECISION_CHALLENGE: u8 = 2;
+const NONCE_LEN: usize = 32;
+const TAG_LEN: usize = 32;
 
 type StdinLines = Lines<BufReader<Stdin>>;
 
@@ -142,23 +151,50 @@ async fn accept_or_resume<C: Connection>(
     sessions: &mut HashMap<PeerId, SecureSession>,
 ) -> Result<(PeerId, ConnectedSession<C>)> {
     let preamble = conn.recv().await?;
-    let mode = *preamble
-        .first()
-        .ok_or_else(|| Error::Verify("empty preamble".into()))?;
-    let peer = PublicIdentity::from_bytes(&preamble[1..])?;
+    if preamble.len() < 1 + NONCE_LEN {
+        return Err(Error::Verify("short preamble".into()));
+    }
+    let mode = preamble[0];
+    let mut dialer_nonce = [0u8; NONCE_LEN];
+    dialer_nonce.copy_from_slice(&preamble[1..1 + NONCE_LEN]);
+    let peer = PublicIdentity::from_bytes(&preamble[1 + NONCE_LEN..])?;
     let peer_id = peer.peer_id();
 
-    if mode == MODE_RESUME && sessions.contains_key(&peer_id) {
-        // Send first: a failed send leaves the kept session in place.
-        conn.send(&[DECISION_RESUMED]).await?;
-        if let Some(sess) = sessions.remove(&peer_id) {
+    if mode == MODE_RESUME {
+        if let Some(kept) = sessions.get(&peer_id) {
+            // Prove we hold the session, then require the dialer's proof
+            // *before* the session is removed from the map or used.
+            let listener_nonce = resume_nonce()?;
+            let listener_tag = kept.resume_tag(
+                ResumeRole::Listener,
+                &peer,
+                me.public(),
+                &dialer_nonce,
+                &listener_nonce,
+            );
+            let mut challenge = Vec::with_capacity(1 + NONCE_LEN + TAG_LEN);
+            challenge.push(DECISION_CHALLENGE);
+            challenge.extend_from_slice(&listener_nonce);
+            challenge.extend_from_slice(&listener_tag);
+            conn.send(&challenge).await?;
+            let tag = conn.recv().await?;
+            kept.verify_resume_tag(
+                ResumeRole::Dialer,
+                &peer,
+                me.public(),
+                &dialer_nonce,
+                &listener_nonce,
+                &tag,
+            )?;
+            let sess = sessions
+                .remove(&peer_id)
+                .ok_or_else(|| Error::Verify("kept session vanished during resume".into()))?;
             eprintln!(
                 "[lattice-net] {:?} resumed — no re-handshake — type messages:",
                 peer_id
             );
             return Ok((peer_id, ConnectedSession::resume(conn, sess)));
         }
-        return Err(Error::Verify("kept session vanished during resume".into()));
     }
     // Fresh handshake (requested, or resume with no kept session).
     conn.send(&[DECISION_FRESH]).await?;
@@ -199,6 +235,83 @@ async fn connect(me: Keypair, ticket: String, mut lines: StdinLines) -> Result<(
     Ok(())
 }
 
+/// Dialer-side negotiation after the transport connects: send the preamble,
+/// then either resume the kept session (after a mutual proof) or run a fresh
+/// handshake. `kept` is only taken once the outcome is certain.
+async fn negotiate_dial<C: Connection>(
+    mut conn: C,
+    me: &Keypair,
+    peer: &PublicIdentity,
+    kept: &mut Option<SecureSession>,
+) -> Result<ConnectedSession<C>> {
+    // Preamble: [mode] ++ dialer nonce ++ our identity bundle.
+    let (mode, dialer_nonce) = if kept.is_some() {
+        (MODE_RESUME, resume_nonce()?)
+    } else {
+        (MODE_FRESH, [0u8; NONCE_LEN])
+    };
+    let mut preamble = vec![mode];
+    preamble.extend_from_slice(&dialer_nonce);
+    preamble.extend_from_slice(&me.public().to_bytes());
+    conn.send(&preamble).await?;
+
+    let decision = conn.recv().await?;
+    match decision.first().copied() {
+        Some(DECISION_FRESH) => {
+            if kept.take().is_some() {
+                eprintln!("[lattice-net] peer couldn't resume — fresh handshake");
+            }
+            let cs = ConnectedSession::initiate(conn, me, peer).await?;
+            eprintln!(
+                "[lattice-net] connected to {:?} (fresh session) — type messages:",
+                peer.peer_id()
+            );
+            Ok(cs)
+        }
+        Some(DECISION_CHALLENGE) => {
+            let Some(sess) = kept.as_ref() else {
+                return Err(Error::Verify(
+                    "peer sent a resume challenge but no session is kept".into(),
+                ));
+            };
+            if decision.len() != 1 + NONCE_LEN + TAG_LEN {
+                return Err(Error::Verify("malformed resume challenge".into()));
+            }
+            let mut listener_nonce = [0u8; NONCE_LEN];
+            listener_nonce.copy_from_slice(&decision[1..1 + NONCE_LEN]);
+            let listener_tag = &decision[1 + NONCE_LEN..];
+            sess.verify_resume_tag(
+                ResumeRole::Listener,
+                me.public(),
+                peer,
+                &dialer_nonce,
+                &listener_nonce,
+                listener_tag,
+            )?;
+            let dialer_tag = sess.resume_tag(
+                ResumeRole::Dialer,
+                me.public(),
+                peer,
+                &dialer_nonce,
+                &listener_nonce,
+            );
+            conn.send(&dialer_tag).await?;
+            let sess = kept
+                .take()
+                .ok_or_else(|| Error::Verify("kept session vanished during resume".into()))?;
+            eprintln!(
+                "[lattice-net] resumed with {:?} — no re-handshake — type messages:",
+                peer.peer_id()
+            );
+            Ok(ConnectedSession::resume(conn, sess))
+        }
+        Some(DECISION_RESUMED) => Err(Error::Verify(
+            "peer sent legacy unauthenticated resume decision".into(),
+        )),
+        _ => Err(Error::Verify("unrecognised resume decision".into())),
+    }
+}
+
 async fn dial_once(
     t: &IrohTransport,
     ticket: &str,
@@ -207,42 +320,10 @@ async fn dial_once(
     lines: &mut StdinLines,
 ) -> Result<Outcome> {
     eprintln!("[lattice-net] dialing peer...");
-    let (peer_bytes, mut conn) = t.connect_ticket(ticket).await?;
+    let (peer_bytes, conn) = t.connect_ticket(ticket).await?;
     let peer = PublicIdentity::from_bytes(&peer_bytes)?;
 
-    // Preamble: [mode] ++ our identity bundle. Resume if we kept a session.
-    let mode = if kept.is_some() {
-        MODE_RESUME
-    } else {
-        MODE_FRESH
-    };
-    let mut preamble = vec![mode];
-    preamble.extend_from_slice(&me.public().to_bytes());
-    conn.send(&preamble).await?;
-
-    let decision = conn.recv().await?;
-    let resumed = decision.first() == Some(&DECISION_RESUMED);
-
-    let cs = if resumed {
-        let sess = kept
-            .take()
-            .ok_or_else(|| Error::Verify("peer claimed resume but no session is kept".into()))?;
-        eprintln!(
-            "[lattice-net] resumed with {:?} — no re-handshake — type messages:",
-            peer.peer_id()
-        );
-        ConnectedSession::resume(conn, sess)
-    } else {
-        if kept.take().is_some() {
-            eprintln!("[lattice-net] peer couldn't resume — fresh handshake");
-        }
-        let cs = ConnectedSession::initiate(conn, me, &peer).await?;
-        eprintln!(
-            "[lattice-net] connected to {:?} (fresh session) — type messages:",
-            peer.peer_id()
-        );
-        cs
-    };
+    let cs = negotiate_dial(conn, me, &peer, kept).await?;
 
     match chat(cs, lines).await {
         Ok((Outcome::PeerDisconnected, recovered)) => {
@@ -338,6 +419,7 @@ mod tests {
 
     async fn preamble(conn: &mut MemoryConn, mode: u8, who: &Keypair) {
         let mut p = vec![mode];
+        p.extend_from_slice(&[0u8; NONCE_LEN]);
         p.extend_from_slice(&who.public().to_bytes());
         conn.send(&p).await.unwrap();
     }
@@ -373,14 +455,162 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_with_kept_session_succeeds() {
+    async fn genuine_resume_with_mutual_proof_succeeds() {
+        let (alice, bob) = (id(), id());
+        let (hs, a) = SecureSession::initiate(&alice, bob.public()).unwrap();
+        let b = SecureSession::accept(&bob, alice.public(), &hs).unwrap();
+        let mut sessions = HashMap::from([(alice.peer_id(), b)]);
+        let mut kept = Some(a);
+        let (dial, listen) = pair().await;
+        let (d, l) = tokio::join!(
+            negotiate_dial(dial, &alice, bob.public(), &mut kept),
+            accept_or_resume(listen, &bob, &mut sessions)
+        );
+        let (mut d, (_, mut l)) = (d.unwrap(), l.unwrap());
+        assert!(kept.is_none());
+        assert!(!sessions.contains_key(&alice.peer_id()));
+        d.send(b"hello").await.unwrap();
+        assert_eq!(l.recv().await.unwrap(), b"hello");
+        l.send(b"world").await.unwrap();
+        assert_eq!(d.recv().await.unwrap(), b"world");
+    }
+
+    #[tokio::test]
+    async fn impostor_with_legacy_preamble_cannot_resume() {
         let (alice, bob) = (id(), id());
         let mut sessions = stale(&alice, &bob);
         let (mut dial, listen) = pair().await;
-        preamble(&mut dial, MODE_RESUME, &alice).await;
+        let mut p = vec![MODE_RESUME];
+        p.extend_from_slice(&alice.public().to_bytes());
+        dial.send(&p).await.unwrap();
         let r = accept_or_resume(listen, &bob, &mut sessions).await;
-        assert!(r.is_ok());
-        assert_eq!(dial.recv().await.unwrap(), vec![DECISION_RESUMED]);
-        assert!(!sessions.contains_key(&alice.peer_id()));
+        assert!(r.is_err());
+        assert!(sessions.contains_key(&alice.peer_id()));
+    }
+
+    /// Genuine Alice–Bob pair: (alice, bob, alice's session, bob's session).
+    fn genuine() -> (Keypair, Keypair, SecureSession, SecureSession) {
+        let (alice, bob) = (id(), id());
+        let (hs, a) = SecureSession::initiate(&alice, bob.public()).unwrap();
+        let b = SecureSession::accept(&bob, alice.public(), &hs).unwrap();
+        (alice, bob, a, b)
+    }
+
+    fn resume_preamble(nonce: &[u8; NONCE_LEN], who: &Keypair) -> Vec<u8> {
+        let mut p = vec![MODE_RESUME];
+        p.extend_from_slice(nonce);
+        p.extend_from_slice(&who.public().to_bytes());
+        p
+    }
+
+    #[tokio::test]
+    async fn impostor_with_bogus_tag_cannot_resume() {
+        let (alice, bob, _a, b) = genuine();
+        let mut sessions = HashMap::from([(alice.peer_id(), b)]);
+        let (mut eve, listen) = pair().await;
+        eve.send(&resume_preamble(&[7u8; NONCE_LEN], &alice))
+            .await
+            .unwrap();
+        eve.send(&[0xAA; TAG_LEN]).await.unwrap();
+        let r = accept_or_resume(listen, &bob, &mut sessions).await;
+        assert!(r.is_err());
+        assert!(sessions.contains_key(&alice.peer_id()));
+        let reply = eve.recv().await.unwrap();
+        assert_eq!(reply.len(), 1 + NONCE_LEN + TAG_LEN);
+        assert_eq!(reply[0], DECISION_CHALLENGE);
+    }
+
+    #[tokio::test]
+    async fn impostor_hanging_up_cannot_resume() {
+        let (alice, bob, _a, b) = genuine();
+        let mut sessions = HashMap::from([(alice.peer_id(), b)]);
+        let (mut eve, listen) = pair().await;
+        eve.send(&resume_preamble(&[7u8; NONCE_LEN], &alice))
+            .await
+            .unwrap();
+        drop(eve);
+        let r = accept_or_resume(listen, &bob, &mut sessions).await;
+        assert!(r.is_err());
+        assert!(sessions.contains_key(&alice.peer_id()));
+    }
+
+    #[tokio::test]
+    async fn dialer_rejects_wrong_listener_tag_and_checks_preamble() {
+        let (alice, bob, a, _b) = genuine();
+        let mut kept = Some(a);
+        let (dial, mut listen) = pair().await;
+        let script = async {
+            let p = listen.recv().await.unwrap();
+            let mut reply = vec![DECISION_CHALLENGE];
+            reply.extend_from_slice(&[3u8; NONCE_LEN]);
+            reply.extend_from_slice(&[0xBB; TAG_LEN]);
+            listen.send(&reply).await.unwrap();
+            p
+        };
+        let (r, p) = tokio::join!(
+            negotiate_dial(dial, &alice, bob.public(), &mut kept),
+            script
+        );
+        assert!(r.is_err());
+        assert!(kept.is_some());
+        let ib = alice.public().to_bytes();
+        assert_eq!(p[0], MODE_RESUME);
+        assert_eq!(p.len(), 1 + NONCE_LEN + ib.len());
+        assert_eq!(&p[1 + NONCE_LEN..], &ib[..]);
+    }
+
+    #[tokio::test]
+    async fn dialer_rejects_legacy_resumed_decision() {
+        let (alice, bob, a, _b) = genuine();
+        let mut kept = Some(a);
+        let (dial, mut listen) = pair().await;
+        listen.send(&[DECISION_RESUMED]).await.unwrap();
+        let r = negotiate_dial(dial, &alice, bob.public(), &mut kept).await;
+        assert!(r.is_err());
+        assert!(kept.is_some());
+    }
+
+    #[tokio::test]
+    async fn dialer_rejects_challenge_without_kept_session() {
+        let (alice, bob) = (id(), id());
+        let mut kept = None;
+        let (dial, mut listen) = pair().await;
+        let mut reply = vec![DECISION_CHALLENGE];
+        reply.extend_from_slice(&[0u8; NONCE_LEN + TAG_LEN]);
+        listen.send(&reply).await.unwrap();
+        let r = negotiate_dial(dial, &alice, bob.public(), &mut kept).await;
+        assert!(r.is_err());
+    }
+
+    #[tokio::test]
+    async fn short_preambles_are_rejected() {
+        let (alice, bob) = (id(), id());
+        for n in [0usize, 1, 32] {
+            let mut sessions = stale(&alice, &bob);
+            let (mut dial, listen) = pair().await;
+            dial.send(&vec![MODE_RESUME; n]).await.unwrap();
+            let r = accept_or_resume(listen, &bob, &mut sessions).await;
+            assert!(r.is_err(), "len {n}");
+            assert!(sessions.contains_key(&alice.peer_id()));
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_dial_preamble_has_zero_nonce() {
+        let (alice, bob) = (id(), id());
+        let mut kept = None;
+        let (dial, mut listen) = pair().await;
+        let script = async {
+            let p = listen.recv().await.unwrap();
+            listen.send(&[0xFF]).await.unwrap(); // unknown decision → dialer errors
+            p
+        };
+        let (r, p) = tokio::join!(
+            negotiate_dial(dial, &alice, bob.public(), &mut kept),
+            script
+        );
+        assert!(r.is_err());
+        assert_eq!(p[0], MODE_FRESH);
+        assert!(p[1..1 + NONCE_LEN].iter().all(|b| *b == 0));
     }
 }

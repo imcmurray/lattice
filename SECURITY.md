@@ -16,6 +16,9 @@
   first ratchet secret is that static X25519 key.
 - The `lattice-net` listen ticket is an unsigned bearer token for reachability.
   The Lattice identity is not bound to the iroh endpoint id.
+- Resuming a kept session in `lattice-net` requires a mutual HMAC proof bound to
+  that session's secret (`lattice-resume-v1`). Anyone holding the current
+  session state (for example a compromised device) can still resume.
 - `lattice-net` must not be used for real secrets.
 
 ## Reporting a vulnerability

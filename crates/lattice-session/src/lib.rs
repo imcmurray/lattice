@@ -43,11 +43,23 @@ use lattice_identity::{Keypair, PublicIdentity};
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret as XStaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 
 const HS_DOMAIN: &[u8] = b"lattice-session-hs-v2";
+const RESUME_KEY_INFO: &[u8] = b"lattice-session-resume-v1";
+const RESUME_DOMAIN: &[u8] = b"lattice-resume-v1";
+
+/// Which side of a resume negotiation a tag is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResumeRole {
+    /// The side that dialed (role byte `0x01`).
+    Dialer,
+    /// The side that accepted (role byte `0x02`).
+    Listener,
+}
 /// Max encoded handshake size (bytes), also the per-field cap.
 const MAX_HANDSHAKE_LEN: usize = 65_536;
 const HEADER_LEN: usize = 32 + 8 + 8; // ratchet pubkey ‖ prev-chain-len ‖ msg-index
@@ -128,6 +140,9 @@ impl Skipped {
 pub struct SecureSession {
     core: RatchetCore,
     skipped: Skipped,
+    /// Per-session key for resume proofs; derived from the handshake root key,
+    /// fixed for the session lifetime (never ratcheted).
+    resume_key: Zeroizing<[u8; 32]>,
 }
 
 /// Output of the initiator's hybrid-KEM handshake.
@@ -153,6 +168,7 @@ impl SecureSession {
 
         // Double Ratchet init (Alice): peer's static as DHr.
         let dhr = peer.x25519_bytes();
+        let resume_key = derive_resume_key(&sk);
         let (rk, cks) = kdf_rk(&sk, &dh(&dhs, &dhr));
 
         let core = RatchetCore {
@@ -169,6 +185,7 @@ impl SecureSession {
         let session = Self {
             core,
             skipped: Skipped::default(),
+            resume_key,
         };
         Ok((
             Handshake {
@@ -205,6 +222,7 @@ impl SecureSession {
             ));
         }
         let sk = kem_accept(me, hs, &t)?;
+        let resume_key = derive_resume_key(&sk);
         let mut core = RatchetCore {
             rk: sk,
             dhs: me.x25519_secret(), // initial ratchet key = identity X25519
@@ -223,7 +241,57 @@ impl SecureSession {
         Ok(Self {
             core,
             skipped: Skipped::default(),
+            resume_key,
         })
+    }
+
+    /// HMAC tag proving possession of this session's secret for a resume
+    /// negotiation. Does not touch the ratchet state.
+    pub fn resume_tag(
+        &self,
+        role: ResumeRole,
+        dialer: &PublicIdentity,
+        listener: &PublicIdentity,
+        dialer_nonce: &[u8; 32],
+        listener_nonce: &[u8; 32],
+    ) -> [u8; 32] {
+        let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(&self.resume_key[..])
+            .expect("hmac accepts any key length");
+        mac.update(&resume_msg(
+            role,
+            dialer,
+            listener,
+            dialer_nonce,
+            listener_nonce,
+        ));
+        let out = mac.finalize().into_bytes();
+        let mut tag = [0u8; 32];
+        tag.copy_from_slice(&out);
+        tag
+    }
+
+    /// Verify a peer's resume tag in constant time. Fails with
+    /// [`Error::Verify`] on any mismatch or a tag whose length is not 32.
+    pub fn verify_resume_tag(
+        &self,
+        role: ResumeRole,
+        dialer: &PublicIdentity,
+        listener: &PublicIdentity,
+        dialer_nonce: &[u8; 32],
+        listener_nonce: &[u8; 32],
+        tag: &[u8],
+    ) -> Result<()> {
+        let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(&self.resume_key[..])
+            .expect("hmac accepts any key length");
+        mac.update(&resume_msg(
+            role,
+            dialer,
+            listener,
+            dialer_nonce,
+            listener_nonce,
+        ));
+        mac.verify_slice(tag)
+            .map_err(|_| Error::Verify("resume proof failed".into()))
     }
 
     /// Encrypt the next outbound message. Output is `header ‖ ciphertext`, with
@@ -439,6 +507,44 @@ fn gen_ratchet_key() -> Result<(XStaticSecret, [u8; 32])> {
     Ok((s, p))
 }
 
+/// 32 fresh random bytes for a resume nonce.
+pub fn resume_nonce() -> Result<[u8; 32]> {
+    let mut n = [0u8; 32];
+    getrandom::getrandom(&mut n).map_err(|e| Error::Crypto(format!("rng: {e}")))?;
+    Ok(n)
+}
+
+fn derive_resume_key(sk: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    let hk = Hkdf::<Sha256>::new(None, sk);
+    let mut k = [0u8; 32];
+    hk.expand(RESUME_KEY_INFO, &mut k).expect("hkdf len");
+    Zeroizing::new(k)
+}
+
+fn resume_msg(
+    role: ResumeRole,
+    dialer: &PublicIdentity,
+    listener: &PublicIdentity,
+    dialer_nonce: &[u8; 32],
+    listener_nonce: &[u8; 32],
+) -> Vec<u8> {
+    let dp = dialer.to_bytes();
+    let lp = listener.to_bytes();
+    let mut m = Vec::with_capacity(RESUME_DOMAIN.len() + 1 + 64 + 4 + dp.len() + 4 + lp.len());
+    m.extend_from_slice(RESUME_DOMAIN);
+    m.push(match role {
+        ResumeRole::Dialer => 0x01,
+        ResumeRole::Listener => 0x02,
+    });
+    m.extend_from_slice(dialer_nonce);
+    m.extend_from_slice(listener_nonce);
+    m.extend_from_slice(&(dp.len() as u32).to_le_bytes());
+    m.extend_from_slice(&dp);
+    m.extend_from_slice(&(lp.len() as u32).to_le_bytes());
+    m.extend_from_slice(&lp);
+    m
+}
+
 fn root_key(ikm: &[u8], transcript: &[u8]) -> Zeroizing<[u8; 32]> {
     let hk = Hkdf::<Sha256>::new(Some(transcript), ikm);
     let mut sk = [0u8; 32];
@@ -635,6 +741,131 @@ mod tests {
         let (hs, a) = SecureSession::initiate(&alice, bob.public()).unwrap();
         let b = SecureSession::accept(&bob, alice.public(), &hs).unwrap();
         (a, b)
+    }
+
+    fn pair_ids() -> (Keypair, Keypair, SecureSession, SecureSession) {
+        let (alice, bob) = (id(), id());
+        let (hs, a) = SecureSession::initiate(&alice, bob.public()).unwrap();
+        let b = SecureSession::accept(&bob, alice.public(), &hs).unwrap();
+        (alice, bob, a, b)
+    }
+
+    const D: ResumeRole = ResumeRole::Dialer;
+    const L: ResumeRole = ResumeRole::Listener;
+
+    #[test]
+    fn resume_tags_verify_across_genuine_pair() {
+        let (alice, bob, a, b) = pair_ids();
+        let (nd, nl) = ([1u8; 32], [2u8; 32]);
+        let td = a.resume_tag(D, alice.public(), bob.public(), &nd, &nl);
+        b.verify_resume_tag(D, alice.public(), bob.public(), &nd, &nl, &td)
+            .unwrap();
+        let tl = b.resume_tag(L, alice.public(), bob.public(), &nd, &nl);
+        a.verify_resume_tag(L, alice.public(), bob.public(), &nd, &nl, &tl)
+            .unwrap();
+    }
+
+    #[test]
+    fn resume_tags_match_between_sides() {
+        let (alice, bob, a, b) = pair_ids();
+        let (nd, nl) = ([3u8; 32], [4u8; 32]);
+        assert_eq!(
+            a.resume_tag(D, alice.public(), bob.public(), &nd, &nl),
+            b.resume_tag(D, alice.public(), bob.public(), &nd, &nl)
+        );
+    }
+
+    #[test]
+    fn resume_tag_from_other_session_is_rejected() {
+        let (alice, bob, _a, b) = pair_ids();
+        let eve = id();
+        let (hs, e) = SecureSession::initiate(&eve, bob.public()).unwrap();
+        let _ = SecureSession::accept(&bob, eve.public(), &hs).unwrap();
+        let (nd, nl) = ([5u8; 32], [6u8; 32]);
+        let tag = e.resume_tag(D, alice.public(), bob.public(), &nd, &nl);
+        assert!(matches!(
+            b.verify_resume_tag(D, alice.public(), bob.public(), &nd, &nl, &tag),
+            Err(Error::Verify(_))
+        ));
+    }
+
+    #[test]
+    fn resume_tag_role_mismatch_is_rejected() {
+        let (alice, bob, a, b) = pair_ids();
+        let (nd, nl) = ([7u8; 32], [8u8; 32]);
+        let td = a.resume_tag(D, alice.public(), bob.public(), &nd, &nl);
+        assert!(b
+            .verify_resume_tag(L, alice.public(), bob.public(), &nd, &nl, &td)
+            .is_err());
+        let tl = a.resume_tag(L, alice.public(), bob.public(), &nd, &nl);
+        assert!(b
+            .verify_resume_tag(D, alice.public(), bob.public(), &nd, &nl, &tl)
+            .is_err());
+    }
+
+    #[test]
+    fn resume_tag_binds_nonces_and_identities() {
+        let (alice, bob, a, b) = pair_ids();
+        let eve = id();
+        let (nd, nl) = ([9u8; 32], [10u8; 32]);
+        let tag = a.resume_tag(D, alice.public(), bob.public(), &nd, &nl);
+        let mut nd2 = nd;
+        nd2[0] ^= 1;
+        let mut nl2 = nl;
+        nl2[31] ^= 1;
+        assert!(b
+            .verify_resume_tag(D, alice.public(), bob.public(), &nd2, &nl, &tag)
+            .is_err());
+        assert!(b
+            .verify_resume_tag(D, alice.public(), bob.public(), &nd, &nl2, &tag)
+            .is_err());
+        assert!(b
+            .verify_resume_tag(D, eve.public(), bob.public(), &nd, &nl, &tag)
+            .is_err());
+        assert!(b
+            .verify_resume_tag(D, alice.public(), eve.public(), &nd, &nl, &tag)
+            .is_err());
+        assert!(b
+            .verify_resume_tag(D, bob.public(), alice.public(), &nd, &nl, &tag)
+            .is_err());
+    }
+
+    #[test]
+    fn resume_tag_bad_lengths_are_rejected() {
+        let (alice, bob, a, b) = pair_ids();
+        let (nd, nl) = ([11u8; 32], [12u8; 32]);
+        let tag = a.resume_tag(D, alice.public(), bob.public(), &nd, &nl);
+        for n in [0usize, 31, 33, 64] {
+            let mut t = tag.to_vec();
+            t.resize(n, 0);
+            assert!(b
+                .verify_resume_tag(D, alice.public(), bob.public(), &nd, &nl, &t)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn resume_proofs_do_not_disturb_ratchet() {
+        let (alice, bob, mut a, mut b) = pair_ids();
+        let (nd, nl) = ([13u8; 32], [14u8; 32]);
+        for _ in 0..3 {
+            let t = a.resume_tag(D, alice.public(), bob.public(), &nd, &nl);
+            b.verify_resume_tag(D, alice.public(), bob.public(), &nd, &nl, &t)
+                .unwrap();
+            let t = b.resume_tag(L, alice.public(), bob.public(), &nd, &nl);
+            a.verify_resume_tag(L, alice.public(), bob.public(), &nd, &nl, &t)
+                .unwrap();
+        }
+        let ct = a.seal(b"x").unwrap();
+        assert_eq!(b.open(&ct).unwrap(), b"x");
+        let ct = b.seal(b"y").unwrap();
+        assert_eq!(a.open(&ct).unwrap(), b"y");
+    }
+
+    #[test]
+    fn resume_nonce_is_random() {
+        let (x, y) = (resume_nonce().unwrap(), resume_nonce().unwrap());
+        assert_ne!(x, y);
     }
 
     #[test]
