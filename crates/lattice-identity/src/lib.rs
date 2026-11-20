@@ -54,7 +54,9 @@ type MlKemDk = DecapsulationKey<MlKem768>;
 
 const HKDF_SALT: &[u8] = b"lattice-hkdf-v1";
 const PEERID_DOMAIN: &[u8] = b"lattice-id-v1";
-const DEVICE_CERT_DOMAIN: &[u8] = b"lattice-device-cert-v1";
+const DEVICE_CERT_DOMAIN: &[u8] = b"lattice-device-cert-v2";
+/// Hard cap on an encoded [`DeviceCert`] (bytes).
+const MAX_DEVICE_CERT_LEN: usize = 64 * 1024;
 const SIG_DOMAIN: &[u8] = b"lattice-sig-v2";
 
 /// The exact bytes both signature halves cover:
@@ -136,16 +138,31 @@ fn decode_hybrid(b: &[u8]) -> Option<(&[u8], &[u8])> {
     }
     let ed_len = u32::from_le_bytes(b[0..4].try_into().ok()?) as usize;
     let mid = 4usize.checked_add(ed_len)?;
-    if b.len() < mid + 4 {
+    if b.len() < mid.checked_add(4)? {
         return None;
     }
     let ed = &b[4..mid];
     let pq_len = u32::from_le_bytes(b[mid..mid + 4].try_into().ok()?) as usize;
     let end = mid.checked_add(4)?.checked_add(pq_len)?;
-    if b.len() < end {
+    if b.len() != end {
         return None;
     }
     Some((ed, &b[mid + 4..end]))
+}
+
+/// Split `n` bytes off the front of `rest`, or fail if fewer remain.
+fn take<'a>(rest: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
+    if n > rest.len() {
+        return Err(Error::Crypto("truncated input".into()));
+    }
+    let (head, tail) = rest.split_at(n);
+    *rest = tail;
+    Ok(head)
+}
+
+fn take_u32(rest: &mut &[u8]) -> Result<u32> {
+    let b = take(rest, 4)?;
+    Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 // ---------------------------------------------------------------------------
@@ -190,28 +207,58 @@ impl PublicIdentity {
 
     /// Parse a public identity from [`PublicIdentity::to_bytes`], recomputing
     /// (and thereby binding) the `PeerId` from the key material.
+    ///
+    /// Strict and canonical: lengths are checked against the remaining input,
+    /// trailing bytes are rejected, keys are validated, and every accepted
+    /// input re-encodes to itself.
     pub fn from_bytes(b: &[u8]) -> Result<Self> {
-        let need = |have: usize, want: usize| -> Result<()> {
-            if have < want {
-                Err(Error::Crypto("truncated public identity".into()))
-            } else {
-                Ok(())
-            }
-        };
-        need(b.len(), 1 + 64 + 4)?;
-        let suite = suite_from_tag(b[0])?;
+        let mut rest = b;
+        let suite = suite_from_tag(take(&mut rest, 1)?[0])?;
         let mut ed25519 = [0u8; 32];
         let mut x25519 = [0u8; 32];
-        ed25519.copy_from_slice(&b[1..33]);
-        x25519.copy_from_slice(&b[33..65]);
-        let dsa_len = u32::from_le_bytes(b[65..69].try_into().expect("4 bytes")) as usize;
-        let p = 69 + dsa_len;
-        need(b.len(), p + 4)?;
-        let ml_dsa = b[69..p].to_vec();
-        let kem_len = u32::from_le_bytes(b[p..p + 4].try_into().expect("4 bytes")) as usize;
-        let end = p + 4 + kem_len;
-        need(b.len(), end)?;
-        let ml_kem = b[p + 4..end].to_vec();
+        ed25519.copy_from_slice(take(&mut rest, 32)?);
+        x25519.copy_from_slice(take(&mut rest, 32)?);
+        let dsa_len = take_u32(&mut rest)? as usize;
+        let ml_dsa = take(&mut rest, dsa_len)?;
+        let kem_len = take_u32(&mut rest)? as usize;
+        let ml_kem = take(&mut rest, kem_len)?;
+        if !rest.is_empty() {
+            return Err(Error::Crypto("trailing bytes after public identity".into()));
+        }
+
+        match EdVerifyingKey::from_bytes(&ed25519) {
+            Ok(vk) if !vk.is_weak() => {}
+            _ => return Err(Error::Crypto("invalid Ed25519 public key".into())),
+        }
+
+        match suite {
+            CryptoSuite::Classical => {
+                if !ml_dsa.is_empty() || !ml_kem.is_empty() {
+                    return Err(Error::Crypto(
+                        "Classical identity carries post-quantum keys".into(),
+                    ));
+                }
+            }
+            CryptoSuite::Hybrid => {
+                #[cfg(feature = "pq")]
+                {
+                    DsaEncodedVk::<MlDsa65>::try_from(ml_dsa)
+                        .map_err(|_| Error::Crypto("malformed ML-DSA verifying key".into()))?;
+                    let key = MlKemKey::<EncapsulationKey<MlKem768>>::try_from(ml_kem)
+                        .map_err(|_| Error::Crypto("malformed ML-KEM encapsulation key".into()))?;
+                    EncapsulationKey::<MlKem768>::new(&key)
+                        .map_err(|_| Error::Crypto("invalid ML-KEM encapsulation key".into()))?;
+                }
+                #[cfg(not(feature = "pq"))]
+                {
+                    return Err(Error::Crypto(
+                        "Hybrid identity requires the `pq` feature to validate".into(),
+                    ));
+                }
+            }
+        }
+
+        let (ml_dsa, ml_kem) = (ml_dsa.to_vec(), ml_kem.to_vec());
         let peer_id = Self::compute_peer_id(suite, &ed25519, &x25519, &ml_dsa, &ml_kem);
         Ok(Self {
             suite,
@@ -481,16 +528,30 @@ impl Keypair {
         Ok(Zeroizing::new(b))
     }
 
-    /// Authorize a device's Ed25519 key under this root identity, returning a
-    /// signed [`DeviceCert`] (ADR-004 multi-device delegation).
-    pub fn authorize_device(&self, device_ed25519: [u8; 32]) -> DeviceCert {
-        let root = self.public.peer_id();
-        let sig = self.sign(&DeviceCert::message(&root, &device_ed25519));
-        DeviceCert {
-            root,
-            device_ed25519,
-            sig,
+    /// Authorize a device's full public identity under this root identity until
+    /// `not_after` (Unix seconds), returning a signed [`DeviceCert`] (ADR-004).
+    /// Fails if `not_after == 0`, if a Hybrid root targets a Classical device,
+    /// or if the device is the root itself.
+    pub fn authorize_device(&self, device: &PublicIdentity, not_after: u64) -> Result<DeviceCert> {
+        if not_after == 0 {
+            return Err(Error::Crypto("device cert expiry must be non-zero".into()));
         }
+        if self.public.suite() == CryptoSuite::Hybrid && device.suite() == CryptoSuite::Classical {
+            return Err(Error::Crypto(
+                "a Hybrid root cannot delegate to a Classical device".into(),
+            ));
+        }
+        let root = self.public.peer_id();
+        if device.peer_id() == root {
+            return Err(Error::Crypto("device must differ from the root".into()));
+        }
+        let sig = self.sign(&DeviceCert::message(&root, device, not_after));
+        Ok(DeviceCert {
+            root,
+            device: device.clone(),
+            not_after,
+            sig,
+        })
     }
 }
 
@@ -559,36 +620,104 @@ fn derive_public(suite: CryptoSuite, seed: &[u8; 64]) -> Result<PublicIdentity> 
 // Device delegation (multi-device, ADR-004).
 // ---------------------------------------------------------------------------
 
-/// A root-signed authorization binding a device's Ed25519 key to a root
-/// identity. The day-to-day signer is the device key; the root (recoverable
-/// from the mnemonic) is used only to issue or revoke device certs.
+/// A root-signed authorization binding a device's full public identity to a
+/// root identity, with a mandatory expiry. The day-to-day signer is the device
+/// key; the root (recoverable from the mnemonic) is used only to issue certs.
 #[derive(Clone, Debug)]
 pub struct DeviceCert {
     root: PeerId,
-    device_ed25519: [u8; 32],
+    device: PublicIdentity,
+    /// Unix seconds; never 0.
+    not_after: u64,
     sig: Signature,
 }
 
 impl DeviceCert {
-    fn message(root: &PeerId, device: &[u8; 32]) -> Vec<u8> {
-        let mut m = Vec::with_capacity(DEVICE_CERT_DOMAIN.len() + 64);
+    /// `DOMAIN ‖ root[32] ‖ u32le(len(dev)) ‖ dev ‖ u64le(not_after)`.
+    fn message(root: &PeerId, device: &PublicIdentity, not_after: u64) -> Vec<u8> {
+        let dev = device.to_bytes();
+        let mut m = Vec::with_capacity(DEVICE_CERT_DOMAIN.len() + 32 + 4 + dev.len() + 8);
         m.extend_from_slice(DEVICE_CERT_DOMAIN);
         m.extend_from_slice(&root.0);
-        m.extend_from_slice(device);
+        m.extend_from_slice(&(dev.len() as u32).to_le_bytes());
+        m.extend_from_slice(&dev);
+        m.extend_from_slice(&not_after.to_le_bytes());
         m
     }
 
-    /// The authorized device's Ed25519 public key.
-    pub fn device_key(&self) -> [u8; 32] {
-        self.device_ed25519
+    /// The authorized device's public identity.
+    pub fn device(&self) -> &PublicIdentity {
+        &self.device
     }
 
-    /// Verify this cert was issued by `root`.
-    pub fn verify(&self, root: &PublicIdentity) -> bool {
-        if root.peer_id() != self.root {
+    /// The issuing root's PeerId.
+    pub fn root(&self) -> &PeerId {
+        &self.root
+    }
+
+    /// Expiry (Unix seconds); the cert is valid while `now <= not_after`.
+    pub fn not_after(&self) -> u64 {
+        self.not_after
+    }
+
+    /// Verify this cert was issued by `root` and is unexpired at `now`.
+    pub fn verify(&self, root: &PublicIdentity, now: u64) -> bool {
+        if root.peer_id() != self.root
+            || self.not_after == 0
+            || self.device.peer_id() == self.root
+            || (root.suite() == CryptoSuite::Hybrid
+                && self.device.suite() == CryptoSuite::Classical)
+            || now > self.not_after
+        {
             return false;
         }
-        root.verify(&Self::message(&self.root, &self.device_ed25519), &self.sig)
+        root.verify(
+            &Self::message(&self.root, &self.device, self.not_after),
+            &self.sig,
+        )
+    }
+
+    /// `root[32] ‖ u32le(len(dev)) ‖ dev ‖ u64le(not_after) ‖ u32le(len(sig)) ‖ sig`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let dev = self.device.to_bytes();
+        let mut v = Vec::with_capacity(32 + 4 + dev.len() + 8 + 4 + self.sig.0.len());
+        v.extend_from_slice(&self.root.0);
+        v.extend_from_slice(&(dev.len() as u32).to_le_bytes());
+        v.extend_from_slice(&dev);
+        v.extend_from_slice(&self.not_after.to_le_bytes());
+        v.extend_from_slice(&(self.sig.0.len() as u32).to_le_bytes());
+        v.extend_from_slice(&self.sig.0);
+        v
+    }
+
+    /// Strict parser for [`DeviceCert::to_bytes`]. Does not check the signature
+    /// (no root is available here); callers must call [`DeviceCert::verify`].
+    pub fn from_bytes(b: &[u8]) -> Result<Self> {
+        if b.len() > MAX_DEVICE_CERT_LEN {
+            return Err(Error::Crypto("device cert too large".into()));
+        }
+        let mut rest = b;
+        let mut root = [0u8; 32];
+        root.copy_from_slice(take(&mut rest, 32)?);
+        let dev_len = take_u32(&mut rest)? as usize;
+        let device = PublicIdentity::from_bytes(take(&mut rest, dev_len)?)?;
+        let na = take(&mut rest, 8)?;
+        let not_after =
+            u64::from_le_bytes([na[0], na[1], na[2], na[3], na[4], na[5], na[6], na[7]]);
+        if not_after == 0 {
+            return Err(Error::Crypto("device cert expiry must be non-zero".into()));
+        }
+        let sig_len = take_u32(&mut rest)? as usize;
+        let sig = take(&mut rest, sig_len)?.to_vec();
+        if !rest.is_empty() {
+            return Err(Error::Crypto("trailing bytes after device cert".into()));
+        }
+        Ok(Self {
+            root: PeerId(root),
+            device,
+            not_after,
+            sig: Signature(sig),
+        })
     }
 }
 
@@ -832,20 +961,63 @@ mod tests {
     }
 
     #[test]
-    fn device_cert_roundtrip() {
+    fn device_cert_roundtrip_classical() {
+        let root = Keypair::generate(CryptoSuite::Classical).unwrap();
+        let device = Keypair::generate(CryptoSuite::Classical).unwrap();
+        let cert = root.authorize_device(device.public(), 1000).unwrap();
+
+        assert!(cert.verify(root.public(), 1000));
+        assert!(!cert.verify(root.public(), 1001));
+        assert_eq!(cert.not_after(), 1000);
+        assert_eq!(*cert.root(), root.peer_id());
+        assert_eq!(cert.device().peer_id(), device.peer_id());
+
+        let parsed = DeviceCert::from_bytes(&cert.to_bytes()).unwrap();
+        assert_eq!(parsed.to_bytes(), cert.to_bytes());
+        assert!(parsed.verify(root.public(), 5));
+
+        let imposter = Keypair::generate(CryptoSuite::Classical).unwrap();
+        assert!(!cert.verify(imposter.public(), 5));
+        assert!(root.authorize_device(root.public(), 1000).is_err());
+        assert!(root.authorize_device(device.public(), 0).is_err());
+    }
+
+    #[test]
+    fn decode_hybrid_rejects_trailing_bytes() {
+        let mut e = encode_hybrid(&[1, 2], &[3]);
+        assert!(decode_hybrid(&e).is_some());
+        e.push(0);
+        assert!(decode_hybrid(&e).is_none());
+    }
+
+    #[test]
+    fn public_identity_rejects_trailing_and_weak_key() {
+        let kp = Keypair::generate(CryptoSuite::Classical).unwrap();
+        let mut b = kp.public().to_bytes();
+        assert_eq!(PublicIdentity::from_bytes(&b).unwrap().to_bytes(), b);
+        b[1] = 1;
+        b[2..33].fill(0);
+        assert!(PublicIdentity::from_bytes(&b).is_err());
+        let mut t = kp.public().to_bytes();
+        t.push(0);
+        assert!(PublicIdentity::from_bytes(&t).is_err());
+    }
+
+    #[cfg(feature = "pq")]
+    #[test]
+    fn device_cert_roundtrip_hybrid() {
         let root = Keypair::generate(CryptoSuite::Hybrid).unwrap();
         let device = Keypair::generate(CryptoSuite::Hybrid).unwrap();
-        let cert = root.authorize_device(device.public().ed25519_bytes());
-
-        assert!(
-            cert.verify(root.public()),
-            "cert must verify under its root"
-        );
-
-        let imposter = Keypair::generate(CryptoSuite::Hybrid).unwrap();
-        assert!(
-            !cert.verify(imposter.public()),
-            "cert must not verify under a different root"
+        let cert = root.authorize_device(device.public(), 1000).unwrap();
+        let parsed = DeviceCert::from_bytes(&cert.to_bytes()).unwrap();
+        assert!(parsed.verify(root.public(), 1000));
+        let classical = Keypair::generate(CryptoSuite::Classical).unwrap();
+        assert!(root.authorize_device(classical.public(), 1000).is_err());
+        assert_eq!(
+            PublicIdentity::from_bytes(&device.public().to_bytes())
+                .unwrap()
+                .peer_id(),
+            device.peer_id()
         );
     }
 }

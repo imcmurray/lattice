@@ -35,6 +35,17 @@
   `lattice-sig-v2`), so a signature cannot move between the Classical and Hybrid
   identities derived from one mnemonic. This changes every signature: logs,
   caps and device certs signed earlier no longer verify (pre-1.0, no migration).
+- Device certificates (`lattice-device-cert-v2`) now bind a device's full
+  (hybrid) identity and carry a mandatory expiry (`not_after`). A Hybrid root
+  cannot delegate to a Classical device. v1 device certs no longer verify
+  (pre-1.0, no migration).
+- Lattice has no revocation list yet: a leaked device key stays valid until its
+  certificate's `not_after`.
+- `lattice-net` still uses the root identity directly as its everyday key;
+  device keys are not yet wired into the example app.
+- Public identity and signature encodings are parsed strictly and canonically:
+  trailing bytes, wrong-length or invalid keys and small-order Ed25519 keys are
+  rejected at parse time.
 - `lattice-net` must not be used for real secrets.
 
 ## Reporting a vulnerability
