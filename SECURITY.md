@@ -45,7 +45,7 @@
 - `lattice-net` signs handshakes with a separate Hybrid **device** key, not the
   root identity. The root (recoverable from its mnemonic) only issues and
   renews device certificates (30-day lifetime, auto-renewed within 7 days of
-  expiry) and signs revocation lists; it can be removed from a store with
+  expiry while the root is in the store) and signs revocation lists; it can be removed from a store with
   `forget-root`. The root's own secret is still a single point of total
   compromise: there is no root rotation.
 - Revocation lists (`lattice-revocation-v1`) are signed by the root, monotonic by

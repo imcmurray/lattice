@@ -756,7 +756,13 @@ async fn run() -> Result<()> {
                 ));
             }
             let root_id = root.keypair.peer_id();
-            let old = store.load_revocation()?.filter(|l| *l.root() == root_id);
+            // Build on the highest-seq list known for this root (our own file or one
+            // learned from a peer, possibly issued by another device of this root),
+            // so the new seq supersedes it and no earlier revocation is dropped.
+            let old = creds
+                .revocation
+                .clone()
+                .filter(|l| *l.root() == root_id && l.verify(root.keypair.public()));
             let mut set: Vec<PeerId> = old
                 .as_ref()
                 .map(|l| l.revoked().to_vec())
@@ -2217,7 +2223,7 @@ mod tests {
     // ---- negotiation timeouts, busy reply, gate ----
 
     const SHORT: Duration = Duration::from_millis(50);
-    const MEDIUM: Duration = Duration::from_millis(1500);
+    const MEDIUM: Duration = Duration::from_secs(5);
 
     #[test]
     fn negotiation_constants() {
