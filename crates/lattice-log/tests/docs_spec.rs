@@ -31,7 +31,7 @@ fn design_mentions_required_terms() {
         "lattice-session-hs-v3",
         "lattice-sig-v2",
         "lattice-resume-v2",
-        "lattice-ticket-v1",
+        "lattice-ticket-v2",
         "lattice-net-cb-v1",
         "ed25519-dalek 3.0.0-rc.0",
         "64 KiB",
@@ -59,6 +59,69 @@ fn adrs_appear_in_order() {
         assert!(pos >= last, "{key} out of order");
         last = pos;
     }
+}
+
+fn collapsed(name: &str) -> String {
+    read(name).split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[test]
+fn design_states_exact_transcript() {
+    let d = collapsed("DESIGN.md");
+    for need in [
+        "\"lattice-session-hs-v3\" ‖ lp(binding) ‖ lp(initiator) ‖ lp(responder) ‖ eph_i ‖ ratchet_pub_i ‖ lp(kem_ct_s) ‖ lp(kem_ek_i)",
+        "T1 ‖ lp(sig_i) ‖ eph_r ‖ lp(kem_ct_e)",
+        "T2 ‖ lp(sig_r)",
+        "classical-only security",
+        "MAX_PENDING_ACCEPTS",
+        "MAX_BUSY_REPLIES",
+    ] {
+        assert!(d.contains(need), "DESIGN.md missing {need:?}");
+    }
+}
+
+#[test]
+fn design_drops_overclaims() {
+    let d = collapsed("DESIGN.md");
+    for bad in [
+        "classical-only (harvest-now-decrypt-later risk)",
+        "Hybrid, never PQ-only or classical-only",
+        "Each side verifies the peer's signature **before** any DH or decapsulation",
+        "day-to-day signing via device subkeys",
+        "plaintext backed up",
+        "Residual: `IrohTransport::accept_conn` has no timeout",
+        "lattice-ticket-v1`: signed",
+    ] {
+        assert!(!d.contains(bad), "DESIGN.md still contains {bad:?}");
+    }
+}
+
+#[test]
+fn design_unimplemented_items_follow_marker() {
+    let d = collapsed("DESIGN.md");
+    let marker = "**Not implemented (future):**";
+    let first = d.find(marker).expect("marker missing");
+    for term in ["proof-of-membership", "peer-scoring"] {
+        for (pos, _) in d.match_indices(term) {
+            assert!(pos > first, "{term:?} appears before the marker");
+        }
+    }
+}
+
+#[test]
+fn adr004_mentions_root_identity_use() {
+    let d = collapsed("DESIGN.md");
+    let start = d.rfind("ADR-004").unwrap();
+    let end = start + d[start..].find("ADR-005").unwrap();
+    let adr = &d[start..end];
+    assert!(adr.contains("root") && adr.contains("device subkeys"));
+}
+
+#[test]
+fn security_md_qualifies_hybrid_handshake() {
+    let s = collapsed("SECURITY.md").to_lowercase();
+    assert!(s.contains("classical"));
+    assert!(s.contains("responder is hybrid"));
 }
 
 #[test]

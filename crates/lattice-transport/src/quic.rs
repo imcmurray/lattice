@@ -342,14 +342,43 @@ impl IrohTransport {
         Ok((parsed, IrohConn { conn, send, recv }))
     }
 
-    /// Accept one inbound connection's first bi-stream.
-    pub async fn accept_conn(&self) -> Result<IrohConn> {
+    /// Wait for the next inbound connection attempt and return it without
+    /// awaiting its handshake. `Err(Error::Transport("endpoint closed"))` when
+    /// the endpoint is closed.
+    pub async fn accept_incoming(&self) -> Result<IncomingConn> {
         let incoming = self
             .ep
             .accept()
             .await
             .ok_or_else(|| Error::Transport("endpoint closed".into()))?;
-        let conn = incoming.await.map_err(|e| terr("accept", e))?;
+        Ok(IncomingConn { incoming })
+    }
+
+    /// Accept one inbound connection's first bi-stream.
+    ///
+    /// **WARNING: no timeout.** A peer that never completes the QUIC handshake,
+    /// or completes it but never opens a stream, makes this wait forever and
+    /// blocks the caller. Prefer [`IrohTransport::accept_incoming`] plus a
+    /// bounded [`IncomingConn::finish`].
+    pub async fn accept_conn(&self) -> Result<IrohConn> {
+        self.accept_incoming().await?.finish().await
+    }
+}
+
+/// An inbound connection attempt that has not yet completed its QUIC
+/// handshake or opened a stream. Obtained quickly from
+/// [`IrohTransport::accept_incoming`]; dropping it refuses/abandons the attempt.
+pub struct IncomingConn {
+    incoming: iroh::endpoint::Incoming,
+}
+
+impl IncomingConn {
+    /// Complete the QUIC handshake, then accept the peer's first bi-stream.
+    ///
+    /// Has NO timeout of its own: a peer that completes QUIC but never opens a
+    /// stream makes this wait forever. Callers must bound it.
+    pub async fn finish(self) -> Result<IrohConn> {
+        let conn = self.incoming.await.map_err(|e| terr("accept", e))?;
         let (send, recv) = conn.accept_bi().await.map_err(|e| terr("accept_bi", e))?;
         Ok(IrohConn { conn, send, recv })
     }
@@ -395,6 +424,20 @@ impl Transport for IrohTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Compile-only: the incoming-connection API exists with these shapes.
+    #[test]
+    fn incoming_api_is_exported() {
+        fn _assert(t: &IrohTransport) {
+            let _incoming = t.accept_incoming();
+            let _conn = t.accept_conn();
+        }
+        fn _finish(i: IncomingConn) {
+            let _fut = i.finish();
+        }
+        let _: fn(&IrohTransport) = _assert;
+        let _: fn(IncomingConn) = _finish;
+    }
 
     #[test]
     fn oversized_frames_are_rejected() {

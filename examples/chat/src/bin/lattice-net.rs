@@ -31,10 +31,14 @@
 //!
 //! Every pre-chat step (preamble, resume challenge/response, handshake) is
 //! limited to 15 s on both sides, so one slow or silent peer cannot stall the
-//! listener. A separate acceptor task keeps accepting while a chat runs; any
-//! connection that arrives while a chat (or negotiation) is in progress gets a
-//! one-byte "busy" reply and is dropped, and a dialer treats that as a failed
-//! attempt and retries with backoff.
+//! listener. Finishing an inbound QUIC connection (handshake plus the first
+//! stream) is limited to 15 s too. A separate acceptor task only takes incoming
+//! connections and keeps accepting while a chat runs; each one finishes in its
+//! own task, with at most 8 pending accepts at a time. Any connection that
+//! arrives while a chat (or negotiation) is in progress gets a one-byte "busy"
+//! reply and is dropped, with at most 8 busy replies at a time. Excess
+//! connections beyond either limit are dropped immediately. A dialer treats a
+//! busy reply as a failed attempt and retries with backoff.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -67,6 +71,10 @@ const DECISION_BUSY: u8 = 3;
 /// Upper bound on every pre-chat step (preamble, resume challenge/response,
 /// v3 handshake) on both the listener and the dialer.
 const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(15);
+/// Max concurrent busy-reply tasks; over the limit a connection is dropped without spawning.
+const MAX_BUSY_REPLIES: usize = 8;
+/// Max concurrent pending accepts (QUIC handshake + accept_bi); over the limit an incoming is dropped.
+const MAX_PENDING_ACCEPTS: usize = 8;
 const NONCE_LEN: usize = 32;
 const TAG_LEN: usize = 32;
 /// Domain separator of the channel binding passed to the handshake and resume.
@@ -242,31 +250,49 @@ async fn listen(me: Keypair, mut lines: StdinLines) -> Result<()> {
     let ticket = encode_ticket(&addr, &app_identity, &app_sig)?;
     println!("\n=== TICKET (copy to the other device) ===\n{ticket}\n=========================================\n");
 
-    // Acceptor task: keeps accepting while a chat runs. A free gate hands the
-    // connection to this loop; a taken gate gets a one-byte "busy" reply.
+    // Acceptor task: only takes `Incoming`s, so one slow peer cannot stall it.
+    // Each incoming finishes (QUIC handshake + first stream, limited to
+    // NEGOTIATION_TIMEOUT) in its own task under the `pending` semaphore. A free
+    // gate hands the connection to this loop; a taken gate gets a one-byte
+    // "busy" reply under the `busy` semaphore. Excess connections are dropped.
     let t = Arc::new(t);
     let gate = Arc::new(ChatGate::new());
+    let busy = Arc::new(tokio::sync::Semaphore::new(MAX_BUSY_REPLIES));
+    let pending = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_ACCEPTS));
     let (tx, mut rx) = tokio::sync::mpsc::channel::<IrohConn>(1);
     let acceptor = {
         let t = t.clone();
         let gate = gate.clone();
         tokio::spawn(async move {
             loop {
-                let conn = match t.accept_conn().await {
-                    Ok(c) => c,
+                let incoming = match t.accept_incoming().await {
+                    Ok(i) => i,
                     Err(e) => {
-                        eprintln!("[lattice-net] accept failed: {e} — still listening");
-                        continue;
-                    }
-                };
-                if gate.try_claim() {
-                    if tx.send(conn).await.is_err() {
+                        eprintln!("[lattice-net] accept failed: {e} — no longer accepting");
                         break;
                     }
-                } else {
-                    tokio::spawn(async move {
-                        let _ = tokio::time::timeout(NEGOTIATION_TIMEOUT, reply_busy(conn)).await;
-                    });
+                };
+                let (gate, tx_task, busy) = (gate.clone(), tx.clone(), busy.clone());
+                let task = async move {
+                    let conn = match accept_within(NEGOTIATION_TIMEOUT, incoming.finish()).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("[lattice-net] inbound connection failed: {e}");
+                            return;
+                        }
+                    };
+                    // Not under the timeout: a timeout between claiming the gate
+                    // and sending would leave the gate claimed forever.
+                    let _ = dispatch(conn, &gate, &tx_task, &busy, |c| async move {
+                        let _ = tokio::time::timeout(NEGOTIATION_TIMEOUT, reply_busy(c)).await;
+                    })
+                    .await;
+                };
+                if spawn_bounded(&pending, task).is_none() {
+                    eprintln!("[lattice-net] too many pending accepts — dropped a connection");
+                }
+                if tx.is_closed() {
+                    break;
                 }
             }
         })
@@ -306,6 +332,82 @@ async fn listen(me: Keypair, mut lines: StdinLines) -> Result<()> {
     }
     acceptor.abort();
     Ok(())
+}
+
+/// Spawn `fut` iff `sem` has a free permit (never waits). The permit moves into
+/// the task and is released when the task ends (completion or abort). With no
+/// permit, `fut` is dropped unpolled (dropping whatever it owns) and `None` is
+/// returned.
+fn spawn_bounded<F>(
+    sem: &Arc<tokio::sync::Semaphore>,
+    fut: F,
+) -> Option<tokio::task::JoinHandle<F::Output>>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let permit = sem.clone().try_acquire_owned().ok()?;
+    Some(tokio::spawn(async move {
+        let _permit = permit;
+        fut.await
+    }))
+}
+
+/// `fut` bounded by `limit`; on timeout returns a transport error and drops it.
+async fn accept_within<F, T>(limit: Duration, fut: F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    match tokio::time::timeout(limit, fut).await {
+        Ok(r) => r,
+        Err(_) => Err(Error::Transport(format!(
+            "accept timed out after {limit:?}"
+        ))),
+    }
+}
+
+/// What happened to a finished inbound connection.
+#[derive(Debug, PartialEq, Eq)]
+enum Dispatched {
+    /// Gate claimed and the connection was sent to the chat loop.
+    Forwarded,
+    /// Gate taken; a bounded busy-reply task was spawned.
+    Busy,
+    /// Gate taken and the busy semaphore was full; the connection was dropped.
+    Dropped,
+    /// Gate claimed but the chat loop's receiver is gone; gate released, connection dropped.
+    Closed,
+}
+
+/// Route one established connection: claim the gate and forward it, else reply
+/// busy under `busy` (via `spawn_bounded`), else drop it. `busy_reply` builds
+/// the (already time-bounded) busy-reply future; it is only invoked inside the
+/// spawned task, so it never runs when the busy semaphore is full.
+async fn dispatch<C, B, Fut>(
+    conn: C,
+    gate: &ChatGate,
+    tx: &tokio::sync::mpsc::Sender<C>,
+    busy: &Arc<tokio::sync::Semaphore>,
+    busy_reply: B,
+) -> Dispatched
+where
+    C: Send + 'static,
+    B: FnOnce(C) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    if gate.try_claim() {
+        match tx.send(conn).await {
+            Ok(()) => Dispatched::Forwarded,
+            Err(_) => {
+                gate.release();
+                Dispatched::Closed
+            }
+        }
+    } else if spawn_bounded(busy, async move { busy_reply(conn).await }).is_some() {
+        Dispatched::Busy
+    } else {
+        Dispatched::Dropped
+    }
 }
 
 /// Single-chat gate shared by the acceptor task and the listen loop.
@@ -490,8 +592,11 @@ async fn connect(me: Keypair, ticket: String, mut lines: StdinLines) -> Result<(
 
 /// Dialer-side negotiation after the transport connects: send the preamble,
 /// then either resume the kept session (after a mutual proof) or run a fresh
-/// handshake. `kept` is only taken once the outcome is certain. `binding` is
-/// the channel binding of this connection.
+/// handshake. On `DECISION_FRESH`, `kept` is taken (cleared) before the fresh
+/// handshake runs, so a failed fresh handshake leaves no kept session. On
+/// `DECISION_CHALLENGE`, `kept` is taken only after the listener's proof
+/// verifies and the dialer's tag is sent. Busy, legacy and unknown decisions
+/// leave `kept` untouched. `binding` is the channel binding of this connection.
 async fn negotiate_dial<C: Connection>(
     mut conn: C,
     me: &Keypair,
@@ -1041,6 +1146,160 @@ mod tests {
         assert!(!g.try_claim());
         g.release();
         assert!(g.try_claim());
+    }
+
+    // ---- bounded accept path ----
+
+    fn sem(n: usize) -> Arc<tokio::sync::Semaphore> {
+        Arc::new(tokio::sync::Semaphore::new(n))
+    }
+
+    #[test]
+    fn listener_limits_are_set() {
+        assert_eq!(MAX_BUSY_REPLIES, 8);
+        assert_eq!(MAX_PENDING_ACCEPTS, 8);
+        assert_eq!(NEGOTIATION_TIMEOUT, Duration::from_secs(15));
+    }
+
+    #[tokio::test]
+    async fn spawn_bounded_without_permit_never_polls() {
+        let (mut dial, listen) = pair().await;
+        let polled = Arc::new(AtomicBool::new(false));
+        let flag = polled.clone();
+        let s = sem(0);
+        let h = spawn_bounded(&s, async move {
+            flag.store(true, Ordering::SeqCst);
+            let _own = listen;
+        });
+        assert!(h.is_none());
+        assert!(!polled.load(Ordering::SeqCst));
+        // The owned connection was dropped: the peer sees a closed channel.
+        assert!(dial.recv().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn spawn_bounded_caps_tasks_and_releases_on_abort() {
+        const N: usize = 3;
+        let s = sem(N);
+        let mut handles = Vec::new();
+        for _ in 0..N {
+            let h = spawn_bounded(&s, std::future::pending::<()>());
+            handles.push(h.expect("permit available"));
+        }
+        assert!(spawn_bounded(&s, std::future::pending::<()>()).is_none());
+        for h in &handles {
+            h.abort();
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+        assert_eq!(s.available_permits(), N);
+    }
+
+    #[tokio::test]
+    async fn spawn_bounded_releases_permit_on_completion() {
+        let s = sem(2);
+        let h = spawn_bounded(&s, async { 7 }).unwrap();
+        assert_eq!(h.await.unwrap(), 7);
+        assert_eq!(s.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn accept_within_times_out() {
+        let r = tokio::time::timeout(
+            Duration::from_secs(5),
+            accept_within(SHORT, std::future::pending::<Result<()>>()),
+        )
+        .await
+        .expect("accept_within must not hang");
+        assert!(matches!(r, Err(Error::Transport(_))));
+    }
+
+    #[tokio::test]
+    async fn accept_within_passes_results_through() {
+        assert_eq!(accept_within(SHORT, async { Ok(5) }).await.unwrap(), 5);
+        let r = accept_within(SHORT, async { Err::<(), _>(Error::Verify("x".into())) }).await;
+        assert!(matches!(r, Err(Error::Verify(_))));
+    }
+
+    #[tokio::test]
+    async fn pending_accept_does_not_block_another() {
+        let s = sem(2);
+        let a = spawn_bounded(
+            &s,
+            accept_within(SHORT, std::future::pending::<Result<()>>()),
+        )
+        .unwrap();
+        let b = spawn_bounded(&s, accept_within(SHORT, async { Ok(()) })).unwrap();
+        // B finishes while A is still waiting for its timeout.
+        assert!(b.await.unwrap().is_ok());
+        assert!(!a.is_finished());
+        assert!(matches!(a.await.unwrap(), Err(Error::Transport(_))));
+        assert_eq!(s.available_permits(), 2);
+    }
+
+    async fn no_busy(_c: MemoryConn) {}
+
+    #[tokio::test]
+    async fn dispatch_forwards_when_gate_free() {
+        let (_dial, listen) = pair().await;
+        let gate = ChatGate::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<MemoryConn>(1);
+        let r = dispatch(listen, &gate, &tx, &sem(1), no_busy).await;
+        assert_eq!(r, Dispatched::Forwarded);
+        assert!(rx.recv().await.is_some());
+        assert!(!gate.try_claim());
+    }
+
+    #[tokio::test]
+    async fn dispatch_closed_releases_gate() {
+        let (_dial, listen) = pair().await;
+        let gate = ChatGate::new();
+        let (tx, rx) = tokio::sync::mpsc::channel::<MemoryConn>(1);
+        drop(rx);
+        let r = dispatch(listen, &gate, &tx, &sem(1), no_busy).await;
+        assert_eq!(r, Dispatched::Closed);
+        assert!(gate.try_claim());
+    }
+
+    #[tokio::test]
+    async fn dispatch_busy_replies_and_frees_permit() {
+        let (mut dial, listen) = pair().await;
+        let gate = ChatGate::new();
+        assert!(gate.try_claim());
+        let (tx, _rx) = tokio::sync::mpsc::channel::<MemoryConn>(1);
+        let busy = sem(2);
+        let r = dispatch(listen, &gate, &tx, &busy, |c| async move {
+            let _ = tokio::time::timeout(NEGOTIATION_TIMEOUT, reply_busy(c)).await;
+        })
+        .await;
+        assert_eq!(r, Dispatched::Busy);
+        assert_eq!(dial.recv().await.unwrap(), [DECISION_BUSY]);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while busy.available_permits() != 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("busy permit released");
+    }
+
+    #[tokio::test]
+    async fn dispatch_drops_when_busy_semaphore_full() {
+        let (mut dial, listen) = pair().await;
+        let gate = ChatGate::new();
+        assert!(gate.try_claim());
+        let (tx, _rx) = tokio::sync::mpsc::channel::<MemoryConn>(1);
+        let invoked = Arc::new(AtomicBool::new(false));
+        let flag = invoked.clone();
+        let r = dispatch(listen, &gate, &tx, &sem(0), move |c| async move {
+            flag.store(true, Ordering::SeqCst);
+            let _ = reply_busy(c).await;
+        })
+        .await;
+        assert_eq!(r, Dispatched::Dropped);
+        assert!(!invoked.load(Ordering::SeqCst));
+        assert!(dial.recv().await.is_err());
     }
 
     // ---- channel binding ----

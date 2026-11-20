@@ -14,10 +14,17 @@
   caller-supplied channel-binding bytes. `lattice-net` passes the dialer's and
   listener's iroh endpoint ids as that binding (`lattice-net-cb-v1`), so the
   handshake is bound to the specific iroh channel.
-- Sessions now have forward secrecy against later identity compromise: the
-  handshake is hybrid, mixing fresh X25519 and ML-KEM ephemerals from both
-  sides, which are erased after the handshake. A compromised long-term identity
-  can still impersonate its owner in NEW sessions.
+- Sessions have forward secrecy against later identity compromise: the
+  handshake mixes fresh X25519 ephemerals from both sides, which are erased
+  after the handshake. It also mixes ML-KEM only when the responder is Hybrid
+  (the default suite, and what `lattice-net` uses). With a Classical responder
+  the session is classical-only (X25519), with no post-quantum protection. A
+  compromised long-term identity can still impersonate its owner in NEW
+  sessions.
+- The `lattice-net` listener limits each pre-chat step and the finishing of an
+  inbound QUIC connection to 15 s, and bounds pending accepts and busy replies
+  (8 each), dropping the excess. This is not Sybil or flood resistance: a flood
+  can still fill those slots and delay legitimate peers.
 - The `lattice-net` listen ticket is a reachability bearer token. It is signed
   by the listener's Lattice identity: the signature (`lattice-ticket-v2`) covers
   the listener's iroh endpoint id, its full address (relay URLs and direct
