@@ -2,64 +2,83 @@
 //!
 //! On device A:  `lattice-net listen`            → prints a TICKET
 //! On device B:  `lattice-net connect <ticket>`  → dials A
-//! Either side:  `lattice-net whoami`            → prints your peer id + fingerprint
+//! Either side:  `lattice-net whoami`            → root + device ids, fingerprints, cert expiry
 //!               `lattice-net show-recovery-phrase --i-understand`
+//!               `lattice-net renew-device` / `revoke-device <id>`
+//!               `lattice-net forget-root --i-understand` / `import-root`
 //!
-//! Each side loads a persistent PQ-hybrid identity via [`IdentityStore`] (OS
-//! keychain, else an age-encrypted file), then runs the hybrid-KEM +
-//! Double-Ratchet handshake over an iroh QUIC connection and relays stdin lines
-//! as end-to-end-encrypted messages.
+//! **Device keys (ADR-013).** The root identity (recoverable from its mnemonic)
+//! is *not* the everyday key. Each store holds a separate Hybrid **device**
+//! keypair and a root-signed `DeviceCert` (30-day lifetime, auto-renewed within
+//! 7 days of expiry while the root is in the store). Handshakes are signed with
+//! the device key. The root is only needed to issue/renew certs and revocation
+//! lists, and can be removed from the store with `forget-root` (restore it with
+//! `import-root`, which reads the phrase from stdin). Peers prove
+//! device → root → (not revoked) on the wire, and users compare the peer's
+//! **root** fingerprint out of band.
 //!
-//! The TICKET is signed by the listener's Lattice identity (`lattice-ticket-v2`)
-//! and the signature covers its full iroh address: endpoint id, relay URLs and
-//! direct addresses. The dialer verifies that signature *before dialing*, so an
-//! edited ticket is rejected, then checks that it actually reached the endpoint
-//! the ticket names. Both the handshake
-//! transcript and the resume proofs are bound to the dialer's and listener's
-//! iroh endpoint ids (`lattice-net-cb-v1`), so a session cannot be replayed onto
-//! a different QUIC connection. The ticket still grants reachability, and a
-//! first contact is trust-on-first-use: compare the printed fingerprints
-//! (`lattice-net whoami`) with your peer out of band.
+//! **Revocation.** The root signs `lattice-revocation-v1` lists
+//! (`revoke-device`), monotonic by `seq`. Peers cache the highest-seq verified
+//! list per root and enforce it on fresh handshakes *and on resume*. Propagation
+//! is lazy: a peer learns a list only when it next talks to a non-revoked
+//! device of that root (which sends it in its auth bundle / listener hello).
+//!
+//! **Ticket v3** is compact and unsigned: the iroh address plus the listener's
+//! root and device PeerIds (small enough for a QR code). It is an out-of-band
+//! bearer of those ids; its security comes from the listener's *hello*
+//! (device identity + cert chain, sent before the handshake) being verified
+//! against the ticket's ids, then the handshake and an auth-bundle exchange.
+//! Both the handshake transcript and the resume proofs are bound to the
+//! dialer's and listener's iroh endpoint ids (`lattice-net-cb-v1`). The ticket
+//! still grants reachability. A v2 ticket, or a peer on the previous wire
+//! version, fails with a clear version error (the dialer's first byte is the
+//! wire version).
 //!
 //! Reconnects use **session resumption** (ADR-006): on a drop, each side keeps
-//! its `SecureSession`; the dialer's reconnect preamble signals `resume`, and if
-//! the listener still holds that peer's session both sides exchange HMAC proofs
-//! keyed by the session's secret and the channel binding (`lattice-resume-v2`);
-//! only when both verify do they rebind to the new connection with no
-//! re-handshake. If either side lost its state (e.g. a restart), they fall back
-//! to a fresh handshake.
+//! its `SecureSession` and the verified peer auth; the dialer's reconnect
+//! preamble signals `resume`, and if the listener still holds that peer's
+//! session — and the peer's cert is unexpired and not revoked by a cached list —
+//! both sides exchange HMAC proofs keyed by the session's secret and the
+//! channel binding (`lattice-resume-v2`) and rebind with no re-handshake.
+//! Otherwise they fall back to a fresh handshake plus auth exchange.
 //!
-//! Every pre-chat step (preamble, resume challenge/response, handshake) is
-//! limited to 15 s on both sides, so one slow or silent peer cannot stall the
-//! listener. Finishing an inbound QUIC connection (handshake plus the first
-//! stream) is limited to 15 s too. A separate acceptor task only takes incoming
-//! connections and keeps accepting while a chat runs; each one finishes in its
-//! own task, with at most 8 pending accepts at a time. Any connection that
-//! arrives while a chat (or negotiation) is in progress gets a one-byte "busy"
-//! reply and is dropped, with at most 8 busy replies at a time. Excess
-//! connections beyond either limit are dropped immediately. A dialer treats a
-//! busy reply as a failed attempt and retries with backoff.
+//! Every pre-chat step (preamble, hello, resume challenge/response, handshake,
+//! auth exchange) is limited to 15 s on both sides, so one slow or silent peer
+//! cannot stall the listener. Finishing an inbound QUIC connection (handshake
+//! plus the first stream) is limited to 15 s too. A separate acceptor task only
+//! takes incoming connections and keeps accepting while a chat runs; each one
+//! finishes in its own task, with at most 8 pending accepts at a time. Any
+//! connection that arrives while a chat (or negotiation) is in progress gets a
+//! one-byte "busy" reply and is dropped, with at most 8 busy replies at a
+//! time. Excess connections beyond either limit are dropped immediately. A
+//! dialer treats a busy reply as a failed attempt and retries with backoff.
+//! Identity hiding is absent: the listener's identities and the dialer's device
+//! identity are sent in the clear (the auth bundles are encrypted).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use lattice::identity::storage::IdentityStore;
+use lattice::identity::storage::{IdentityStore, StorageBackend};
 use lattice::prelude::*;
 use lattice::session::{resume_nonce, ResumeRole};
 use lattice::transport::{
-    encode_ticket, parse_ticket, read_frame, ticket_message, write_frame, IrohConn, IrohTransport,
-    ParsedTicket,
+    encode_ticket, parse_ticket, read_frame, write_frame, IrohConn, IrohTransport,
 };
 use tokio::io::{AsyncBufReadExt, BufReader, Lines, Stdin};
 use tokio::sync::{Mutex, Notify};
 
+/// First byte of the dialer's preamble. Must differ from the old preamble's
+/// first byte (`MODE_FRESH`/`MODE_RESUME`, 0/1) so an old dialer is recognised.
+const WIRE_VERSION: u8 = 2;
 // Connection preamble: the dialer's first frame is
-// [mode] ++ dialer_nonce[32] ++ its identity bundle (nonce is zero for fresh).
+// [WIRE_VERSION] ++ [mode] ++ dialer_nonce[32] ++ its device identity
+// (nonce is zero for fresh).
 const MODE_FRESH: u8 = 0;
 const MODE_RESUME: u8 = 1;
-// The listener's reply: fresh handshake, or a resume challenge
+// The listener replies with a hello frame (LISTENER_HELLO), then a decision:
+// fresh handshake, or a resume challenge
 // [DECISION_CHALLENGE] ++ listener_nonce[32] ++ listener_tag[32]; the dialer then
 // answers with its own 32-byte tag (see `ResumeRole`). Resuming needs both proofs.
 const DECISION_FRESH: u8 = 0;
@@ -68,8 +87,26 @@ const DECISION_RESUMED: u8 = 1;
 const DECISION_CHALLENGE: u8 = 2;
 /// Listener reply to a connection that arrives while a chat is in progress.
 const DECISION_BUSY: u8 = 3;
-/// Upper bound on every pre-chat step (preamble, resume challenge/response,
-/// v3 handshake) on both the listener and the dialer.
+/// Listener reply `[DECISION_VERSION, WIRE_VERSION]` to an old/unknown preamble.
+const DECISION_VERSION: u8 = 4;
+/// Tag byte of the listener hello frame.
+const LISTENER_HELLO: u8 = 5;
+/// How long a freshly issued device certificate is valid.
+const DEVICE_CERT_LIFETIME: Duration = Duration::from_secs(30 * 24 * 3600);
+/// Renew (or warn) when the certificate has at most this long left.
+const DEVICE_RENEW_WINDOW: Duration = Duration::from_secs(7 * 24 * 3600);
+/// Max accepted dialer preamble (bytes); checked before parsing.
+const MAX_PREAMBLE_LEN: usize = 8 * 1024;
+/// Max accepted listener hello (bytes); checked before parsing.
+const MAX_LISTENER_HELLO_LEN: usize = 60 * 1024;
+/// Max accepted auth bundle (bytes); checked before parsing.
+const MAX_AUTH_BUNDLE_LEN: usize = 60 * 1024;
+/// Bound on the in-memory revocation cache (== `storage::MAX_PEER_REVOCATIONS`).
+const MAX_CACHED_ROOTS: usize = 256;
+/// Marker in wire-version errors; the dialer does not retry these.
+const VERSION_ERR_MARK: &str = "wire version";
+/// Upper bound on every pre-chat step (preamble, hello, resume
+/// challenge/response, handshake, auth exchange) on both the listener and the dialer.
 const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(15);
 /// Max concurrent busy-reply tasks; over the limit a connection is dropped without spawning.
 const MAX_BUSY_REPLIES: usize = 8;
@@ -84,7 +121,11 @@ const USAGE: &str = "usage:
   lattice-net listen
   lattice-net connect <ticket>
   lattice-net whoami
-  lattice-net show-recovery-phrase --i-understand";
+  lattice-net show-recovery-phrase --i-understand
+  lattice-net renew-device
+  lattice-net revoke-device <64-hex device peer id>
+  lattice-net forget-root --i-understand
+  lattice-net import-root        (the recovery phrase is read from stdin)";
 
 const RECOVERY_REFUSAL: &str = "the recovery phrase is the root secret of your identity:
 anyone who has it can impersonate you. If you really want it printed, rerun with
@@ -92,6 +133,13 @@ anyone who has it can impersonate you. If you really want it printed, rerun with
 
 const RECOVERY_WARNING: &str = "[lattice-net] ⚠ this recovery phrase controls your identity.
 Keep it secret and store it offline: anyone who has it can impersonate you.";
+
+const FORGET_REFUSAL: &str = "forget-root removes the root secret from this store; make sure you
+have the recovery phrase backed up first. Rerun with `lattice-net forget-root --i-understand`";
+
+const NO_ROOT_HELP: &str =
+    "the root is not in this store; restore it with `lattice-net import-root` \
+     (the recovery phrase is read from stdin)";
 
 type StdinLines = Lines<BufReader<Stdin>>;
 
@@ -118,7 +166,29 @@ enum Command {
     Connect(String),
     Whoami,
     ShowRecoveryPhrase,
+    RenewDevice,
+    RevokeDevice(PeerId),
+    ForgetRoot,
+    ImportRoot,
     Usage,
+}
+
+/// Parse 64 hex characters (either case) into a PeerId.
+fn parse_peer_hex(s: &str) -> Result<PeerId> {
+    let b = s.as_bytes();
+    if b.len() != 64 {
+        return Err(Error::Other("a device peer id is 64 hex characters".into()));
+    }
+    let mut out = [0u8; 32];
+    for (i, o) in out.iter_mut().enumerate() {
+        let hi = (b[2 * i] as char).to_digit(16);
+        let lo = (b[2 * i + 1] as char).to_digit(16);
+        match (hi, lo) {
+            (Some(h), Some(l)) => *o = (h * 16 + l) as u8,
+            _ => return Err(Error::Other("a device peer id is hex only".into())),
+        }
+    }
+    Ok(PeerId(out))
 }
 
 /// Parse the full argv (`args[0]` is the program name). Runs before any
@@ -140,8 +210,329 @@ fn parse_command(args: &[String]) -> Result<Command> {
                 Err(Error::Other(RECOVERY_REFUSAL.into()))
             }
         }
+        Some("renew-device") => {
+            if args.len() == 2 {
+                Ok(Command::RenewDevice)
+            } else {
+                Err(Error::Other("usage: lattice-net renew-device".into()))
+            }
+        }
+        Some("revoke-device") => {
+            if args.len() != 3 {
+                return Err(Error::Other(
+                    "usage: lattice-net revoke-device <64-hex device peer id>".into(),
+                ));
+            }
+            Ok(Command::RevokeDevice(parse_peer_hex(&args[2])?))
+        }
+        Some("forget-root") => {
+            if args.len() == 3 && args[2] == "--i-understand" {
+                Ok(Command::ForgetRoot)
+            } else {
+                Err(Error::Other(FORGET_REFUSAL.into()))
+            }
+        }
+        Some("import-root") => {
+            if args.len() == 2 {
+                Ok(Command::ImportRoot)
+            } else {
+                Err(Error::Other(
+                    "the phrase is read from stdin, never from the command line".into(),
+                ))
+            }
+        }
         _ => Ok(Command::Usage),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Time helpers.
+// ---------------------------------------------------------------------------
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Pure: `YYYY-MM-DD` (UTC) for Unix seconds. No dependencies.
+fn format_date(secs: u64) -> String {
+    let z = secs / 86_400 + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + u64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum CertStatus {
+    /// More than the renew window left.
+    Valid,
+    /// Still valid, but within the renew window.
+    RenewSoon,
+    /// `now > not_after`.
+    Expired,
+}
+
+/// Pure expiry policy. `now == not_after` is still valid (`RenewSoon`).
+fn cert_status(now: u64, not_after: u64, window: u64) -> CertStatus {
+    if now > not_after {
+        CertStatus::Expired
+    } else if not_after - now <= window {
+        CertStatus::RenewSoon
+    } else {
+        CertStatus::Valid
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Credentials, revocation cache, auth bundle.
+// ---------------------------------------------------------------------------
+
+/// Our credentials for this run.
+struct DeviceCreds {
+    device: Keypair,
+    root: PublicIdentity,
+    cert: DeviceCert,
+    /// Our own root's highest-seq list, if any.
+    revocation: Option<RevocationList>,
+}
+
+/// Parsed peer auth bundle (nothing verified yet).
+struct AuthBundle {
+    root: PublicIdentity,
+    cert: DeviceCert,
+    revocation: Option<RevocationList>,
+}
+
+/// What we verified about a peer.
+#[derive(Clone, Debug)]
+struct PeerAuth {
+    root: PublicIdentity,
+    device: PublicIdentity,
+    cert_not_after: u64,
+}
+
+/// A kept session for resume (listener: map value keyed by device PeerId;
+/// dialer: `Option`).
+struct KeptPeer {
+    session: SecureSession,
+    auth: PeerAuth,
+}
+
+/// Bounded per-root cache of the highest-seq verified revocation list.
+struct RevocationCache {
+    lists: HashMap<PeerId, RevocationList>,
+    /// Roots whose entry changed since the last `take_dirty` (to persist).
+    dirty: Vec<PeerId>,
+}
+
+impl RevocationCache {
+    fn new() -> Self {
+        Self {
+            lists: HashMap::new(),
+            dirty: Vec::new(),
+        }
+    }
+
+    fn get(&self, root: &PeerId) -> Option<&RevocationList> {
+        self.lists.get(root)
+    }
+
+    /// Store if no list for that root yet (and below `MAX_CACHED_ROOTS`) or if
+    /// `list` supersedes the cached one. Returns true iff stored. The caller
+    /// must only pass lists already verified under their root.
+    fn observe(&mut self, list: RevocationList) -> bool {
+        let root = list.root().clone();
+        let store = match self.lists.get(&root) {
+            Some(cached) => list.supersedes(cached),
+            None => self.lists.len() < MAX_CACHED_ROOTS,
+        };
+        if store {
+            self.lists.insert(root.clone(), list);
+            if !self.dirty.contains(&root) {
+                self.dirty.push(root);
+            }
+        }
+        store
+    }
+
+    fn revokes(&self, root: &PeerId, device: &PeerId) -> bool {
+        self.lists.get(root).is_some_and(|l| l.is_revoked(device))
+    }
+
+    fn take_dirty(&mut self) -> Vec<PeerId> {
+        std::mem::take(&mut self.dirty)
+    }
+}
+
+fn push_lp32(v: &mut Vec<u8>, x: &[u8]) {
+    v.extend_from_slice(&(x.len() as u32).to_le_bytes());
+    v.extend_from_slice(x);
+}
+
+/// Split one `u32le`-length-prefixed field off `rest`, bounds-checked.
+fn take_lp32<'a>(rest: &mut &'a [u8]) -> Result<&'a [u8]> {
+    let all: &'a [u8] = rest;
+    if all.len() < 4 {
+        return Err(Error::Verify("truncated length prefix".into()));
+    }
+    let n = u32::from_le_bytes([all[0], all[1], all[2], all[3]]) as usize;
+    let body = &all[4..];
+    if n > body.len() {
+        return Err(Error::Verify("length prefix exceeds input".into()));
+    }
+    let (head, tail) = body.split_at(n);
+    *rest = tail;
+    Ok(head)
+}
+
+fn vctx(what: &'static str) -> impl Fn(Error) -> Error {
+    move |e| Error::Verify(format!("{what}: {e}"))
+}
+
+/// bundle = lp32(root identity) ‖ lp32(cert) ‖ lp32(revocation list | empty)
+fn encode_auth_bundle(me: &DeviceCreds) -> Vec<u8> {
+    let mut v = Vec::new();
+    push_lp32(&mut v, &me.root.to_bytes());
+    push_lp32(&mut v, &me.cert.to_bytes());
+    match &me.revocation {
+        Some(l) => push_lp32(&mut v, &l.to_bytes()),
+        None => push_lp32(&mut v, &[]),
+    }
+    v
+}
+
+/// Length cap first, strict, no trailing bytes.
+fn decode_auth_bundle(b: &[u8]) -> Result<AuthBundle> {
+    if b.len() > MAX_AUTH_BUNDLE_LEN {
+        return Err(Error::Verify(format!(
+            "auth bundle too large: {} > {MAX_AUTH_BUNDLE_LEN}",
+            b.len()
+        )));
+    }
+    let mut rest = b;
+    let root = PublicIdentity::from_bytes(take_lp32(&mut rest)?).map_err(vctx("bundle root"))?;
+    let cert = DeviceCert::from_bytes(take_lp32(&mut rest)?).map_err(vctx("bundle cert"))?;
+    let rev = take_lp32(&mut rest)?;
+    let revocation = if rev.is_empty() {
+        None
+    } else {
+        Some(RevocationList::from_bytes(rev).map_err(vctx("bundle revocation list"))?)
+    };
+    if !rest.is_empty() {
+        return Err(Error::Verify("trailing bytes after auth bundle".into()));
+    }
+    Ok(AuthBundle {
+        root,
+        cert,
+        revocation,
+    })
+}
+
+/// Verify a peer's device → root → (not revoked) chain. On success the sent
+/// list is observed into `cache`.
+fn verify_peer_chain(
+    b: &AuthBundle,
+    peer_device: &PublicIdentity,
+    now: u64,
+    cache: &mut RevocationCache,
+) -> Result<PeerAuth> {
+    let device_id = peer_device.peer_id();
+    let root_id = b.root.peer_id();
+    if b.cert.device().peer_id() != device_id {
+        return Err(Error::Verify(
+            "peer chain: certificate is for a different device than the session peer".into(),
+        ));
+    }
+    if !b.cert.verify(&b.root, now) {
+        return Err(Error::Verify(
+            "peer chain: certificate is invalid, expired, or not issued by the stated root".into(),
+        ));
+    }
+    if let Some(l) = &b.revocation {
+        if *l.root() != root_id {
+            return Err(Error::Verify(
+                "peer chain: revocation list is for a different root".into(),
+            ));
+        }
+        if !l.verify(&b.root) {
+            return Err(Error::Verify(
+                "peer chain: revocation list signature is invalid".into(),
+            ));
+        }
+        if l.is_revoked(&device_id) {
+            return Err(Error::Verify(
+                "peer chain: device is revoked by the root's list".into(),
+            ));
+        }
+    }
+    if cache.revokes(&root_id, &device_id) {
+        return Err(Error::Verify(
+            "peer chain: device is revoked by a cached list for its root".into(),
+        ));
+    }
+    if let Some(l) = &b.revocation {
+        cache.observe(l.clone());
+    }
+    Ok(PeerAuth {
+        root: b.root.clone(),
+        device: peer_device.clone(),
+        cert_not_after: b.cert.not_after(),
+    })
+}
+
+/// hello = [LISTENER_HELLO] ‖ lp32(device identity) ‖ auth bundle
+fn encode_listener_hello(me: &DeviceCreds) -> Vec<u8> {
+    let mut v = vec![LISTENER_HELLO];
+    push_lp32(&mut v, &me.device.public().to_bytes());
+    v.extend_from_slice(&encode_auth_bundle(me));
+    v
+}
+
+/// Parse a listener hello, check its device/root PeerIds against the ticket,
+/// then verify the chain.
+fn verify_listener_hello(
+    frame: &[u8],
+    ticket_root: &[u8; 32],
+    ticket_device: &[u8; 32],
+    now: u64,
+    cache: &mut RevocationCache,
+) -> Result<PeerAuth> {
+    if frame.len() > MAX_LISTENER_HELLO_LEN {
+        return Err(Error::Verify(format!(
+            "listener hello too large: {} > {MAX_LISTENER_HELLO_LEN}",
+            frame.len()
+        )));
+    }
+    if frame.first() != Some(&LISTENER_HELLO) {
+        return Err(Error::Verify("not a listener hello".into()));
+    }
+    let mut rest = &frame[1..];
+    let device = PublicIdentity::from_bytes(take_lp32(&mut rest)?).map_err(vctx("hello device"))?;
+    let bundle = decode_auth_bundle(rest)?;
+    if device.peer_id().0 != *ticket_device {
+        return Err(Error::Verify(
+            "listener's device is not the one named by the ticket".into(),
+        ));
+    }
+    if bundle.root.peer_id().0 != *ticket_root {
+        return Err(Error::Verify(
+            "listener's root is not the one named by the ticket".into(),
+        ));
+    }
+    verify_peer_chain(&bundle, &device, now, cache)
+}
+
+/// True iff the peer's cert is unexpired and the cache does not revoke it.
+fn resume_allowed(auth: &PeerAuth, now: u64, cache: &RevocationCache) -> bool {
+    now <= auth.cert_not_after && !cache.revokes(&auth.root.peer_id(), &auth.device.peer_id())
 }
 
 /// `CB_DOMAIN ‖ dialer_endpoint_id ‖ listener_endpoint_id` (81 bytes): binds a
@@ -154,16 +545,6 @@ fn channel_binding(dialer_ep: &[u8; 32], listener_ep: &[u8; 32]) -> Vec<u8> {
     b
 }
 
-/// Verify a ticket's signature under the identity it carries (pure; no network).
-fn verify_ticket(t: &ParsedTicket) -> Result<PublicIdentity> {
-    let id = PublicIdentity::from_bytes(&t.app_identity)?;
-    let msg = ticket_message(&t.endpoint_id, &t.addr_bytes, &t.app_identity);
-    if t.app_sig.is_empty() || !id.verify(&msg, &Signature(t.app_sig.clone())) {
-        return Err(Error::Verify("ticket signature invalid".into()));
-    }
-    Ok(id)
-}
-
 /// Fail unless the connection reached the endpoint we expected.
 fn check_endpoint(expected: &[u8; 32], remote: &[u8; 32]) -> Result<()> {
     if expected != remote {
@@ -172,83 +553,297 @@ fn check_endpoint(expected: &[u8; 32], remote: &[u8; 32]) -> Result<()> {
     Ok(())
 }
 
-/// Print the peer's fingerprint for out-of-band comparison.
-fn announce_peer(peer: &PeerId, what: &str) {
+/// Print the peer's root fingerprint (the out-of-band comparison value), then
+/// its device fingerprint and certificate expiry.
+fn announce_peer(peer: &PeerAuth, what: &str) {
     eprintln!("[lattice-net] {what} — type messages:");
     eprintln!(
-        "[lattice-net] peer fingerprint: {} — compare this with your peer out of band",
-        peer.fingerprint()
+        "[lattice-net] peer root fingerprint: {} — compare this with your peer out of band",
+        peer.root.peer_id().fingerprint()
     );
+    eprintln!(
+        "[lattice-net] peer device {}, certificate valid until {}",
+        peer.device.peer_id().fingerprint(),
+        format_date(peer.cert_not_after)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Startup: device provisioning, renewal, revocation cache.
+// ---------------------------------------------------------------------------
+
+/// Load (or provision) our device credentials and the revocation cache.
+fn startup(
+    store: &IdentityStore,
+    now: u64,
+) -> Result<(DeviceCreds, RevocationCache, StorageBackend)> {
+    let loaded = match store.load_device(CryptoSuite::Hybrid)? {
+        Some(d) => d,
+        None => {
+            let root_pub = store.root_public()?;
+            if root_pub.is_some() && !store.has_root()? {
+                return Err(Error::Other(format!(
+                    "no device key in this store and {NO_ROOT_HELP}"
+                )));
+            }
+            let root = store.load_or_create(CryptoSuite::Hybrid)?;
+            if root.created {
+                eprintln!("[lattice-net] new root identity created");
+            }
+            if root.migrated {
+                eprintln!(
+                    "[lattice-net] ⚠ migrated your legacy plaintext identity into secure storage ({:?}); \
+                     the legacy plaintext file was removed.",
+                    root.backend
+                );
+            }
+            let not_after = now + DEVICE_CERT_LIFETIME.as_secs();
+            let d = store.provision_device(&root.keypair, CryptoSuite::Hybrid, not_after)?;
+            eprintln!(
+                "[lattice-net] device key created; certificate valid until {}",
+                format_date(not_after)
+            );
+            d
+        }
+    };
+
+    let root_id = loaded.root.peer_id();
+    let mut cache = RevocationCache::new();
+    if let Some(own) = store.load_revocation()? {
+        if own.verify(&loaded.root) {
+            cache.observe(own);
+        } else {
+            eprintln!(
+                "[lattice-net] warning: ignoring revocation.bin (does not verify under this root)"
+            );
+        }
+    }
+    for l in store.load_peer_revocations()? {
+        cache.observe(l);
+    }
+    let _ = cache.take_dirty(); // everything observed here came from disk
+    let revocation = cache.get(&root_id).cloned();
+    let creds = DeviceCreds {
+        device: loaded.keypair,
+        root: loaded.root,
+        cert: loaded.cert,
+        revocation,
+    };
+    Ok((creds, cache, loaded.backend))
+}
+
+/// Re-issue the cert for the same device key, valid for `DEVICE_CERT_LIFETIME`.
+fn renew_cert(
+    store: &IdentityStore,
+    device: &Keypair,
+    root: &Keypair,
+    now: u64,
+) -> Result<DeviceCert> {
+    let cert = root.authorize_device(device.public(), now + DEVICE_CERT_LIFETIME.as_secs())?;
+    store.store_device(device, &cert, root.public())?;
+    Ok(cert)
+}
+
+/// Expiry policy for `listen`/`connect`: renew automatically while the root is
+/// in the store; otherwise warn (renew soon) or refuse (expired).
+fn maintain_cert(store: &IdentityStore, creds: &mut DeviceCreds, now: u64) -> Result<()> {
+    let not_after = creds.cert.not_after();
+    let status = cert_status(now, not_after, DEVICE_RENEW_WINDOW.as_secs());
+    if status == CertStatus::Valid {
+        return Ok(());
+    }
+    if store.has_root()? {
+        let root = store
+            .load_root(CryptoSuite::Hybrid)?
+            .ok_or_else(|| Error::Other(NO_ROOT_HELP.into()))?;
+        creds.cert = renew_cert(store, &creds.device, &root.keypair, now)?;
+        eprintln!(
+            "[lattice-net] device certificate renewed until {}",
+            format_date(creds.cert.not_after())
+        );
+        return Ok(());
+    }
+    let date = format_date(not_after);
+    match status {
+        CertStatus::Expired => Err(Error::Other(format!(
+            "the device certificate expired on {date} and the root is not in this store: \
+             run `lattice-net import-root`, then `lattice-net renew-device`"
+        ))),
+        _ => {
+            eprintln!(
+                "[lattice-net] ⚠ the device certificate expires on {date}; to renew it run \
+                 `lattice-net import-root`, then `lattice-net renew-device`"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Write cache entries that changed during negotiation. Failures are warnings.
+fn persist_cache(store: &IdentityStore, cache: &mut RevocationCache) {
+    for root in cache.take_dirty() {
+        if let Some(l) = cache.get(&root) {
+            if let Err(e) = store.store_peer_revocation(l) {
+                eprintln!("[lattice-net] warning: could not persist a revocation list: {e}");
+            }
+        }
+    }
 }
 
 async fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     // Parse first: bad usage must not touch (or create) any identity.
     let cmd = parse_command(&args)?;
-    if cmd == Command::Usage {
-        eprintln!("{USAGE}");
-        return Ok(());
-    }
-
-    // Persistent identity: OS keychain if available, else an age-encrypted file.
-    let loaded = IdentityStore::open_default().load_or_create(CryptoSuite::Hybrid)?;
-    let me = loaded.keypair;
-    let note = if loaded.created {
-        " (new identity created)"
-    } else {
-        ""
-    };
-    if loaded.migrated {
-        eprintln!(
-            "[lattice-net] ⚠ migrated your legacy plaintext identity into secure storage ({:?}); \
-             the legacy plaintext file was removed.",
-            loaded.backend
-        );
-    }
-
+    let now = now_secs();
     match cmd {
-        Command::Whoami => {
-            println!("peer id: {}", me.peer_id());
-            println!("fingerprint: {}", me.peer_id().fingerprint());
+        Command::Usage => {
+            eprintln!("{USAGE}");
             return Ok(());
         }
-        Command::ShowRecoveryPhrase => {
-            eprintln!("{RECOVERY_WARNING}");
-            println!("{}", me.mnemonic());
-            return Ok(());
-        }
+        Command::ImportRoot => return import_root_cmd(now),
         _ => {}
     }
 
-    eprintln!(
-        "[lattice-net] your fingerprint: {} [stored via {:?}]{note}",
-        me.peer_id().fingerprint(),
-        loaded.backend
-    );
-
-    // Read stdin once and reuse it across reconnects (typed input isn't lost).
-    let lines = BufReader::new(tokio::io::stdin()).lines();
+    let store = IdentityStore::open_default();
+    let (mut creds, cache, backend) = startup(&store, now)?;
 
     match cmd {
-        Command::Listen => listen(me, lines).await,
-        Command::Connect(ticket) => connect(me, ticket, lines).await,
-        _ => Ok(()),
+        Command::Whoami => {
+            let in_store = store.has_root()?;
+            println!("root peer id: {}", creds.root.peer_id());
+            println!("root fingerprint: {}", creds.root.peer_id().fingerprint());
+            println!("device peer id: {}", creds.device.peer_id());
+            println!(
+                "device fingerprint: {}",
+                creds.device.peer_id().fingerprint()
+            );
+            println!(
+                "device cert expires: {}",
+                format_date(creds.cert.not_after())
+            );
+            println!(
+                "root in this store: {}",
+                if in_store { "yes" } else { "no" }
+            );
+            Ok(())
+        }
+        Command::ShowRecoveryPhrase => {
+            let root = store
+                .load_root(CryptoSuite::Hybrid)?
+                .ok_or_else(|| Error::Other(NO_ROOT_HELP.into()))?;
+            eprintln!("{RECOVERY_WARNING}");
+            println!("{}", root.keypair.mnemonic());
+            Ok(())
+        }
+        Command::RenewDevice => {
+            let root = store
+                .load_root(CryptoSuite::Hybrid)?
+                .ok_or_else(|| Error::Other(NO_ROOT_HELP.into()))?;
+            creds.cert = renew_cert(&store, &creds.device, &root.keypair, now)?;
+            println!(
+                "device certificate renewed until {}",
+                format_date(creds.cert.not_after())
+            );
+            Ok(())
+        }
+        Command::RevokeDevice(id) => {
+            let root = store
+                .load_root(CryptoSuite::Hybrid)?
+                .ok_or_else(|| Error::Other(NO_ROOT_HELP.into()))?;
+            if id == creds.device.peer_id() {
+                return Err(Error::Other(
+                    "refusing to revoke this store's own current device".into(),
+                ));
+            }
+            let root_id = root.keypair.peer_id();
+            let old = store.load_revocation()?.filter(|l| *l.root() == root_id);
+            let mut set: Vec<PeerId> = old
+                .as_ref()
+                .map(|l| l.revoked().to_vec())
+                .unwrap_or_default();
+            set.push(id);
+            let seq = old.as_ref().map_or(1, |l| l.seq() + 1);
+            let list = root.keypair.revoke_devices(seq, now, &set)?;
+            store.store_revocation(&list)?;
+            println!(
+                "revocation list seq {seq} written ({} device(s) revoked). Peers learn it only \
+                 when they next talk to a non-revoked device of this root.",
+                list.revoked().len()
+            );
+            Ok(())
+        }
+        Command::ForgetRoot => {
+            eprintln!("{RECOVERY_WARNING}");
+            store.forget_root()?;
+            println!(
+                "root removed from this store; the device key remains. Restore the root with \
+                 `lattice-net import-root`."
+            );
+            Ok(())
+        }
+        Command::Listen | Command::Connect(_) => {
+            maintain_cert(&store, &mut creds, now)?;
+            eprintln!(
+                "[lattice-net] your root fingerprint: {} — device {}, certificate valid until {} [stored via {backend:?}]",
+                creds.root.peer_id().fingerprint(),
+                creds.device.peer_id().fingerprint(),
+                format_date(creds.cert.not_after()),
+            );
+            // Read stdin once and reuse it across reconnects (typed input isn't lost).
+            let lines = BufReader::new(tokio::io::stdin()).lines();
+            match cmd {
+                Command::Listen => listen(creds, cache, store, lines).await,
+                Command::Connect(ticket) => connect(creds, cache, store, ticket, lines).await,
+                _ => Ok(()),
+            }
+        }
+        Command::ImportRoot | Command::Usage => Ok(()),
     }
+}
+
+/// `import-root`: read the phrase from stdin (never echoed or logged), restore
+/// the root, and provision a device if the store has none.
+fn import_root_cmd(now: u64) -> Result<()> {
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| Error::Other(format!("read stdin: {e}")))?;
+    let store = IdentityStore::open_default();
+    let loaded = store.import_root(CryptoSuite::Hybrid, line.trim())?;
+    if store.load_device(CryptoSuite::Hybrid)?.is_none() {
+        let not_after = now + DEVICE_CERT_LIFETIME.as_secs();
+        store.provision_device(&loaded.keypair, CryptoSuite::Hybrid, not_after)?;
+        eprintln!(
+            "[lattice-net] device key created; certificate valid until {}",
+            format_date(not_after)
+        );
+    }
+    println!(
+        "root imported; root fingerprint: {}",
+        loaded.keypair.peer_id().fingerprint()
+    );
+    Ok(())
 }
 
 /// Listener loop: accept connections, negotiate resume-vs-fresh, chat, and keep
 /// each peer's `SecureSession` so a reconnect can resume without re-handshaking.
-async fn listen(me: Keypair, mut lines: StdinLines) -> Result<()> {
+async fn listen(
+    me: DeviceCreds,
+    mut cache: RevocationCache,
+    store: IdentityStore,
+    mut lines: StdinLines,
+) -> Result<()> {
     let t = IrohTransport::bind().await?;
     eprintln!("[lattice-net] coming online (contacting relay)...");
-    // The ticket is signed by our Lattice identity and covers our full iroh
-    // address. One snapshot is both signed and encoded.
-    let app_identity = me.public().to_bytes();
+    // The v3 ticket is compact and unsigned: our iroh address plus our root
+    // and device PeerIds. The dialer checks our hello against those ids.
     let addr = t.ticket_addr().await?;
-    let msg = ticket_message(&addr.endpoint_id(), addr.as_bytes(), &app_identity);
-    let app_sig = me.sign(&msg).0;
-    let ticket = encode_ticket(&addr, &app_identity, &app_sig)?;
+    let ticket = encode_ticket(&addr, &me.root.peer_id().0, &me.device.peer_id().0)?;
     println!("\n=== TICKET (copy to the other device) ===\n{ticket}\n=========================================\n");
+    eprintln!(
+        "[lattice-net] your root fingerprint (your peer compares this out of band): {}",
+        me.root.peer_id().fingerprint()
+    );
 
     // Acceptor task: only takes `Incoming`s, so one slow peer cannot stall it.
     // Each incoming finishes (QUIC handshake + first stream, limited to
@@ -298,7 +893,7 @@ async fn listen(me: Keypair, mut lines: StdinLines) -> Result<()> {
         })
     };
 
-    let mut sessions: HashMap<PeerId, SecureSession> = HashMap::new();
+    let mut sessions: HashMap<PeerId, KeptPeer> = HashMap::new();
     loop {
         eprintln!("[lattice-net] waiting for a peer to connect...");
         let Some(conn) = rx.recv().await else {
@@ -306,8 +901,18 @@ async fn listen(me: Keypair, mut lines: StdinLines) -> Result<()> {
         };
         let binding = channel_binding(&conn.remote_endpoint_id(), &t.endpoint_id_bytes());
         let limit = NEGOTIATION_TIMEOUT;
-        let accepted = negotiate_accept(conn, &me, &mut sessions, &binding, limit).await;
-        let (peer_id, sess) = match accepted {
+        let accepted = negotiate_accept(
+            conn,
+            &me,
+            &mut sessions,
+            &binding,
+            now_secs(),
+            &mut cache,
+            limit,
+        )
+        .await;
+        persist_cache(&store, &mut cache);
+        let (auth, sess) = match accepted {
             Ok(x) => x,
             Err(e) => {
                 eprintln!("[lattice-net] negotiation failed: {e} — still listening");
@@ -321,8 +926,9 @@ async fn listen(me: Keypair, mut lines: StdinLines) -> Result<()> {
                 break;
             }
             Ok((Outcome::PeerDisconnected, recovered)) => {
-                if let Some(s) = recovered {
-                    sessions.insert(peer_id, s); // keep for a future resume
+                if let Some(session) = recovered {
+                    // keep for a future resume
+                    sessions.insert(auth.device.peer_id(), KeptPeer { session, auth });
                 }
                 eprintln!("[lattice-net] peer disconnected — back to listening (session kept)");
             }
@@ -438,17 +1044,26 @@ async fn reply_busy<C: Connection>(mut conn: C) -> Result<()> {
     Ok(())
 }
 
-/// `accept_or_resume` bounded by `limit`. A timed-out future is dropped
+/// `accept_or_resume` bounded by `limit` (preamble, hello, decision,
+/// handshake and auth exchange all included). A timed-out future is dropped
 /// mid-await; `accept_or_resume` only mutates `sessions` after its last
-/// `.await`, so a timeout leaves the map unchanged (keep it that way).
+/// `.await`, so a timeout leaves the map unchanged (keep it that way). The
+/// revocation cache only ever gains verified, higher-seq lists.
 async fn negotiate_accept<C: Connection>(
     conn: C,
-    me: &Keypair,
-    sessions: &mut HashMap<PeerId, SecureSession>,
+    me: &DeviceCreds,
+    sessions: &mut HashMap<PeerId, KeptPeer>,
     binding: &[u8],
+    now: u64,
+    cache: &mut RevocationCache,
     limit: Duration,
-) -> Result<(PeerId, ConnectedSession<C>)> {
-    match tokio::time::timeout(limit, accept_or_resume(conn, me, sessions, binding)).await {
+) -> Result<(PeerAuth, ConnectedSession<C>)> {
+    match tokio::time::timeout(
+        limit,
+        accept_or_resume(conn, me, sessions, binding, now, cache),
+    )
+    .await
+    {
         Ok(r) => r,
         Err(_) => Err(Error::Transport(format!(
             "negotiation timed out after {limit:?}"
@@ -457,15 +1072,33 @@ async fn negotiate_accept<C: Connection>(
 }
 
 /// `negotiate_dial` bounded by `limit`.
+#[allow(clippy::too_many_arguments)]
 async fn negotiate_dial_within<C: Connection>(
     conn: C,
-    me: &Keypair,
-    peer: &PublicIdentity,
-    kept: &mut Option<SecureSession>,
+    me: &DeviceCreds,
+    ticket_root: &[u8; 32],
+    ticket_device: &[u8; 32],
+    kept: &mut Option<KeptPeer>,
     binding: &[u8],
+    now: u64,
+    cache: &mut RevocationCache,
     limit: Duration,
-) -> Result<ConnectedSession<C>> {
-    match tokio::time::timeout(limit, negotiate_dial(conn, me, peer, kept, binding)).await {
+) -> Result<(PeerAuth, ConnectedSession<C>)> {
+    match tokio::time::timeout(
+        limit,
+        negotiate_dial(
+            conn,
+            me,
+            ticket_root,
+            ticket_device,
+            kept,
+            binding,
+            now,
+            cache,
+        ),
+    )
+    .await
+    {
         Ok(r) => r,
         Err(_) => Err(Error::Transport(format!(
             "negotiation timed out after {limit:?}"
@@ -473,104 +1106,120 @@ async fn negotiate_dial_within<C: Connection>(
     }
 }
 
-/// Read the dialer's preamble; resume a kept session if asked and available,
-/// otherwise run a fresh handshake. Returns the peer id and the live session.
-/// `binding` is the channel binding of this connection.
+/// Read the dialer's preamble and answer with our hello; resume a kept session
+/// if asked, available, unexpired and not revoked, otherwise run a fresh
+/// handshake plus the auth exchange. Returns the verified peer and the live
+/// session. `binding` is the channel binding of this connection.
 async fn accept_or_resume<C: Connection>(
     mut conn: C,
-    me: &Keypair,
-    sessions: &mut HashMap<PeerId, SecureSession>,
+    me: &DeviceCreds,
+    sessions: &mut HashMap<PeerId, KeptPeer>,
     binding: &[u8],
-) -> Result<(PeerId, ConnectedSession<C>)> {
+    now: u64,
+    cache: &mut RevocationCache,
+) -> Result<(PeerAuth, ConnectedSession<C>)> {
     let preamble = conn.recv().await?;
-    if preamble.len() < 1 + NONCE_LEN {
+    if preamble.len() > MAX_PREAMBLE_LEN {
+        return Err(Error::Verify(format!(
+            "preamble too long: {} > {MAX_PREAMBLE_LEN}",
+            preamble.len()
+        )));
+    }
+    if preamble.len() < 2 + NONCE_LEN {
         return Err(Error::Verify("short preamble".into()));
     }
-    let mode = preamble[0];
+    if preamble[0] != WIRE_VERSION {
+        let _ = conn.send(&[DECISION_VERSION, WIRE_VERSION]).await;
+        return Err(Error::Verify(format!(
+            "peer uses an older lattice-net {VERSION_ERR_MARK}; both sides must upgrade"
+        )));
+    }
+    let mode = preamble[1];
     let mut dialer_nonce = [0u8; NONCE_LEN];
-    dialer_nonce.copy_from_slice(&preamble[1..1 + NONCE_LEN]);
-    let peer = PublicIdentity::from_bytes(&preamble[1 + NONCE_LEN..])?;
+    dialer_nonce.copy_from_slice(&preamble[2..2 + NONCE_LEN]);
+    let peer = PublicIdentity::from_bytes(&preamble[2 + NONCE_LEN..])?;
     let peer_id = peer.peer_id();
+
+    // Always send our hello first so the dialer can check us against its ticket.
+    conn.send(&encode_listener_hello(me)).await?;
 
     if mode == MODE_RESUME {
         if let Some(kept) = sessions.get(&peer_id) {
-            // Prove we hold the session, then require the dialer's proof
-            // *before* the session is removed from the map or used.
-            let listener_nonce = resume_nonce()?;
-            let listener_tag = kept.resume_tag(
-                ResumeRole::Listener,
-                &peer,
-                me.public(),
-                &dialer_nonce,
-                &listener_nonce,
-                binding,
+            if resume_allowed(&kept.auth, now, cache) {
+                // Prove we hold the session, then require the dialer's proof
+                // *before* the session is removed from the map or used.
+                let listener_nonce = resume_nonce()?;
+                let listener_tag = kept.session.resume_tag(
+                    ResumeRole::Listener,
+                    &peer,
+                    me.device.public(),
+                    &dialer_nonce,
+                    &listener_nonce,
+                    binding,
+                );
+                let mut challenge = Vec::with_capacity(1 + NONCE_LEN + TAG_LEN);
+                challenge.push(DECISION_CHALLENGE);
+                challenge.extend_from_slice(&listener_nonce);
+                challenge.extend_from_slice(&listener_tag);
+                conn.send(&challenge).await?;
+                let tag = conn.recv().await?;
+                kept.session.verify_resume_tag(
+                    ResumeRole::Dialer,
+                    &peer,
+                    me.device.public(),
+                    &dialer_nonce,
+                    &listener_nonce,
+                    binding,
+                    &tag,
+                )?;
+                let auth = kept.auth.clone();
+                let kept = sessions
+                    .remove(&peer_id)
+                    .ok_or_else(|| Error::Verify("kept session vanished during resume".into()))?;
+                announce_peer(&auth, "peer resumed — no re-handshake");
+                return Ok((auth, ConnectedSession::resume(conn, kept.session)));
+            }
+            eprintln!(
+                "[lattice-net] kept session for this peer is expired or revoked — requiring a fresh handshake"
             );
-            let mut challenge = Vec::with_capacity(1 + NONCE_LEN + TAG_LEN);
-            challenge.push(DECISION_CHALLENGE);
-            challenge.extend_from_slice(&listener_nonce);
-            challenge.extend_from_slice(&listener_tag);
-            conn.send(&challenge).await?;
-            let tag = conn.recv().await?;
-            kept.verify_resume_tag(
-                ResumeRole::Dialer,
-                &peer,
-                me.public(),
-                &dialer_nonce,
-                &listener_nonce,
-                binding,
-                &tag,
-            )?;
-            let sess = sessions
-                .remove(&peer_id)
-                .ok_or_else(|| Error::Verify("kept session vanished during resume".into()))?;
-            announce_peer(&peer_id, "peer resumed — no re-handshake");
-            return Ok((peer_id, ConnectedSession::resume(conn, sess)));
         }
     }
-    // Fresh handshake (requested, or resume with no kept session).
+    // Fresh handshake (requested, resume with no usable kept session).
     conn.send(&[DECISION_FRESH]).await?;
-    let cs = ConnectedSession::accept(conn, me, &peer, binding).await?;
-    // Only a successful handshake replaces the stale session for this peer.
+    let mut cs = ConnectedSession::accept(conn, &me.device, &peer, binding).await?;
+    // Auth exchange, sealed by the new session: dialer's bundle first.
+    let bundle = decode_auth_bundle(&cs.recv().await?)?;
+    let auth = verify_peer_chain(&bundle, &peer, now, cache)?;
+    cs.send(&encode_auth_bundle(me)).await?;
+    // Only a fully authenticated session replaces the stale one for this peer.
     sessions.remove(&peer_id);
-    announce_peer(&peer_id, "peer connected (fresh session)");
-    Ok((peer_id, cs))
-}
-
-/// What the dialer learned from (and verified about) the ticket, before dialing.
-struct VerifiedTicket {
-    /// The listener's identity, as proven by the ticket signature.
-    identity: PublicIdentity,
-    /// The identity bytes exactly as carried by the ticket.
-    identity_bytes: Vec<u8>,
-    /// The iroh endpoint id the ticket names (covered by the signature).
-    endpoint_id: [u8; 32],
-    /// The serialized address bytes exactly as carried by the ticket (covered
-    /// by the signature).
-    addr_bytes: Vec<u8>,
+    announce_peer(&auth, "peer connected (fresh session)");
+    Ok((auth, cs))
 }
 
 /// Dialer loop: dial, negotiate resume-vs-fresh, chat; keep the `SecureSession`
 /// across drops so the next dial can resume.
-async fn connect(me: Keypair, ticket: String, mut lines: StdinLines) -> Result<()> {
-    // Verify the ticket before binding or dialing; a bad ticket is fatal, not retried.
+async fn connect(
+    me: DeviceCreds,
+    mut cache: RevocationCache,
+    store: IdentityStore,
+    ticket: String,
+    mut lines: StdinLines,
+) -> Result<()> {
+    // Parse the ticket before binding or dialing; a bad ticket is fatal, not retried.
     let parsed = parse_ticket(&ticket)?;
-    let identity = verify_ticket(&parsed)?;
     eprintln!(
-        "[lattice-net] peer fingerprint (from ticket): {} — compare this with your peer out of band",
-        identity.peer_id().fingerprint()
+        "[lattice-net] peer root fingerprint (from ticket): {} — compare this with your peer out of band",
+        PeerId(parsed.root_id).fingerprint()
     );
-    let verified = VerifiedTicket {
-        identity,
-        identity_bytes: parsed.app_identity,
-        endpoint_id: parsed.endpoint_id,
-        addr_bytes: parsed.addr_bytes,
-    };
 
     let t = IrohTransport::bind().await?;
-    let mut kept: Option<SecureSession> = None;
+    let mut kept: Option<KeptPeer> = None;
     let mut backoff = 1u64;
     loop {
-        match dial_once(&t, &ticket, &verified, &me, &mut kept, &mut lines).await {
+        let r = dial_once(&t, &ticket, &parsed, &me, &mut kept, &mut cache, &mut lines).await;
+        persist_cache(&store, &mut cache);
+        match r {
             Ok(Outcome::LocalClosed) => {
                 eprintln!("[lattice-net] input closed — exiting");
                 break;
@@ -580,6 +1229,7 @@ async fn connect(me: Keypair, ticket: String, mut lines: StdinLines) -> Result<(
                 eprintln!("[lattice-net] peer disconnected — reconnecting...");
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
+            Err(e) if e.to_string().contains(VERSION_ERR_MARK) => return Err(e),
             Err(e) => {
                 eprintln!("[lattice-net] connect/session failed: {e} — retrying in {backoff}s");
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
@@ -591,29 +1241,73 @@ async fn connect(me: Keypair, ticket: String, mut lines: StdinLines) -> Result<(
 }
 
 /// Dialer-side negotiation after the transport connects: send the preamble,
-/// then either resume the kept session (after a mutual proof) or run a fresh
-/// handshake. On `DECISION_FRESH`, `kept` is taken (cleared) before the fresh
-/// handshake runs, so a failed fresh handshake leaves no kept session. On
-/// `DECISION_CHALLENGE`, `kept` is taken only after the listener's proof
-/// verifies and the dialer's tag is sent. Busy, legacy and unknown decisions
-/// leave `kept` untouched. `binding` is the channel binding of this connection.
+/// verify the listener's hello against the ticket's ids, then either resume
+/// the kept session (after a mutual proof) or run a fresh handshake plus the
+/// auth exchange. A kept session that is expired/revoked (or for another peer)
+/// is dropped *before* the preamble, so the dialer asks for a fresh session. On
+/// `DECISION_FRESH`, `kept` is taken (cleared) before the fresh handshake runs,
+/// so a failed fresh handshake leaves no kept session. On `DECISION_CHALLENGE`,
+/// `kept` is taken only after the listener's proof verifies and the dialer's tag
+/// is sent. Busy, version, bad-hello and unknown frames leave `kept` untouched.
+/// `binding` is the channel binding of this connection.
+#[allow(clippy::too_many_arguments)]
 async fn negotiate_dial<C: Connection>(
     mut conn: C,
-    me: &Keypair,
-    peer: &PublicIdentity,
-    kept: &mut Option<SecureSession>,
+    me: &DeviceCreds,
+    ticket_root: &[u8; 32],
+    ticket_device: &[u8; 32],
+    kept: &mut Option<KeptPeer>,
     binding: &[u8],
-) -> Result<ConnectedSession<C>> {
-    // Preamble: [mode] ++ dialer nonce ++ our identity bundle.
+    now: u64,
+    cache: &mut RevocationCache,
+) -> Result<(PeerAuth, ConnectedSession<C>)> {
+    if let Some(k) = kept.as_ref() {
+        let other_peer =
+            k.auth.device.peer_id().0 != *ticket_device || k.auth.root.peer_id().0 != *ticket_root;
+        if other_peer || !resume_allowed(&k.auth, now, cache) {
+            eprintln!(
+                "[lattice-net] kept session is expired, revoked or for another peer — fresh handshake"
+            );
+            *kept = None;
+        }
+    }
+
+    // Preamble: [WIRE_VERSION] ++ [mode] ++ dialer nonce ++ our device identity.
     let (mode, dialer_nonce) = if kept.is_some() {
         (MODE_RESUME, resume_nonce()?)
     } else {
         (MODE_FRESH, [0u8; NONCE_LEN])
     };
-    let mut preamble = vec![mode];
+    let mut preamble = vec![WIRE_VERSION, mode];
     preamble.extend_from_slice(&dialer_nonce);
-    preamble.extend_from_slice(&me.public().to_bytes());
+    preamble.extend_from_slice(&me.device.public().to_bytes());
     conn.send(&preamble).await?;
+
+    // First frame: the listener's hello (or busy / a version complaint).
+    let first = conn.recv().await?;
+    let hello = match first.first().copied() {
+        Some(DECISION_BUSY) => return Err(Error::Transport("listener is busy".into())),
+        Some(DECISION_VERSION) => {
+            let theirs = first.get(1).copied().unwrap_or(0);
+            return Err(Error::Verify(format!(
+                "listener speaks lattice-net {VERSION_ERR_MARK} {theirs}, we speak {WIRE_VERSION}; both sides must upgrade"
+            )));
+        }
+        // A bare old-style decision as the first frame: an old listener.
+        Some(DECISION_FRESH) | Some(DECISION_RESUMED) | Some(DECISION_CHALLENGE) => {
+            return Err(Error::Verify(format!(
+                "peer uses an older lattice-net {VERSION_ERR_MARK}; both sides must upgrade"
+            )));
+        }
+        Some(LISTENER_HELLO) => {
+            verify_listener_hello(&first, ticket_root, ticket_device, now, cache)?
+        }
+        _ => {
+            return Err(Error::Verify(
+                "unrecognised first frame from listener".into(),
+            ))
+        }
+    };
 
     let decision = conn.recv().await?;
     match decision.first().copied() {
@@ -621,45 +1315,63 @@ async fn negotiate_dial<C: Connection>(
             if kept.take().is_some() {
                 eprintln!("[lattice-net] peer couldn't resume — fresh handshake");
             }
-            let cs = ConnectedSession::initiate(conn, me, peer, binding).await?;
-            announce_peer(&peer.peer_id(), "connected (fresh session)");
-            Ok(cs)
+            let mut cs =
+                ConnectedSession::initiate(conn, &me.device, &hello.device, binding).await?;
+            // Auth exchange, sealed by the new session: ours first.
+            cs.send(&encode_auth_bundle(me)).await?;
+            let bundle = decode_auth_bundle(&cs.recv().await?)?;
+            if bundle.root.peer_id() != hello.root.peer_id() {
+                return Err(Error::Verify(
+                    "auth bundle root differs from the root in the hello".into(),
+                ));
+            }
+            let auth = verify_peer_chain(&bundle, &hello.device, now, cache)?;
+            announce_peer(&auth, "connected (fresh session)");
+            Ok((auth, cs))
         }
         Some(DECISION_CHALLENGE) => {
-            let Some(sess) = kept.as_ref() else {
+            let Some(k) = kept.as_ref() else {
                 return Err(Error::Verify(
                     "peer sent a resume challenge but no session is kept".into(),
                 ));
             };
+            if k.auth.device.peer_id() != hello.device.peer_id()
+                || k.auth.root.peer_id() != hello.root.peer_id()
+                || !resume_allowed(&k.auth, now, cache)
+            {
+                return Err(Error::Verify(
+                    "resume challenge from a peer that does not match the kept session".into(),
+                ));
+            }
             if decision.len() != 1 + NONCE_LEN + TAG_LEN {
                 return Err(Error::Verify("malformed resume challenge".into()));
             }
             let mut listener_nonce = [0u8; NONCE_LEN];
             listener_nonce.copy_from_slice(&decision[1..1 + NONCE_LEN]);
             let listener_tag = &decision[1 + NONCE_LEN..];
-            sess.verify_resume_tag(
+            k.session.verify_resume_tag(
                 ResumeRole::Listener,
-                me.public(),
-                peer,
+                me.device.public(),
+                &hello.device,
                 &dialer_nonce,
                 &listener_nonce,
                 binding,
                 listener_tag,
             )?;
-            let dialer_tag = sess.resume_tag(
+            let dialer_tag = k.session.resume_tag(
                 ResumeRole::Dialer,
-                me.public(),
-                peer,
+                me.device.public(),
+                &hello.device,
                 &dialer_nonce,
                 &listener_nonce,
                 binding,
             );
             conn.send(&dialer_tag).await?;
-            let sess = kept
+            let k = kept
                 .take()
                 .ok_or_else(|| Error::Verify("kept session vanished during resume".into()))?;
-            announce_peer(&peer.peer_id(), "resumed — no re-handshake");
-            Ok(ConnectedSession::resume(conn, sess))
+            announce_peer(&k.auth, "resumed — no re-handshake");
+            Ok((k.auth, ConnectedSession::resume(conn, k.session)))
         }
         Some(DECISION_BUSY) => Err(Error::Transport("listener is busy".into())),
         Some(DECISION_RESUMED) => Err(Error::Verify(
@@ -672,31 +1384,40 @@ async fn negotiate_dial<C: Connection>(
 async fn dial_once(
     t: &IrohTransport,
     ticket: &str,
-    verified: &VerifiedTicket,
-    me: &Keypair,
-    kept: &mut Option<SecureSession>,
+    parsed: &lattice::transport::ParsedTicket,
+    me: &DeviceCreds,
+    kept: &mut Option<KeptPeer>,
+    cache: &mut RevocationCache,
     lines: &mut StdinLines,
 ) -> Result<Outcome> {
     eprintln!("[lattice-net] dialing peer...");
     let (dialed, conn) = t.connect_ticket(ticket).await?;
-    // The ticket we dialed must be the one we verified, and we must have
+    // The ticket we dialed must be the one we parsed, and we must have
     // reached the endpoint it names.
-    check_endpoint(&verified.endpoint_id, &dialed.endpoint_id)?;
-    if dialed.app_identity != verified.identity_bytes {
-        return Err(Error::Verify("ticket identity changed".into()));
+    if dialed != *parsed {
+        return Err(Error::Verify("ticket changed".into()));
     }
-    if dialed.addr_bytes != verified.addr_bytes {
-        return Err(Error::Verify("ticket address changed".into()));
-    }
-    check_endpoint(&dialed.endpoint_id, &conn.remote_endpoint_id())?;
+    check_endpoint(&parsed.endpoint_id, &conn.remote_endpoint_id())?;
     let binding = channel_binding(&t.endpoint_id_bytes(), &conn.remote_endpoint_id());
 
     let limit = NEGOTIATION_TIMEOUT;
-    let cs = negotiate_dial_within(conn, me, &verified.identity, kept, &binding, limit).await?;
+    let (auth, cs) = negotiate_dial_within(
+        conn,
+        me,
+        &parsed.root_id,
+        &parsed.device_id,
+        kept,
+        &binding,
+        now_secs(),
+        cache,
+        limit,
+    )
+    .await?;
 
     match chat(cs, lines).await {
         Ok((Outcome::PeerDisconnected, recovered)) => {
-            *kept = recovered; // keep for resume (None if unrecoverable)
+            // keep for resume (None if unrecoverable)
+            *kept = recovered.map(|session| KeptPeer { session, auth });
             Ok(Outcome::PeerDisconnected)
         }
         Ok((Outcome::LocalClosed, _)) => Ok(Outcome::LocalClosed),
@@ -765,10 +1486,56 @@ async fn chat(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lattice::identity::MAX_REVOKED;
     use lattice::transport::TicketAddr;
+
+    /// Largest frame body the transport accepts (`lattice_transport::MAX_FRAME_LEN`).
+    const FRAME_CAP: usize = 65_536;
+    const NOW: u64 = 1_000;
+    const FAR: u64 = 1_000_000;
 
     fn id() -> Keypair {
         Keypair::generate(CryptoSuite::Hybrid).unwrap()
+    }
+
+    /// Credentials for a fresh device under `root`, valid until `not_after`.
+    fn creds_with(root: &Keypair, not_after: u64) -> DeviceCreds {
+        let device = id();
+        let cert = root.authorize_device(device.public(), not_after).unwrap();
+        DeviceCreds {
+            device,
+            root: root.public().clone(),
+            cert,
+            revocation: None,
+        }
+    }
+
+    /// Credentials under a brand-new root.
+    fn creds() -> DeviceCreds {
+        creds_with(&id(), FAR)
+    }
+
+    fn cache() -> RevocationCache {
+        RevocationCache::new()
+    }
+
+    fn ids(c: &DeviceCreds) -> ([u8; 32], [u8; 32]) {
+        (c.root.peer_id().0, c.device.peer_id().0)
+    }
+
+    fn auth_of(c: &DeviceCreds) -> PeerAuth {
+        PeerAuth {
+            root: c.root.clone(),
+            device: c.device.public().clone(),
+            cert_not_after: c.cert.not_after(),
+        }
+    }
+
+    fn kept(session: SecureSession, peer: &DeviceCreds) -> KeptPeer {
+        KeptPeer {
+            session,
+            auth: auth_of(peer),
+        }
     }
 
     /// A fixed, valid channel binding for tests that don't care about its value.
@@ -787,87 +1554,154 @@ mod tests {
         (dial, listen)
     }
 
-    fn stale(alice: &Keypair, bob: &Keypair) -> HashMap<PeerId, SecureSession> {
-        let (m1, pending) = SecureSession::initiate(bob, alice.public(), b"").unwrap();
-        let (m2, _) = SecureSession::respond(alice, bob.public(), b"", &m1).unwrap();
-        let s = pending.finish(&m2).unwrap();
-        HashMap::from([(alice.peer_id(), s)])
+    /// Alice (dialer) negotiates with `bob` (listener) using bob's ticket ids.
+    async fn dial_to(
+        conn: MemoryConn,
+        alice: &DeviceCreds,
+        bob: &DeviceCreds,
+        kept: &mut Option<KeptPeer>,
+        binding: &[u8],
+        cache: &mut RevocationCache,
+    ) -> Result<(PeerAuth, ConnectedSession<MemoryConn>)> {
+        let (r, d) = ids(bob);
+        negotiate_dial(conn, alice, &r, &d, kept, binding, NOW, cache).await
     }
 
-    async fn preamble(conn: &mut MemoryConn, mode: u8, who: &Keypair) {
-        let mut p = vec![mode];
-        p.extend_from_slice(&[0u8; NONCE_LEN]);
+    /// Listener map holding a kept session for alice's device (responder = bob).
+    fn stale(alice: &DeviceCreds, bob: &DeviceCreds) -> HashMap<PeerId, KeptPeer> {
+        let (m1, pending) =
+            SecureSession::initiate(&bob.device, alice.device.public(), b"").unwrap();
+        let (m2, _) = SecureSession::respond(&alice.device, bob.device.public(), b"", &m1).unwrap();
+        let s = pending.finish(&m2).unwrap();
+        HashMap::from([(alice.device.peer_id(), kept(s, alice))])
+    }
+
+    async fn send_preamble(conn: &mut MemoryConn, mode: u8, nonce: [u8; NONCE_LEN], who: &Keypair) {
+        let mut p = vec![WIRE_VERSION, mode];
+        p.extend_from_slice(&nonce);
         p.extend_from_slice(&who.public().to_bytes());
         conn.send(&p).await.unwrap();
     }
 
+    async fn preamble(conn: &mut MemoryConn, mode: u8, who: &Keypair) {
+        send_preamble(conn, mode, [0u8; NONCE_LEN], who).await;
+    }
+
+    /// Genuine Alice–Bob pair: (alice, bob, alice's kept (of bob), bob's kept (of alice)).
+    fn genuine() -> (DeviceCreds, DeviceCreds, KeptPeer, KeptPeer) {
+        let (alice, bob) = (creds(), creds());
+        let (m1, pending) =
+            SecureSession::initiate(&alice.device, bob.device.public(), b"").unwrap();
+        let (m2, b) = SecureSession::respond(&bob.device, alice.device.public(), b"", &m1).unwrap();
+        let a = pending.finish(&m2).unwrap();
+        let (ka, kb) = (kept(a, &bob), kept(b, &alice));
+        (alice, bob, ka, kb)
+    }
+
+    // ---- fresh negotiation ----
+
+    #[tokio::test]
+    async fn fresh_dial_and_accept_two_roots() {
+        let (alice, bob) = (creds(), creds());
+        let mut sessions = HashMap::new();
+        let (mut ca, mut cb) = (cache(), cache());
+        let mut k = None;
+        let (dial, listen) = pair().await;
+        let bd = bnd();
+        let (d, l) = tokio::join!(
+            dial_to(dial, &alice, &bob, &mut k, &bd, &mut ca),
+            accept_or_resume(listen, &bob, &mut sessions, &bd, NOW, &mut cb)
+        );
+        let ((da, mut ds), (la, mut ls)) = (d.unwrap(), l.unwrap());
+        assert_eq!(da.root.peer_id(), bob.root.peer_id());
+        assert_eq!(da.device.peer_id(), bob.device.peer_id());
+        assert_eq!(la.root.peer_id(), alice.root.peer_id());
+        assert_eq!(la.device.peer_id(), alice.device.peer_id());
+        assert_eq!(la.cert_not_after, FAR);
+        ds.send(b"hello").await.unwrap();
+        assert_eq!(ls.recv().await.unwrap(), b"hello");
+        ls.send(b"world").await.unwrap();
+        assert_eq!(ds.recv().await.unwrap(), b"world");
+    }
+
     #[tokio::test]
     async fn forged_initiator_keeps_stale_session() {
-        let (alice, bob, eve) = (id(), id(), id());
+        let (alice, bob, eve) = (creds(), creds(), creds());
         let mut sessions = stale(&alice, &bob);
         let (mut dial, listen) = pair().await;
-        preamble(&mut dial, MODE_FRESH, &alice).await;
+        preamble(&mut dial, MODE_FRESH, &alice.device).await;
         let b = bnd();
-        // Eve's handshake, claimed to come from Alice.
+        // Eve's handshake, claimed to come from Alice's device.
         let dialer = async {
-            // The listener's decision byte comes first, then the handshake.
+            // The listener's hello and decision come first, then the handshake.
+            assert_eq!(dial.recv().await.unwrap()[0], LISTENER_HELLO);
             assert_eq!(dial.recv().await.unwrap(), [DECISION_FRESH]);
-            ConnectedSession::initiate(dial, &eve, bob.public(), &b).await
+            ConnectedSession::initiate(dial, &eve.device, bob.device.public(), &b).await
         };
-        let (d, r) = tokio::join!(dialer, accept_or_resume(listen, &bob, &mut sessions, &b));
+        let mut c = cache();
+        let (d, r) = tokio::join!(
+            dialer,
+            accept_or_resume(listen, &bob, &mut sessions, &b, NOW, &mut c)
+        );
         assert!(r.is_err());
         assert!(d.is_err());
-        assert!(sessions.contains_key(&alice.peer_id()));
+        assert!(sessions.contains_key(&alice.device.peer_id()));
     }
 
     #[tokio::test]
     async fn genuine_fresh_handshake_replaces_stale_session() {
-        let (alice, bob) = (id(), id());
+        let (alice, bob) = (creds(), creds());
         let mut sessions = stale(&alice, &bob);
-        let (mut dial, listen) = pair().await;
-        preamble(&mut dial, MODE_FRESH, &alice).await;
+        let (dial, listen) = pair().await;
         let b = bnd();
-        let dialer = async {
-            assert_eq!(dial.recv().await.unwrap(), [DECISION_FRESH]);
-            ConnectedSession::initiate(dial, &alice, bob.public(), &b).await
-        };
-        let (d, r) = tokio::join!(dialer, accept_or_resume(listen, &bob, &mut sessions, &b));
+        let (mut ca, mut cb) = (cache(), cache());
+        let mut k = None;
+        let (d, r) = tokio::join!(
+            dial_to(dial, &alice, &bob, &mut k, &b, &mut ca),
+            accept_or_resume(listen, &bob, &mut sessions, &b, NOW, &mut cb)
+        );
         assert!(d.is_ok());
         assert!(r.is_ok());
-        assert!(!sessions.contains_key(&alice.peer_id()));
+        assert!(!sessions.contains_key(&alice.device.peer_id()));
     }
 
     #[tokio::test]
     async fn fresh_handshake_with_mismatched_bindings_fails() {
-        let (alice, bob) = (id(), id());
+        let (alice, bob) = (creds(), creds());
         let mut sessions = HashMap::new();
         let (dial, listen) = pair().await;
         let b_dial = channel_binding(&[1u8; 32], &[2u8; 32]);
         let b_listen = channel_binding(&[1u8; 32], &[3u8; 32]);
-        let mut kept = None;
+        let mut k = None;
+        let (mut ca, mut cb) = (cache(), cache());
         let (d, r) = tokio::join!(
-            negotiate_dial(dial, &alice, bob.public(), &mut kept, &b_dial),
-            accept_or_resume(listen, &bob, &mut sessions, &b_listen)
+            dial_to(dial, &alice, &bob, &mut k, &b_dial, &mut ca),
+            accept_or_resume(listen, &bob, &mut sessions, &b_listen, NOW, &mut cb)
         );
         assert!(matches!(r, Err(Error::Verify(_))));
         assert!(d.is_err());
         assert!(sessions.is_empty());
     }
 
+    // ---- resume ----
+
     #[tokio::test]
     async fn genuine_resume_with_mutual_proof_succeeds() {
         let (alice, bob, a, b) = genuine();
-        let mut sessions = HashMap::from([(alice.peer_id(), b)]);
-        let mut kept = Some(a);
+        let mut sessions = HashMap::from([(alice.device.peer_id(), b)]);
+        let mut k = Some(a);
         let (dial, listen) = pair().await;
         let bd = bnd();
+        let (mut ca, mut cb) = (cache(), cache());
         let (d, l) = tokio::join!(
-            negotiate_dial(dial, &alice, bob.public(), &mut kept, &bd),
-            accept_or_resume(listen, &bob, &mut sessions, &bd)
+            dial_to(dial, &alice, &bob, &mut k, &bd, &mut ca),
+            accept_or_resume(listen, &bob, &mut sessions, &bd, NOW, &mut cb)
         );
-        let (mut d, (_, mut l)) = (d.unwrap(), l.unwrap());
-        assert!(kept.is_none());
-        assert!(!sessions.contains_key(&alice.peer_id()));
+        let ((da, mut d), (la, mut l)) = (d.unwrap(), l.unwrap());
+        assert_eq!(da.device.peer_id(), bob.device.peer_id());
+        assert_eq!(la.device.peer_id(), alice.device.peer_id());
+        assert!(k.is_none());
+        assert!(!sessions.contains_key(&alice.device.peer_id()));
         d.send(b"hello").await.unwrap();
         assert_eq!(l.recv().await.unwrap(), b"hello");
         l.send(b"world").await.unwrap();
@@ -877,45 +1711,24 @@ mod tests {
     #[tokio::test]
     async fn resume_with_mismatched_bindings_fails_and_keeps_state() {
         let (alice, bob, a, b) = genuine();
-        let mut sessions = HashMap::from([(alice.peer_id(), b)]);
-        let mut kept = Some(a);
+        let mut sessions = HashMap::from([(alice.device.peer_id(), b)]);
+        let mut k = Some(a);
         let (dial, listen) = pair().await;
         let b_dial = channel_binding(&[1u8; 32], &[2u8; 32]);
         let b_listen = channel_binding(&[1u8; 32], &[3u8; 32]);
+        let (mut ca, mut cb) = (cache(), cache());
         let (d, l) = tokio::join!(
-            negotiate_dial(dial, &alice, bob.public(), &mut kept, &b_dial),
-            accept_or_resume(listen, &bob, &mut sessions, &b_listen)
+            dial_to(dial, &alice, &bob, &mut k, &b_dial, &mut ca),
+            accept_or_resume(listen, &bob, &mut sessions, &b_listen, NOW, &mut cb)
         );
         assert!(d.is_err());
         assert!(l.is_err());
-        assert!(kept.is_some());
-        assert!(sessions.contains_key(&alice.peer_id()));
-    }
-
-    #[tokio::test]
-    async fn impostor_with_legacy_preamble_cannot_resume() {
-        let (alice, bob) = (id(), id());
-        let mut sessions = stale(&alice, &bob);
-        let (mut dial, listen) = pair().await;
-        let mut p = vec![MODE_RESUME];
-        p.extend_from_slice(&alice.public().to_bytes());
-        dial.send(&p).await.unwrap();
-        let r = accept_or_resume(listen, &bob, &mut sessions, &bnd()).await;
-        assert!(r.is_err());
-        assert!(sessions.contains_key(&alice.peer_id()));
-    }
-
-    /// Genuine Alice–Bob pair: (alice, bob, alice's session, bob's session).
-    fn genuine() -> (Keypair, Keypair, SecureSession, SecureSession) {
-        let (alice, bob) = (id(), id());
-        let (m1, pending) = SecureSession::initiate(&alice, bob.public(), b"").unwrap();
-        let (m2, b) = SecureSession::respond(&bob, alice.public(), b"", &m1).unwrap();
-        let a = pending.finish(&m2).unwrap();
-        (alice, bob, a, b)
+        assert!(k.is_some());
+        assert!(sessions.contains_key(&alice.device.peer_id()));
     }
 
     fn resume_preamble(nonce: &[u8; NONCE_LEN], who: &Keypair) -> Vec<u8> {
-        let mut p = vec![MODE_RESUME];
+        let mut p = vec![WIRE_VERSION, MODE_RESUME];
         p.extend_from_slice(nonce);
         p.extend_from_slice(&who.public().to_bytes());
         p
@@ -924,15 +1737,17 @@ mod tests {
     #[tokio::test]
     async fn impostor_with_bogus_tag_cannot_resume() {
         let (alice, bob, _a, b) = genuine();
-        let mut sessions = HashMap::from([(alice.peer_id(), b)]);
+        let mut sessions = HashMap::from([(alice.device.peer_id(), b)]);
         let (mut eve, listen) = pair().await;
-        eve.send(&resume_preamble(&[7u8; NONCE_LEN], &alice))
+        eve.send(&resume_preamble(&[7u8; NONCE_LEN], &alice.device))
             .await
             .unwrap();
         eve.send(&[0xAA; TAG_LEN]).await.unwrap();
-        let r = accept_or_resume(listen, &bob, &mut sessions, &bnd()).await;
+        let mut c = cache();
+        let r = accept_or_resume(listen, &bob, &mut sessions, &bnd(), NOW, &mut c).await;
         assert!(r.is_err());
-        assert!(sessions.contains_key(&alice.peer_id()));
+        assert!(sessions.contains_key(&alice.device.peer_id()));
+        assert_eq!(eve.recv().await.unwrap()[0], LISTENER_HELLO);
         let reply = eve.recv().await.unwrap();
         assert_eq!(reply.len(), 1 + NONCE_LEN + TAG_LEN);
         assert_eq!(reply[0], DECISION_CHALLENGE);
@@ -941,24 +1756,111 @@ mod tests {
     #[tokio::test]
     async fn impostor_hanging_up_cannot_resume() {
         let (alice, bob, _a, b) = genuine();
-        let mut sessions = HashMap::from([(alice.peer_id(), b)]);
+        let mut sessions = HashMap::from([(alice.device.peer_id(), b)]);
         let (mut eve, listen) = pair().await;
-        eve.send(&resume_preamble(&[7u8; NONCE_LEN], &alice))
+        eve.send(&resume_preamble(&[7u8; NONCE_LEN], &alice.device))
             .await
             .unwrap();
         drop(eve);
-        let r = accept_or_resume(listen, &bob, &mut sessions, &bnd()).await;
+        let mut c = cache();
+        let r = accept_or_resume(listen, &bob, &mut sessions, &bnd(), NOW, &mut c).await;
         assert!(r.is_err());
-        assert!(sessions.contains_key(&alice.peer_id()));
+        assert!(sessions.contains_key(&alice.device.peer_id()));
+    }
+
+    #[test]
+    fn resume_allowed_checks_expiry_and_cache() {
+        let root = id();
+        let c = creds_with(&root, 500);
+        let auth = auth_of(&c);
+        let mut cc = cache();
+        assert!(resume_allowed(&auth, 500, &cc));
+        assert!(!resume_allowed(&auth, 501, &cc));
+        let list = root.revoke_devices(1, 0, &[c.device.peer_id()]).unwrap();
+        assert!(cc.observe(list));
+        assert!(!resume_allowed(&auth, 100, &cc));
+    }
+
+    #[tokio::test]
+    async fn revoked_kept_session_is_not_resumed_listener_side() {
+        let alice_root = id();
+        let alice = creds_with(&alice_root, FAR);
+        let bob = creds();
+        let (m1, pending) =
+            SecureSession::initiate(&alice.device, bob.device.public(), b"").unwrap();
+        let (m2, b) = SecureSession::respond(&bob.device, alice.device.public(), b"", &m1).unwrap();
+        let _a = pending.finish(&m2).unwrap();
+        let mut sessions = HashMap::from([(alice.device.peer_id(), kept(b, &alice))]);
+        // Bob learns that alice's root revoked alice's device.
+        let mut cb = cache();
+        let list = alice_root
+            .revoke_devices(1, 0, &[alice.device.peer_id()])
+            .unwrap();
+        assert!(cb.observe(list));
+
+        let (mut eve, listen) = pair().await;
+        eve.send(&resume_preamble(&[7u8; NONCE_LEN], &alice.device))
+            .await
+            .unwrap();
+        let binding = bnd();
+        let r = accept_or_resume(listen, &bob, &mut sessions, &binding, NOW, &mut cb);
+        let script = async {
+            assert_eq!(eve.recv().await.unwrap()[0], LISTENER_HELLO);
+            // No challenge: the listener demands a fresh handshake.
+            assert_eq!(eve.recv().await.unwrap(), [DECISION_FRESH]);
+            drop(eve);
+        };
+        let (r, ()) = tokio::join!(r, script);
+        assert!(r.is_err());
+        // The refused entry stays in the map and was never resumed.
+        assert!(sessions.contains_key(&alice.device.peer_id()));
+    }
+
+    #[tokio::test]
+    async fn dialer_drops_revoked_or_expired_kept_and_goes_fresh() {
+        for expired in [false, true] {
+            let bob_root = id();
+            let (alice, bob) = (creds(), creds_with(&bob_root, 2_000));
+            let (m1, pending) =
+                SecureSession::initiate(&alice.device, bob.device.public(), b"").unwrap();
+            let (m2, _b) =
+                SecureSession::respond(&bob.device, alice.device.public(), b"", &m1).unwrap();
+            let a = pending.finish(&m2).unwrap();
+            let mut k = Some(kept(a, &bob));
+            let mut ca = cache();
+            let mut now = NOW;
+            if expired {
+                now = 2_001;
+            } else {
+                let list = bob_root
+                    .revoke_devices(1, 0, &[bob.device.peer_id()])
+                    .unwrap();
+                assert!(ca.observe(list));
+            }
+            let (dial, mut listen) = pair().await;
+            let script = async { listen.recv().await.unwrap() };
+            let (r, d) = ids(&bob);
+            let binding = bnd();
+            let (res, p) = tokio::join!(
+                negotiate_dial_within(dial, &alice, &r, &d, &mut k, &binding, now, &mut ca, SHORT),
+                script
+            );
+            assert!(res.is_err());
+            assert_eq!(p[0], WIRE_VERSION);
+            assert_eq!(p[1], MODE_FRESH, "expired={expired}");
+            assert!(k.is_none());
+        }
     }
 
     #[tokio::test]
     async fn dialer_rejects_wrong_listener_tag_and_checks_preamble() {
         let (alice, bob, a, _b) = genuine();
-        let mut kept = Some(a);
+        let mut k = Some(a);
         let (dial, mut listen) = pair().await;
+        let hello = encode_listener_hello(&bob);
         let script = async {
             let p = listen.recv().await.unwrap();
+            listen.send(&hello).await.unwrap();
             let mut reply = vec![DECISION_CHALLENGE];
             reply.extend_from_slice(&[3u8; NONCE_LEN]);
             reply.extend_from_slice(&[0xBB; TAG_LEN]);
@@ -966,118 +1868,406 @@ mod tests {
             p
         };
         let bd = bnd();
-        let (r, p) = tokio::join!(
-            negotiate_dial(dial, &alice, bob.public(), &mut kept, &bd),
-            script
-        );
+        let mut c = cache();
+        let (r, p) = tokio::join!(dial_to(dial, &alice, &bob, &mut k, &bd, &mut c), script);
         assert!(r.is_err());
-        assert!(kept.is_some());
-        let ib = alice.public().to_bytes();
-        assert_eq!(p[0], MODE_RESUME);
-        assert_eq!(p.len(), 1 + NONCE_LEN + ib.len());
-        assert_eq!(&p[1 + NONCE_LEN..], &ib[..]);
+        assert!(k.is_some());
+        let ib = alice.device.public().to_bytes();
+        assert_eq!(p[0], WIRE_VERSION);
+        assert_eq!(p[1], MODE_RESUME);
+        assert_eq!(p.len(), 2 + NONCE_LEN + ib.len());
+        assert_eq!(&p[2 + NONCE_LEN..], &ib[..]);
     }
 
     #[tokio::test]
     async fn dialer_rejects_legacy_resumed_decision() {
         let (alice, bob, a, _b) = genuine();
-        let mut kept = Some(a);
+        let mut k = Some(a);
         let (dial, mut listen) = pair().await;
+        listen.send(&encode_listener_hello(&bob)).await.unwrap();
         listen.send(&[DECISION_RESUMED]).await.unwrap();
-        let r = negotiate_dial(dial, &alice, bob.public(), &mut kept, &bnd()).await;
+        let mut c = cache();
+        let r = dial_to(dial, &alice, &bob, &mut k, &bnd(), &mut c).await;
         assert!(r.is_err());
-        assert!(kept.is_some());
+        assert!(k.is_some());
     }
 
     #[tokio::test]
     async fn dialer_rejects_challenge_without_kept_session() {
-        let (alice, bob) = (id(), id());
-        let mut kept = None;
+        let (alice, bob) = (creds(), creds());
+        let mut k = None;
         let (dial, mut listen) = pair().await;
+        listen.send(&encode_listener_hello(&bob)).await.unwrap();
         let mut reply = vec![DECISION_CHALLENGE];
         reply.extend_from_slice(&[0u8; NONCE_LEN + TAG_LEN]);
         listen.send(&reply).await.unwrap();
-        let r = negotiate_dial(dial, &alice, bob.public(), &mut kept, &bnd()).await;
+        let mut c = cache();
+        let r = dial_to(dial, &alice, &bob, &mut k, &bnd(), &mut c).await;
         assert!(r.is_err());
     }
 
     #[tokio::test]
-    async fn short_preambles_are_rejected() {
-        let (alice, bob) = (id(), id());
-        for n in [0usize, 1, 32] {
+    async fn short_and_long_preambles_are_rejected() {
+        let (alice, bob) = (creds(), creds());
+        for n in [0usize, 1, 2, 33, MAX_PREAMBLE_LEN + 1] {
             let mut sessions = stale(&alice, &bob);
             let (mut dial, listen) = pair().await;
-            dial.send(&vec![MODE_RESUME; n]).await.unwrap();
-            let r = accept_or_resume(listen, &bob, &mut sessions, &bnd()).await;
-            assert!(r.is_err(), "len {n}");
-            assert!(sessions.contains_key(&alice.peer_id()));
+            dial.send(&vec![WIRE_VERSION; n]).await.unwrap();
+            let mut c = cache();
+            let r = accept_or_resume(listen, &bob, &mut sessions, &bnd(), NOW, &mut c).await;
+            assert!(matches!(r, Err(Error::Verify(_))), "len {n}");
+            assert!(sessions.contains_key(&alice.device.peer_id()));
         }
     }
 
     #[tokio::test]
-    async fn fresh_dial_preamble_has_zero_nonce() {
-        let (alice, bob) = (id(), id());
-        let mut kept = None;
+    async fn fresh_dial_preamble_has_version_mode_and_zero_nonce() {
+        let (alice, bob) = (creds(), creds());
+        let mut k = None;
         let (dial, mut listen) = pair().await;
         let script = async {
             let p = listen.recv().await.unwrap();
-            listen.send(&[0xFF]).await.unwrap(); // unknown decision → dialer errors
+            listen.send(&[0xFF]).await.unwrap(); // unknown first frame → dialer errors
             p
         };
         let bd = bnd();
-        let (r, p) = tokio::join!(
-            negotiate_dial(dial, &alice, bob.public(), &mut kept, &bd),
+        let mut c = cache();
+        let (r, p) = tokio::join!(dial_to(dial, &alice, &bob, &mut k, &bd, &mut c), script);
+        assert!(r.is_err());
+        assert_eq!(p[0], WIRE_VERSION);
+        assert_eq!(p[1], MODE_FRESH);
+        assert!(p[2..2 + NONCE_LEN].iter().all(|b| *b == 0));
+    }
+
+    // ---- wire version ----
+
+    #[tokio::test]
+    async fn old_preamble_gets_version_reply_and_error() {
+        let (alice, bob) = (creds(), creds());
+        for mode in [MODE_FRESH, MODE_RESUME] {
+            let mut sessions = stale(&alice, &bob);
+            let (mut dial, listen) = pair().await;
+            let mut p = vec![mode];
+            p.extend_from_slice(&[0u8; NONCE_LEN]);
+            p.extend_from_slice(&alice.device.public().to_bytes());
+            dial.send(&p).await.unwrap();
+            let mut c = cache();
+            let r = accept_or_resume(listen, &bob, &mut sessions, &bnd(), NOW, &mut c).await;
+            match r {
+                Err(e) => assert!(e.to_string().contains("version"), "{e}"),
+                Ok(_) => panic!("old preamble accepted"),
+            }
+            assert_eq!(dial.recv().await.unwrap(), [DECISION_VERSION, WIRE_VERSION]);
+            assert!(sessions.contains_key(&alice.device.peer_id()));
+        }
+        assert_ne!(WIRE_VERSION, MODE_FRESH);
+        assert_ne!(WIRE_VERSION, MODE_RESUME);
+    }
+
+    #[tokio::test]
+    async fn dialer_maps_version_and_old_decisions_to_version_error() {
+        let (alice, bob, a, _b) = genuine();
+        let mut k = Some(a);
+        for first in [
+            vec![DECISION_VERSION, 9],
+            vec![DECISION_FRESH],
+            vec![DECISION_RESUMED],
+            vec![DECISION_CHALLENGE, 0, 0],
+        ] {
+            let (dial, mut listen) = pair().await;
+            listen.send(&first).await.unwrap();
+            let mut c = cache();
+            let r = dial_to(dial, &alice, &bob, &mut k, &bnd(), &mut c).await;
+            match r {
+                Err(e) => assert!(e.to_string().contains("version"), "{e}"),
+                Ok(_) => panic!("accepted"),
+            }
+            assert!(k.is_some());
+        }
+    }
+
+    // ---- auth chain ----
+
+    fn bundle_of(c: &DeviceCreds) -> AuthBundle {
+        decode_auth_bundle(&encode_auth_bundle(c)).unwrap()
+    }
+
+    #[test]
+    fn chain_accepts_genuine_and_observes_list() {
+        let root = id();
+        let mut c = creds_with(&root, FAR);
+        c.revocation = Some(root.revoke_devices(4, 0, &[PeerId([9; 32])]).unwrap());
+        let mut cc = cache();
+        let auth = verify_peer_chain(&bundle_of(&c), c.device.public(), NOW, &mut cc).unwrap();
+        assert_eq!(auth.root.peer_id(), root.peer_id());
+        assert_eq!(cc.get(&root.peer_id()).unwrap().seq(), 4);
+    }
+
+    #[test]
+    fn chain_rejects_cert_for_other_device() {
+        let root = id();
+        let (a, other) = (creds_with(&root, FAR), creds_with(&root, FAR));
+        let mut cc = cache();
+        let r = verify_peer_chain(&bundle_of(&other), a.device.public(), NOW, &mut cc);
+        assert!(matches!(r, Err(Error::Verify(_))));
+    }
+
+    #[test]
+    fn chain_rejects_expired_cert() {
+        let c = creds_with(&id(), 500);
+        let mut cc = cache();
+        assert!(verify_peer_chain(&bundle_of(&c), c.device.public(), 500, &mut cc).is_ok());
+        assert!(verify_peer_chain(&bundle_of(&c), c.device.public(), 501, &mut cc).is_err());
+    }
+
+    #[test]
+    fn chain_rejects_device_revoked_by_sent_list() {
+        let root = id();
+        let mut c = creds_with(&root, FAR);
+        c.revocation = Some(root.revoke_devices(1, 0, &[c.device.peer_id()]).unwrap());
+        let mut cc = cache();
+        assert!(verify_peer_chain(&bundle_of(&c), c.device.public(), NOW, &mut cc).is_err());
+    }
+
+    #[test]
+    fn chain_rejects_device_revoked_by_cached_list_even_if_omitted() {
+        let root = id();
+        let c = creds_with(&root, FAR);
+        let mut cc = cache();
+        cc.observe(root.revoke_devices(2, 0, &[c.device.peer_id()]).unwrap());
+        assert!(verify_peer_chain(&bundle_of(&c), c.device.public(), NOW, &mut cc).is_err());
+    }
+
+    #[test]
+    fn chain_rejects_list_from_other_root_and_unrelated_bundles() {
+        let root = id();
+        let mut c = creds_with(&root, FAR);
+        let other = id();
+        c.revocation = Some(other.revoke_devices(1, 0, &[]).unwrap());
+        let mut cc = cache();
+        assert!(verify_peer_chain(&bundle_of(&c), c.device.public(), NOW, &mut cc).is_err());
+
+        // Valid bundle for carol's own device, but the session peer is dave.
+        let (carol, dave) = (creds(), creds());
+        assert!(verify_peer_chain(&bundle_of(&carol), dave.device.public(), NOW, &mut cc).is_err());
+    }
+
+    #[test]
+    fn chain_rejects_cert_signed_by_wrong_root() {
+        let mut c = creds();
+        c.root = id().public().clone(); // claims a root that did not sign the cert
+        let mut cc = cache();
+        assert!(verify_peer_chain(&bundle_of(&c), c.device.public(), NOW, &mut cc).is_err());
+    }
+
+    #[tokio::test]
+    async fn bundle_for_wrong_device_rejected_and_sessions_unchanged() {
+        let alice_root = id();
+        let alice = creds_with(&alice_root, FAR);
+        let other = creds_with(&alice_root, FAR);
+        let bob = creds();
+        let mut sessions = stale(&alice, &bob);
+        let (mut dial, listen) = pair().await;
+        preamble(&mut dial, MODE_FRESH, &alice.device).await;
+        let bd = bnd();
+        let script = async {
+            assert_eq!(dial.recv().await.unwrap()[0], LISTENER_HELLO);
+            assert_eq!(dial.recv().await.unwrap(), [DECISION_FRESH]);
+            let mut cs = ConnectedSession::initiate(dial, &alice.device, bob.device.public(), &bd)
+                .await
+                .unwrap();
+            // A genuine cert, but for a different device than the session peer.
+            cs.send(&encode_auth_bundle(&other)).await.unwrap();
+        };
+        let mut c = cache();
+        let (r, ()) = tokio::join!(
+            accept_or_resume(listen, &bob, &mut sessions, &bd, NOW, &mut c),
             script
         );
         assert!(r.is_err());
-        assert_eq!(p[0], MODE_FRESH);
-        assert!(p[1..1 + NONCE_LEN].iter().all(|b| *b == 0));
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions.contains_key(&alice.device.peer_id()));
+    }
+
+    #[test]
+    fn bundle_size_caps() {
+        // Oversized: rejected before parsing.
+        assert!(decode_auth_bundle(&vec![0u8; MAX_AUTH_BUNDLE_LEN + 1]).is_err());
+        // Trailing byte / truncation.
+        let c = creds();
+        let mut b = encode_auth_bundle(&c);
+        assert!(decode_auth_bundle(&b).is_ok());
+        assert!(decode_auth_bundle(&b[..b.len() - 1]).is_err());
+        b.push(0);
+        assert!(decode_auth_bundle(&b).is_err());
+        // Length prefix larger than the input.
+        assert!(decode_auth_bundle(&[0xff, 0xff, 0xff, 0x7f, 1, 2]).is_err());
+    }
+
+    #[test]
+    fn maximal_bundle_and_hello_fit_caps_and_frames() {
+        let root = id();
+        let mut c = creds_with(&root, FAR);
+        let many: Vec<PeerId> = (0..MAX_REVOKED)
+            .map(|i| {
+                let mut b = [0u8; 32];
+                b[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+                PeerId(b)
+            })
+            .collect();
+        c.revocation = Some(root.revoke_devices(1, 0, &many).unwrap());
+        let bundle = encode_auth_bundle(&c);
+        assert!(bundle.len() <= MAX_AUTH_BUNDLE_LEN, "{}", bundle.len());
+        let parsed = decode_auth_bundle(&bundle).unwrap();
+        assert_eq!(parsed.revocation.unwrap().revoked().len(), MAX_REVOKED);
+        // Sealed by a session: must fit one transport frame.
+        let peer = id();
+        let (m1, pending) = SecureSession::initiate(&c.device, peer.public(), b"").unwrap();
+        let (m2, _) = SecureSession::respond(&peer, c.device.public(), b"", &m1).unwrap();
+        let mut s = pending.finish(&m2).unwrap();
+        assert!(s.seal(&bundle).unwrap().len() <= FRAME_CAP);
+        // The hello is a plain frame.
+        let hello = encode_listener_hello(&c);
+        assert!(hello.len() <= MAX_LISTENER_HELLO_LEN, "{}", hello.len());
+        assert!(hello.len() <= FRAME_CAP);
+        let (r, d) = ids(&c);
+        let mut cc = cache();
+        assert!(verify_listener_hello(&hello, &r, &d, NOW, &mut cc).is_ok());
+    }
+
+    // ---- listener hello ----
+
+    #[test]
+    fn hello_checks_against_ticket() {
+        let root = id();
+        let bob = creds_with(&root, FAR);
+        let (r, d) = ids(&bob);
+        let hello = encode_listener_hello(&bob);
+        let mut cc = cache();
+        let ok = verify_listener_hello(&hello, &r, &d, NOW, &mut cc).unwrap();
+        assert_eq!(ok.device.peer_id(), bob.device.peer_id());
+
+        let mut wrong_dev = d;
+        wrong_dev[0] ^= 1;
+        assert!(verify_listener_hello(&hello, &r, &wrong_dev, NOW, &mut cc).is_err());
+        let mut wrong_root = r;
+        wrong_root[0] ^= 1;
+        assert!(verify_listener_hello(&hello, &wrong_root, &d, NOW, &mut cc).is_err());
+        // Expired.
+        assert!(verify_listener_hello(&hello, &r, &d, FAR + 1, &mut cc).is_err());
+        // Cert not signed by the stated root.
+        let mut forged = creds_with(&root, FAR);
+        forged.root = id().public().clone();
+        let (fr, fd) = ids(&forged);
+        let fh = encode_listener_hello(&forged);
+        assert!(verify_listener_hello(&fh, &fr, &fd, NOW, &mut cc).is_err());
+        // Revoked by its own included list.
+        let mut revoked = creds_with(&root, FAR);
+        revoked.revocation = Some(
+            root.revoke_devices(1, 0, &[revoked.device.peer_id()])
+                .unwrap(),
+        );
+        let (rr, rd) = ids(&revoked);
+        let rh = encode_listener_hello(&revoked);
+        assert!(verify_listener_hello(&rh, &rr, &rd, NOW, &mut cc).is_err());
+        // Oversized, wrong tag, trailing garbage.
+        assert!(verify_listener_hello(
+            &vec![LISTENER_HELLO; MAX_LISTENER_HELLO_LEN + 1],
+            &r,
+            &d,
+            NOW,
+            &mut cc
+        )
+        .is_err());
+        let mut bad_tag = hello.clone();
+        bad_tag[0] = 0;
+        assert!(verify_listener_hello(&bad_tag, &r, &d, NOW, &mut cc).is_err());
+        let mut trailing = hello.clone();
+        trailing.push(0);
+        assert!(verify_listener_hello(&trailing, &r, &d, NOW, &mut cc).is_err());
+    }
+
+    #[tokio::test]
+    async fn bad_hello_leaves_kept_untouched() {
+        let (alice, bob, a, _b) = genuine();
+        let imposter = creds();
+        let mut k = Some(a);
+        // The listener answers with a hello for someone other than the ticket's peer.
+        let (dial, mut listen) = pair().await;
+        listen
+            .send(&encode_listener_hello(&imposter))
+            .await
+            .unwrap();
+        let mut c = cache();
+        let r = dial_to(dial, &alice, &bob, &mut k, &bnd(), &mut c).await;
+        assert!(matches!(r, Err(Error::Verify(_))));
+        assert!(k.is_some());
+
+        // Oversized hello.
+        let (dial, mut listen) = pair().await;
+        listen
+            .send(&vec![LISTENER_HELLO; MAX_LISTENER_HELLO_LEN + 1])
+            .await
+            .unwrap();
+        let r = dial_to(dial, &alice, &bob, &mut k, &bnd(), &mut c).await;
+        assert!(matches!(r, Err(Error::Verify(_))));
+        assert!(k.is_some());
     }
 
     // ---- negotiation timeouts, busy reply, gate ----
 
     const SHORT: Duration = Duration::from_millis(50);
+    const MEDIUM: Duration = Duration::from_millis(1500);
 
     #[test]
     fn negotiation_constants() {
         assert_eq!(NEGOTIATION_TIMEOUT, Duration::from_secs(15));
         assert_eq!(DECISION_BUSY, 3);
+        assert_eq!(WIRE_VERSION, 2);
+        assert_eq!(DECISION_VERSION, 4);
+        assert_eq!(LISTENER_HELLO, 5);
+        assert_eq!(MAX_CACHED_ROOTS, 256);
+        assert_eq!(DEVICE_CERT_LIFETIME, Duration::from_secs(30 * 24 * 3600));
+        assert_eq!(DEVICE_RENEW_WINDOW, Duration::from_secs(7 * 24 * 3600));
     }
 
     #[tokio::test]
     async fn silent_dialer_times_out_and_keeps_sessions() {
-        let (alice, bob) = (id(), id());
+        let (alice, bob) = (creds(), creds());
         let mut sessions = stale(&alice, &bob);
         let (_dial, listen) = pair().await;
-        let r = negotiate_accept(listen, &bob, &mut sessions, &bnd(), SHORT).await;
+        let mut c = cache();
+        let r = negotiate_accept(listen, &bob, &mut sessions, &bnd(), NOW, &mut c, SHORT).await;
         assert!(matches!(
             r,
             Err(Error::Transport(_)) | Err(Error::Verify(_))
         ));
         assert_eq!(sessions.len(), 1);
-        assert!(sessions.contains_key(&alice.peer_id()));
+        assert!(sessions.contains_key(&alice.device.peer_id()));
     }
 
     #[tokio::test]
     async fn resume_without_tag_times_out_and_session_still_resumes() {
         let (alice, bob, a, b) = genuine();
-        let mut sessions = HashMap::from([(alice.peer_id(), b)]);
+        let mut sessions = HashMap::from([(alice.device.peer_id(), b)]);
         let (mut eve, listen) = pair().await;
-        eve.send(&resume_preamble(&[7u8; NONCE_LEN], &alice))
+        eve.send(&resume_preamble(&[7u8; NONCE_LEN], &alice.device))
             .await
             .unwrap();
-        let r = negotiate_accept(listen, &bob, &mut sessions, &bnd(), SHORT).await;
+        let mut c = cache();
+        let r = negotiate_accept(listen, &bob, &mut sessions, &bnd(), NOW, &mut c, SHORT).await;
         assert!(r.is_err());
-        assert!(sessions.contains_key(&alice.peer_id()));
+        assert!(sessions.contains_key(&alice.device.peer_id()));
         drop(eve);
 
         // A genuine resume on a new pair still works.
-        let mut kept = Some(a);
+        let mut k = Some(a);
         let (dial, listen) = pair().await;
         let bd = bnd();
+        let mut ca = cache();
         let (d, l) = tokio::join!(
-            negotiate_dial(dial, &alice, bob.public(), &mut kept, &bd),
-            accept_or_resume(listen, &bob, &mut sessions, &bd)
+            dial_to(dial, &alice, &bob, &mut k, &bd, &mut ca),
+            accept_or_resume(listen, &bob, &mut sessions, &bd, NOW, &mut c)
         );
         assert!(d.is_ok());
         assert!(l.is_ok());
@@ -1085,55 +2275,130 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_without_msg1_times_out_and_keeps_sessions() {
-        let (alice, bob) = (id(), id());
+        let (alice, bob) = (creds(), creds());
         let mut sessions = stale(&alice, &bob);
         let (mut dial, listen) = pair().await;
-        preamble(&mut dial, MODE_FRESH, &alice).await;
-        let r = negotiate_accept(listen, &bob, &mut sessions, &bnd(), SHORT).await;
+        preamble(&mut dial, MODE_FRESH, &alice.device).await;
+        let mut c = cache();
+        let r = negotiate_accept(listen, &bob, &mut sessions, &bnd(), NOW, &mut c, SHORT).await;
         assert!(r.is_err());
         assert_eq!(sessions.len(), 1);
-        assert!(sessions.contains_key(&alice.peer_id()));
+        assert!(sessions.contains_key(&alice.device.peer_id()));
+    }
+
+    #[tokio::test]
+    async fn handshake_without_auth_bundle_times_out_and_keeps_sessions() {
+        let (alice, bob) = (creds(), creds());
+        let mut sessions = stale(&alice, &bob);
+        let (mut dial, listen) = pair().await;
+        preamble(&mut dial, MODE_FRESH, &alice.device).await;
+        let bd = bnd();
+        let script = async {
+            let _ = dial.recv().await.unwrap();
+            let _ = dial.recv().await.unwrap();
+            let _cs = ConnectedSession::initiate(dial, &alice.device, bob.device.public(), &bd)
+                .await
+                .unwrap();
+            // Handshake done; never send the auth bundle.
+            std::future::pending::<()>().await;
+        };
+        let mut c = cache();
+        let r = tokio::select! {
+            r = negotiate_accept(listen, &bob, &mut sessions, &bd, NOW, &mut c, MEDIUM) => r,
+            _ = script => unreachable!(),
+        };
+        assert!(matches!(r, Err(Error::Transport(_))));
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions.contains_key(&alice.device.peer_id()));
     }
 
     #[tokio::test]
     async fn silent_listener_times_out_and_keeps_kept() {
         let (alice, bob, a, _b) = genuine();
-        let mut kept = Some(a);
+        let mut k = Some(a);
         let (dial, _listen) = pair().await;
-        let r = negotiate_dial_within(dial, &alice, bob.public(), &mut kept, &bnd(), SHORT).await;
-        assert!(matches!(r, Err(Error::Transport(_))));
-        assert!(kept.is_some());
+        let (r, d) = ids(&bob);
+        let mut c = cache();
+        let res =
+            negotiate_dial_within(dial, &alice, &r, &d, &mut k, &bnd(), NOW, &mut c, SHORT).await;
+        assert!(matches!(res, Err(Error::Transport(_))));
+        assert!(k.is_some());
+    }
+
+    #[tokio::test]
+    async fn listener_silent_after_hello_times_out_and_keeps_kept() {
+        let (alice, bob, a, _b) = genuine();
+        let mut k = Some(a);
+        let (dial, mut listen) = pair().await;
+        listen.send(&encode_listener_hello(&bob)).await.unwrap();
+        let (r, d) = ids(&bob);
+        let mut c = cache();
+        let res =
+            negotiate_dial_within(dial, &alice, &r, &d, &mut k, &bnd(), NOW, &mut c, SHORT).await;
+        assert!(matches!(res, Err(Error::Transport(_))));
+        assert!(k.is_some());
+    }
+
+    #[tokio::test]
+    async fn listener_silent_at_auth_bundle_times_out_dialer_side() {
+        let (alice, bob) = (creds(), creds());
+        let (dial, mut listen) = pair().await;
+        let bd = bnd();
+        let hello = encode_listener_hello(&bob);
+        let script = async {
+            let p = listen.recv().await.unwrap();
+            let who = PublicIdentity::from_bytes(&p[2 + NONCE_LEN..]).unwrap();
+            listen.send(&hello).await.unwrap();
+            listen.send(&[DECISION_FRESH]).await.unwrap();
+            let _cs = ConnectedSession::accept(listen, &bob.device, &who, &bd)
+                .await
+                .unwrap();
+            // Handshake done; never send our bundle.
+            std::future::pending::<()>().await;
+        };
+        let (r, d) = ids(&bob);
+        let mut k = None;
+        let mut c = cache();
+        let res = tokio::select! {
+            res = negotiate_dial_within(dial, &alice, &r, &d, &mut k, &bd, NOW, &mut c, MEDIUM) => res,
+            _ = script => unreachable!(),
+        };
+        assert!(matches!(res, Err(Error::Transport(_))));
+        assert!(k.is_none());
     }
 
     #[tokio::test]
     async fn busy_listener_is_an_error_and_keeps_kept() {
         let (alice, bob, a, _b) = genuine();
-        let mut kept = Some(a);
+        let mut k = Some(a);
         let (dial, mut listen) = pair().await;
         listen.send(&[DECISION_BUSY]).await.unwrap();
-        let r = negotiate_dial(dial, &alice, bob.public(), &mut kept, &bnd()).await;
+        let mut c = cache();
+        let r = dial_to(dial, &alice, &bob, &mut k, &bnd(), &mut c).await;
         assert!(matches!(r, Err(Error::Transport(_))));
-        assert!(kept.is_some());
+        assert!(k.is_some());
 
         let (dial, mut listen) = pair().await;
         listen.send(&[DECISION_BUSY]).await.unwrap();
-        let r = negotiate_dial_within(dial, &alice, bob.public(), &mut kept, &bnd(), SHORT).await;
-        assert!(matches!(r, Err(Error::Transport(_))));
-        assert!(kept.is_some());
+        let (r, d) = ids(&bob);
+        let res =
+            negotiate_dial_within(dial, &alice, &r, &d, &mut k, &bnd(), NOW, &mut c, SHORT).await;
+        assert!(matches!(res, Err(Error::Transport(_))));
+        assert!(k.is_some());
 
         let mut none = None;
         let (dial, mut listen) = pair().await;
         listen.send(&[DECISION_BUSY]).await.unwrap();
-        let r = negotiate_dial(dial, &alice, bob.public(), &mut none, &bnd()).await;
+        let r = dial_to(dial, &alice, &bob, &mut none, &bnd(), &mut c).await;
         assert!(matches!(r, Err(Error::Transport(_))));
         assert!(none.is_none());
     }
 
     #[tokio::test]
     async fn reply_busy_sends_one_byte_and_closes() {
-        let alice = id();
+        let alice = creds();
         let (mut dial, listen) = pair().await;
-        preamble(&mut dial, MODE_FRESH, &alice).await; // stays unread
+        preamble(&mut dial, MODE_FRESH, &alice.device).await; // stays unread
         reply_busy(listen).await.unwrap();
         assert_eq!(dial.recv().await.unwrap(), [DECISION_BUSY]);
         assert!(dial.recv().await.is_err());
@@ -1323,123 +2588,23 @@ mod tests {
         assert_ne!(channel_binding(&d, &l2), b);
     }
 
-    // ---- ticket verification ----
-
-    /// A valid iroh endpoint id: a Lattice keypair's Ed25519 public key.
-    fn ep_of(k: &Keypair) -> [u8; 32] {
-        k.public().ed25519_bytes()
-    }
-
-    fn taddr(ep: &[u8; 32], relay: &str, direct: &[&str]) -> TicketAddr {
-        let direct: Vec<std::net::SocketAddr> = direct.iter().map(|s| s.parse().unwrap()).collect();
-        TicketAddr::from_parts(ep, &[relay], &direct).unwrap()
-    }
-
-    fn base_addr(ep: &[u8; 32]) -> TicketAddr {
-        taddr(ep, "https://relay.example.org./", &["192.0.2.1:4433"])
-    }
-
-    /// Sign `msg` with `k` and return the encoded-then-parsed ticket.
-    fn issue(k: &Keypair, addr: &TicketAddr, msg: &[u8]) -> ParsedTicket {
-        let ident = k.public().to_bytes();
-        let sig = k.sign(msg).0;
-        parse_ticket(&encode_ticket(addr, &ident, &sig).unwrap()).unwrap()
-    }
-
-    fn genuine_msg(k: &Keypair, addr: &TicketAddr) -> Vec<u8> {
-        ticket_message(&addr.endpoint_id(), addr.as_bytes(), &k.public().to_bytes())
-    }
-
-    fn signed_ticket(k: &Keypair) -> (ParsedTicket, TicketAddr) {
-        let addr = base_addr(&ep_of(k));
-        let t = issue(k, &addr, &genuine_msg(k, &addr));
-        (t, addr)
-    }
+    // ---- ticket v3 ----
 
     #[test]
-    fn verify_ticket_accepts_genuine() {
-        let k = id();
-        let (t, _) = signed_ticket(&k);
-        let got = verify_ticket(&t).unwrap();
-        assert_eq!(got.peer_id(), k.peer_id());
-    }
-
-    #[test]
-    fn verify_ticket_rejects_tampering() {
-        let (k, other) = (id(), id());
-        let (t, _) = signed_ticket(&k);
-
-        // Changed endpoint id.
-        let mut bad = t.clone();
-        bad.endpoint_id[0] ^= 1;
-        assert!(matches!(verify_ticket(&bad), Err(Error::Verify(_))));
-        // Signature from a different keypair.
-        let (o, _) = signed_ticket(&other);
-        let mut bad = t.clone();
-        bad.app_sig = o.app_sig.clone();
-        assert!(matches!(verify_ticket(&bad), Err(Error::Verify(_))));
-        // Empty signature.
-        let mut bad = t.clone();
-        bad.app_sig = vec![];
-        assert!(matches!(verify_ticket(&bad), Err(Error::Verify(_))));
-        // Swapped identity (valid identity, signature not made by it).
-        let mut bad = t.clone();
-        bad.app_identity = other.public().to_bytes();
-        assert!(verify_ticket(&bad).is_err());
-        // Flipped identity bytes.
-        let mut bad = t.clone();
-        let mid = bad.app_identity.len() / 2;
-        bad.app_identity[mid] ^= 1;
-        assert!(verify_ticket(&bad).is_err());
-        // Truncated identity bytes.
-        let mut bad = t.clone();
-        bad.app_identity.truncate(t.app_identity.len() / 2);
-        assert!(verify_ticket(&bad).is_err());
-    }
-
-    #[test]
-    fn verify_ticket_rejects_edited_address() {
-        let k = id();
-        let ep = ep_of(&k);
-        let (t, addr) = signed_ticket(&k);
-        let ident = k.public().to_bytes();
-        let sig = t.app_sig.clone();
-        let variants = [
-            // (a) different relay URL
-            taddr(&ep, "https://other.example.org./", &["192.0.2.1:4433"]),
-            // (b) different direct address (IP, then port)
-            taddr(&ep, "https://relay.example.org./", &["192.0.2.2:4433"]),
-            taddr(&ep, "https://relay.example.org./", &["192.0.2.1:4434"]),
-            // (c) extra direct address
-            taddr(
-                &ep,
-                "https://relay.example.org./",
-                &["192.0.2.1:4433", "198.51.100.7:1"],
-            ),
-            // (d) direct address removed
-            taddr(&ep, "https://relay.example.org./", &[]),
-        ];
-        for v in variants {
-            assert_ne!(v.as_bytes(), addr.as_bytes());
-            let edited = parse_ticket(&encode_ticket(&v, &ident, &sig).unwrap()).unwrap();
-            assert!(
-                matches!(verify_ticket(&edited), Err(Error::Verify(_))),
-                "edited address must not verify"
-            );
-        }
-    }
-
-    #[test]
-    fn verify_ticket_rejects_v1_signature() {
-        let k = id();
-        let addr = base_addr(&ep_of(&k));
-        let ident = k.public().to_bytes();
-        let mut v1 = b"lattice-ticket-v1".to_vec();
-        v1.extend_from_slice(&addr.endpoint_id());
-        v1.extend_from_slice(&(ident.len() as u32).to_le_bytes());
-        v1.extend_from_slice(&ident);
-        let t = issue(&k, &addr, &v1);
-        assert!(matches!(verify_ticket(&t), Err(Error::Verify(_))));
+    fn ticket_v3_carries_root_and_device_ids() {
+        let ep = id().public().ed25519_bytes();
+        let addr = TicketAddr::from_parts(
+            &ep,
+            &["https://relay.example.org./"],
+            &["192.0.2.1:4433".parse().unwrap()],
+        )
+        .unwrap();
+        let c = creds();
+        let (r, d) = ids(&c);
+        let t = parse_ticket(&encode_ticket(&addr, &r, &d).unwrap()).unwrap();
+        assert_eq!((t.root_id, t.device_id), (r, d));
+        assert_eq!(t.endpoint_id, ep);
+        assert_eq!(t.addr_bytes, addr.as_bytes());
     }
 
     #[test]
@@ -1447,6 +2612,62 @@ mod tests {
         let (a, b) = ([1u8; 32], [2u8; 32]);
         assert!(check_endpoint(&a, &a).is_ok());
         assert!(matches!(check_endpoint(&a, &b), Err(Error::Verify(_))));
+    }
+
+    // ---- revocation cache ----
+
+    #[test]
+    fn cache_observe_rules() {
+        let root = id();
+        let mut cc = cache();
+        let l1 = root.revoke_devices(1, 0, &[PeerId([1; 32])]).unwrap();
+        let l1b = root.revoke_devices(1, 5, &[PeerId([2; 32])]).unwrap();
+        let l2 = root.revoke_devices(2, 0, &[PeerId([3; 32])]).unwrap();
+        let l0 = root.revoke_devices(0, 0, &[]).unwrap();
+        assert!(cc.observe(l1));
+        assert!(!cc.observe(l1b), "equal seq: first one wins");
+        assert!(!cc.observe(l0));
+        assert!(cc.revokes(&root.peer_id(), &PeerId([1; 32])));
+        assert!(cc.observe(l2));
+        assert!(!cc.revokes(&root.peer_id(), &PeerId([1; 32])));
+        assert!(cc.revokes(&root.peer_id(), &PeerId([3; 32])));
+        assert_eq!(cc.take_dirty().len(), 1);
+        assert!(cc.take_dirty().is_empty());
+    }
+
+    #[test]
+    fn cache_is_bounded_but_accepts_newer_for_known_roots() {
+        let mut cc = cache();
+        let first = Keypair::generate(CryptoSuite::Classical).unwrap();
+        assert!(cc.observe(first.revoke_devices(1, 0, &[]).unwrap()));
+        for _ in 1..MAX_CACHED_ROOTS {
+            let k = Keypair::generate(CryptoSuite::Classical).unwrap();
+            assert!(cc.observe(k.revoke_devices(1, 0, &[]).unwrap()));
+        }
+        let extra = Keypair::generate(CryptoSuite::Classical).unwrap();
+        assert!(!cc.observe(extra.revoke_devices(1, 0, &[]).unwrap()));
+        assert!(cc.get(&extra.peer_id()).is_none());
+        assert!(cc.observe(first.revoke_devices(2, 0, &[]).unwrap()));
+        assert_eq!(cc.lists.len(), MAX_CACHED_ROOTS);
+    }
+
+    // ---- expiry policy and dates ----
+
+    #[test]
+    fn cert_status_boundaries() {
+        let (na, w) = (10_000u64, 100u64);
+        assert_eq!(cert_status(na, na, w), CertStatus::RenewSoon);
+        assert_eq!(cert_status(na + 1, na, w), CertStatus::Expired);
+        assert_eq!(cert_status(na - w, na, w), CertStatus::RenewSoon);
+        assert_eq!(cert_status(na - w - 1, na, w), CertStatus::Valid);
+    }
+
+    #[test]
+    fn format_date_known_values() {
+        assert_eq!(format_date(0), "1970-01-01");
+        assert_eq!(format_date(951_782_400), "2000-02-29");
+        assert_eq!(format_date(951_782_399), "2000-02-28");
+        assert_eq!(format_date(1_700_000_000), "2023-11-14");
     }
 
     // ---- command line ----
@@ -1483,5 +2704,42 @@ mod tests {
         }
         assert!(cmd(&["show-recovery-phrase", "--yes"]).is_err());
         assert!(cmd(&["show-recovery-phrase", "--i-understand", "x"]).is_err());
+    }
+
+    #[test]
+    fn parse_command_new_commands() {
+        assert_eq!(cmd(&["renew-device"]).unwrap(), Command::RenewDevice);
+        assert!(cmd(&["renew-device", "x"]).is_err());
+
+        let hex = "ab".repeat(32);
+        assert_eq!(
+            cmd(&["revoke-device", &hex]).unwrap(),
+            Command::RevokeDevice(PeerId([0xab; 32]))
+        );
+        assert_eq!(
+            cmd(&["revoke-device", &hex.to_uppercase()]).unwrap(),
+            Command::RevokeDevice(PeerId([0xab; 32]))
+        );
+        assert!(cmd(&["revoke-device"]).is_err());
+        assert!(cmd(&["revoke-device", "abcd"]).is_err());
+        assert!(cmd(&["revoke-device", &"zz".repeat(32)]).is_err());
+        assert!(cmd(&["revoke-device", &hex, "extra"]).is_err());
+
+        assert_eq!(
+            cmd(&["forget-root", "--i-understand"]).unwrap(),
+            Command::ForgetRoot
+        );
+        for bad in [&["forget-root"][..], &["forget-root", "--yes"][..]] {
+            match cmd(bad) {
+                Err(Error::Other(m)) => assert!(m.contains("--i-understand")),
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+
+        assert_eq!(cmd(&["import-root"]).unwrap(), Command::ImportRoot);
+        match cmd(&["import-root", "abandon", "abandon"]) {
+            Err(Error::Other(m)) => assert!(m.contains("stdin")),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }

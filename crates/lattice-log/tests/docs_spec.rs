@@ -42,6 +42,8 @@ fn design_mentions_required_terms() {
         "ADR-010",
         "ADR-011",
         "ADR-012",
+        "ADR-013",
+        "lattice-revocation-v1",
     ] {
         assert!(d.contains(need), "DESIGN.md missing {need:?}");
     }
@@ -51,7 +53,7 @@ fn design_mentions_required_terms() {
 fn adrs_appear_in_order() {
     let d = read("DESIGN.md");
     let mut last = 0;
-    for n in 6..=12 {
+    for n in 6..=13 {
         let key = format!("ADR-{n:03}");
         // Earlier sections may cross-reference an ADR, so use the last mention
         // (the §8 entry).
@@ -91,9 +93,13 @@ fn design_drops_overclaims() {
         "plaintext backed up",
         "Residual: `IrohTransport::accept_conn` has no timeout",
         "lattice-ticket-v1`: signed",
+        "lattice-net uses the root identity directly",
     ] {
         assert!(!d.contains(bad), "DESIGN.md still contains {bad:?}");
     }
+    let s = collapsed("SECURITY.md");
+    assert!(!s.contains("no revocation list yet"));
+    assert!(!s.contains("uses the root identity directly"));
 }
 
 #[test]

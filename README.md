@@ -60,38 +60,58 @@ cargo build -p lattice-chat-example --bin lattice-net   # pulls in the `iroh` fe
 ```bash
 ./target/debug/lattice-net listen
 # === TICKET (copy to the other device) ===
-# 7b22616464...   <- copy this whole blob
+# 03a1b2c3...   <- copy this whole blob
 ```
 
 **Device B** (dialer) — paste A's ticket:
 
 ```bash
-./target/debug/lattice-net connect 7b22616464...
+./target/debug/lattice-net connect 03a1b2c3...
 ```
 
 Once both show "secure session established", type a line on either side and it
-appears, decrypted, on the other. Each device has a **persistent identity**: a
-BIP39 mnemonic stored at rest under `~/.lattice/` — in the **OS keychain** when
-available (service `lattice`, account `identity-mnemonic`), else an
+appears, decrypted, on the other. Each store has a **persistent root identity**
+(a BIP39 mnemonic stored at rest under `~/.lattice/` — in the **OS keychain**
+when available (service `lattice`, account `identity-mnemonic`), else an
 **age-encrypted file** (`identity.age`, `0600`; passphrase via `LATTICE_PASSPHRASE`
 or prompt — note an env passphrase is visible in the process environment;
-`LATTICE_STORAGE=age` forces the file backend; `LATTICE_DIR` overrides the dir).
-The PeerId is stable across runs and
-recoverable from the mnemonic. The ticket carries A's address + public
-identity so B can authenticate the handshake (trust-on-first-use). Both machines
-need outbound internet to reach the n0 relays for discovery/holepunching.
+`LATTICE_STORAGE=age` forces the file backend; `LATTICE_DIR` overrides the dir))
+and a separate **device key** with a root-signed, 30-day certificate
+(`device.age` / account `device-mnemonic`, `device.cert`, `root.pub`).
+Handshakes are signed with the device key, not the root. The root PeerId is
+stable across runs and recoverable from the mnemonic. The ticket is compact
+(small enough for a QR code) and unsigned: it carries A's address plus A's root
+and device PeerIds, and B checks A's hello and certificate chain against them.
+It is still a bearer token for reachability. Both machines need outbound
+internet to reach the n0 relays for discovery/holepunching.
 
-Run `lattice-net whoami` to print your peer id and fingerprint, and compare
-fingerprints with your peer out of band. `lattice-net show-recovery-phrase
---i-understand` prints your recovery phrase for an offline backup — keep it
-secret.
+Run `lattice-net whoami` to print your root and device ids, fingerprints and
+certificate expiry, and compare the **root fingerprint** with your peer out of
+band. `lattice-net show-recovery-phrase --i-understand` prints your recovery
+phrase for an offline backup — keep it secret.
+
+Device management:
+
+```bash
+lattice-net renew-device                 # re-issue the device cert (needs the root)
+lattice-net revoke-device <64-hex id>    # sign a revocation list (needs the root)
+lattice-net forget-root --i-understand   # remove the root secret from this store
+lattice-net import-root                  # restore the root; phrase read from stdin
+```
+
+Certificates are renewed automatically while the root is in the store.
+Revocation is lazy: peers learn a revoked device only when they next talk to a
+non-revoked device of the same root. Tickets from older versions (v2) and peers
+on the previous wire version fail with a clear version error.
 
 **Reconnect & resume:** the session survives drops. If the connection breaks,
 the listener returns to waiting and the dialer re-dials the same ticket with
 exponential backoff (1→30s). If both sides still hold their session (a transient
 network blip), they **resume the same ratchet with no re-handshake** (ADR-006);
 if either restarted and lost its state, they fall back to a fresh handshake. The
-persistent identity keeps each side's PeerId stable across reconnects. Press
+persistent identity keeps each side's PeerId stable across reconnects. A kept
+session is not resumed if the peer's certificate has expired or a cached
+revocation list revokes its device. Press
 Ctrl-D on either side to quit.
 
 ## Acknowledgements

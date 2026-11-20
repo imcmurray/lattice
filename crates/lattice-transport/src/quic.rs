@@ -2,15 +2,15 @@
 //!
 //! `IrohTransport` binds an iroh endpoint (n0 relays + discovery) and yields
 //! `IrohConn`s — framed (`u32`-BE length prefix) over a single QUIC bi-stream,
-//! preserving in-order delivery for the Double Ratchet. Tickets carry our
-//! iroh address (as the exact serialized bytes that were signed), an opaque
-//! app-identity blob, and an opaque signature (`app_sig`) over
-//! [`ticket_message`] (domain ‖ endpoint id ‖ full address ‖ identity), so the
-//! dialer can verify — *before dialing* — that the ticket was issued by that
-//! identity for that endpoint and address (relay URLs and direct addresses
-//! included). The transport is identity-agnostic: the
-//! app-identity bytes and the signature are opaque here and are never
-//! interpreted or verified by this crate; the application does that.
+//! preserving in-order delivery for the Double Ratchet. Tickets (version 3)
+//! are compact and **unsigned**: our iroh address (the exact serialized
+//! bytes) plus two opaque 32-byte ids (`root_id`, `device_id` — the app puts
+//! PeerIds there). A ticket is an out-of-band bearer of those ids; its
+//! security comes from the application verifying the peer's hello and
+//! handshake against them, not from a signature on the ticket. Tickets stay
+//! small enough for a QR code ([`COMPACT_TICKET_MAX_LEN`]). The transport is
+//! identity-agnostic: the ids are opaque here. Version-2 (signed) tickets are
+//! rejected with an "old ticket version" error.
 //! Addresses ([`IrohEndpointId`]) are unauthenticated transport locators, not
 //! Lattice identities; [`IrohConn::remote_endpoint_id`] exposes the
 //! QUIC-authenticated remote endpoint id for channel binding. `read_frame`
@@ -31,8 +31,12 @@ pub const ALPN: &[u8] = b"lattice/0";
 /// Max accepted ticket length in hex characters (after trim): 16 KiB.
 pub const MAX_TICKET_LEN: usize = 16 * 1024;
 
-const TICKET_DOMAIN: &[u8] = b"lattice-ticket-v2";
-const TICKET_VERSION: u8 = 2;
+/// Current ticket version (compact, unsigned).
+pub const TICKET_VERSION: u8 = 3;
+
+/// Target upper bound (hex chars) for a realistic ticket, so it fits a QR code.
+/// Not enforced by [`encode_ticket`].
+pub const COMPACT_TICKET_MAX_LEN: usize = 1024;
 
 fn terr(ctx: &str, e: impl core::fmt::Display) -> Error {
     Error::Transport(format!("{ctx}: {e}"))
@@ -54,10 +58,10 @@ impl core::fmt::Debug for IrohEndpointId {
 struct Ticket {
     /// Must equal [`TICKET_VERSION`].
     version: u8,
-    /// The exact `postcard(EndpointAddr)` bytes that were signed.
+    /// The exact `postcard(EndpointAddr)` bytes.
     addr: Vec<u8>,
-    app_identity: Vec<u8>,
-    app_sig: Vec<u8>,
+    root_id: [u8; 32],
+    device_id: [u8; 32],
 }
 
 /// A frozen snapshot of an endpoint address and its exact serialized bytes.
@@ -98,45 +102,37 @@ impl TicketAddr {
         *self.addr.id.as_bytes()
     }
 
-    /// The exact `postcard(EndpointAddr)` bytes that are signed and put in the ticket.
+    /// The exact `postcard(EndpointAddr)` bytes that are put in the ticket.
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
 }
 
-/// A decoded ticket. Nothing here has been signature-verified.
+/// A decoded ticket. Unsigned: nothing here is authenticated.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedTicket {
-    pub app_identity: Vec<u8>,
-    pub app_sig: Vec<u8>,
     /// Decoded `EndpointAddr.id`.
     pub endpoint_id: [u8; 32],
     /// Raw address bytes exactly as carried by the ticket.
     pub addr_bytes: Vec<u8>,
+    /// Opaque to this crate (the app puts a root PeerId here).
+    pub root_id: [u8; 32],
+    /// Opaque to this crate (the app puts a device PeerId here).
+    pub device_id: [u8; 32],
 }
 
-/// The bytes a listener signs to issue a ticket:
-/// `b"lattice-ticket-v2" ‖ endpoint_id ‖ u32le(addr.len()) ‖ addr ‖
-/// u32le(app_identity.len()) ‖ app_identity`.
-pub fn ticket_message(endpoint_id: &[u8; 32], addr: &[u8], app_identity: &[u8]) -> Vec<u8> {
-    let mut m =
-        Vec::with_capacity(TICKET_DOMAIN.len() + 32 + 4 + addr.len() + 4 + app_identity.len());
-    m.extend_from_slice(TICKET_DOMAIN);
-    m.extend_from_slice(endpoint_id);
-    m.extend_from_slice(&(addr.len() as u32).to_le_bytes());
-    m.extend_from_slice(addr);
-    m.extend_from_slice(&(app_identity.len() as u32).to_le_bytes());
-    m.extend_from_slice(app_identity);
-    m
-}
-
-/// Pure: `hex(postcard(Ticket { version: 2, addr: addr.as_bytes(), .. }))`.
-pub fn encode_ticket(addr: &TicketAddr, app_identity: &[u8], app_sig: &[u8]) -> Result<String> {
+/// Pure: `hex(postcard(Ticket { version: 3, addr: addr.as_bytes(), root_id, device_id }))`.
+/// Deterministic.
+pub fn encode_ticket(
+    addr: &TicketAddr,
+    root_id: &[u8; 32],
+    device_id: &[u8; 32],
+) -> Result<String> {
     let t = Ticket {
         version: TICKET_VERSION,
         addr: addr.as_bytes().to_vec(),
-        app_identity: app_identity.to_vec(),
-        app_sig: app_sig.to_vec(),
+        root_id: *root_id,
+        device_id: *device_id,
     };
     let bytes = postcard::to_allocvec(&t).map_err(|e| terr("ticket encode", e))?;
     Ok(hex::encode(bytes))
@@ -151,16 +147,25 @@ fn decode_ticket(ticket: &str) -> Result<(ParsedTicket, EndpointAddr)> {
         )));
     }
     let bytes = hex::decode(ticket).map_err(|e| terr("ticket hex", e))?;
+    // The version is the first postcard field (a `u8` = one raw byte).
+    match bytes.first() {
+        None => return Err(Error::Transport("ticket is empty".into())),
+        Some(&TICKET_VERSION) => {}
+        Some(2) => {
+            return Err(Error::Transport(
+                "old ticket version 2 (signed ticket); ask your peer for a new ticket \
+                 from an upgraded lattice-net"
+                    .into(),
+            ))
+        }
+        Some(v) => {
+            return Err(Error::Transport(format!("unsupported ticket version {v}")));
+        }
+    }
     let (t, rest): (Ticket, &[u8]) =
         postcard::take_from_bytes(&bytes).map_err(|e| terr("ticket decode", e))?;
     if !rest.is_empty() {
         return Err(Error::Transport("ticket has trailing bytes".into()));
-    }
-    if t.version != TICKET_VERSION {
-        return Err(Error::Transport(format!(
-            "unsupported ticket version {}",
-            t.version
-        )));
     }
     let (addr, rest): (EndpointAddr, &[u8]) =
         postcard::take_from_bytes(&t.addr).map_err(|e| terr("ticket addr decode", e))?;
@@ -168,16 +173,16 @@ fn decode_ticket(ticket: &str) -> Result<(ParsedTicket, EndpointAddr)> {
         return Err(Error::Transport("ticket addr has trailing bytes".into()));
     }
     let parsed = ParsedTicket {
-        app_identity: t.app_identity,
-        app_sig: t.app_sig,
         endpoint_id: *addr.id.as_bytes(),
         addr_bytes: t.addr,
+        root_id: t.root_id,
+        device_id: t.device_id,
     };
     Ok((parsed, addr))
 }
 
 /// Pure (no network): bounded hex + strict postcard decode of a ticket string.
-/// Does not verify the signature.
+/// The ticket is unsigned; the caller checks the ids it carries.
 pub fn parse_ticket(ticket: &str) -> Result<ParsedTicket> {
     decode_ticket(ticket).map(|(p, _)| p)
 }
@@ -323,8 +328,7 @@ impl IrohTransport {
         *self.ep.id().as_bytes()
     }
 
-    /// Wait until online, then snapshot our address ONCE. Sign
-    /// [`TicketAddr::as_bytes`] via [`ticket_message`] and pass the same value
+    /// Wait until online, then snapshot our address ONCE and pass that value
     /// to [`encode_ticket`].
     pub async fn ticket_addr(&self) -> Result<TicketAddr> {
         self.ep.online().await;
@@ -332,8 +336,8 @@ impl IrohTransport {
     }
 
     /// Dial the address decoded from a ticket. Returns the [`ParsedTicket`] and
-    /// the connection. Does NOT verify `app_sig`; callers should
-    /// [`parse_ticket`] and verify first.
+    /// the connection. The ticket's ids are not checked here; the caller
+    /// verifies the peer against them.
     pub async fn connect_ticket(&self, ticket: &str) -> Result<(ParsedTicket, IrohConn)> {
         let (parsed, addr) = decode_ticket(ticket)?;
         let conn = self
@@ -484,8 +488,8 @@ mod tests {
         Ticket {
             version,
             addr,
-            app_identity: b"identity".to_vec(),
-            app_sig: b"sig".to_vec(),
+            root_id: [0x11; 32],
+            device_id: [0x22; 32],
         }
     }
 
@@ -496,10 +500,10 @@ mod tests {
     #[test]
     fn ticket_roundtrip() {
         let addr = sample_addr(7);
-        let s = encode_ticket(&addr, b"identity-bytes", b"sig-bytes").unwrap();
+        let s = encode_ticket(&addr, &[0xaa; 32], &[0xbb; 32]).unwrap();
         let p = parse_ticket(&s).unwrap();
-        assert_eq!(p.app_identity, b"identity-bytes");
-        assert_eq!(p.app_sig, b"sig-bytes");
+        assert_eq!(p.root_id, [0xaa; 32]);
+        assert_eq!(p.device_id, [0xbb; 32]);
         assert_eq!(p.endpoint_id, addr.endpoint_id());
         assert_eq!(&p.endpoint_id, test_id(7).as_bytes());
         assert_eq!(p.addr_bytes, addr.as_bytes());
@@ -509,22 +513,28 @@ mod tests {
 
     #[test]
     fn ticket_encoding_is_deterministic() {
-        let s1 = encode_ticket(&sample_addr(7), b"i", b"s").unwrap();
+        let s1 = encode_ticket(&sample_addr(7), &[1; 32], &[2; 32]).unwrap();
         let p = parse_ticket(&s1).unwrap();
-        let s2 = encode_ticket(&sample_addr(7), &p.app_identity, &p.app_sig).unwrap();
+        let s2 = encode_ticket(&sample_addr(7), &p.root_id, &p.device_id).unwrap();
         assert_eq!(s1, s2);
+        assert!(s1.starts_with("03"), "version byte first");
     }
 
     #[test]
-    fn ticket_message_layout() {
-        let id = [9u8; 32];
-        let mut want = b"lattice-ticket-v2".to_vec();
-        want.extend_from_slice(&id);
-        want.extend_from_slice(&[2, 0, 0, 0]);
-        want.extend_from_slice(b"AD");
-        want.extend_from_slice(&[3, 0, 0, 0]);
-        want.extend_from_slice(b"xyz");
-        assert_eq!(ticket_message(&id, b"AD", b"xyz"), want);
+    fn realistic_ticket_is_compact() {
+        let addr = TicketAddr::from_parts(
+            test_id(3).as_bytes(),
+            &["https://euc1-1.relay.n0.iroh.iroh.link./"],
+            &[
+                "192.0.2.1:4433".parse().unwrap(),
+                "198.51.100.7:51234".parse().unwrap(),
+                "[2001:db8::1]:4433".parse().unwrap(),
+                "[2001:db8:1::2]:51234".parse().unwrap(),
+            ],
+        )
+        .unwrap();
+        let s = encode_ticket(&addr, &[1; 32], &[2; 32]).unwrap();
+        assert!(s.len() < COMPACT_TICKET_MAX_LEN, "{}", s.len());
     }
 
     #[test]
@@ -538,9 +548,37 @@ mod tests {
     #[test]
     fn wrong_version_is_rejected() {
         let a = sample_addr(1);
-        assert!(parse_ticket(&hex_of(&raw_ticket(1, a.as_bytes().to_vec()))).is_err());
-        assert!(parse_ticket(&hex_of(&raw_ticket(3, a.as_bytes().to_vec()))).is_err());
-        assert!(parse_ticket(&hex_of(&raw_ticket(2, a.as_bytes().to_vec()))).is_ok());
+        for v in [1u8, 4] {
+            match parse_ticket(&hex_of(&raw_ticket(v, a.as_bytes().to_vec()))) {
+                Err(Error::Transport(m)) => {
+                    assert!(m.contains("unsupported ticket version"), "{m}")
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+        assert!(parse_ticket(&hex_of(&raw_ticket(3, a.as_bytes().to_vec()))).is_ok());
+    }
+
+    #[test]
+    fn v2_layout_gets_old_version_error() {
+        #[derive(Serialize)]
+        struct V2 {
+            version: u8,
+            addr: Vec<u8>,
+            app_identity: Vec<u8>,
+            app_sig: Vec<u8>,
+        }
+        let v2 = V2 {
+            version: 2,
+            addr: sample_addr(1).as_bytes().to_vec(),
+            app_identity: b"identity".to_vec(),
+            app_sig: b"sig".to_vec(),
+        };
+        let s = hex::encode(postcard::to_allocvec(&v2).unwrap());
+        match parse_ticket(&s) {
+            Err(Error::Transport(m)) => assert!(m.contains("old ticket version"), "{m}"),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]
@@ -549,9 +587,9 @@ mod tests {
         // Extra byte inside the addr blob.
         let mut inner = a.as_bytes().to_vec();
         inner.push(0);
-        assert!(parse_ticket(&hex_of(&raw_ticket(2, inner))).is_err());
+        assert!(parse_ticket(&hex_of(&raw_ticket(3, inner))).is_err());
         // Extra byte after the outer struct.
-        let mut outer = postcard::to_allocvec(&raw_ticket(2, a.as_bytes().to_vec())).unwrap();
+        let mut outer = postcard::to_allocvec(&raw_ticket(3, a.as_bytes().to_vec())).unwrap();
         outer.push(0);
         assert!(parse_ticket(&hex::encode(outer)).is_err());
     }

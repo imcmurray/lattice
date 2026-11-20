@@ -23,6 +23,13 @@
 //! moved between the Classical and Hybrid identities of one mnemonic (which
 //! share an Ed25519 key), and a `Classical` identity rejects any signature
 //! carrying a PQ part.
+//!
+//! Devices are authorized by a root-signed [`DeviceCert`] (mandatory expiry).
+//! A root can also sign a [`RevocationList`] (`lattice-revocation-v1`): a
+//! monotonic-`seq`, sorted, capped ([`MAX_REVOKED`]) set of revoked device
+//! PeerIds. Checking one is the caller's job
+//! ([`DeviceCert::verify_with_revocation`]); distributing lists is up to the
+//! application (`lattice-net` sends them lazily in its auth bundles).
 
 use lattice_core::{CryptoSuite, Error, Identity, PeerId, Result, Signature, Verify};
 
@@ -721,11 +728,330 @@ impl DeviceCert {
             sig: Signature(sig),
         })
     }
+
+    /// [`DeviceCert::verify`] and, if `revocation` is given, that the list is
+    /// issued by this cert's root, verifies under `root`, and does not list
+    /// this cert's device.
+    pub fn verify_with_revocation(
+        &self,
+        root: &PublicIdentity,
+        now: u64,
+        revocation: Option<&RevocationList>,
+    ) -> bool {
+        if !self.verify(root, now) {
+            return false;
+        }
+        match revocation {
+            None => true,
+            Some(l) => {
+                l.root == self.root
+                    && l.root == root.peer_id()
+                    && l.verify(root)
+                    && !l.is_revoked(&self.device.peer_id())
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Signed revocation lists (`lattice-revocation-v1`).
+// ---------------------------------------------------------------------------
+
+/// Max entries in a [`RevocationList`].
+pub const MAX_REVOKED: usize = 1024;
+/// Hard cap on an encoded [`RevocationList`] (checked before any parsing or
+/// allocation). Larger than the largest valid Hybrid-signed list with
+/// [`MAX_REVOKED`] entries.
+pub const MAX_REVOCATION_LIST_LEN: usize = 40 * 1024;
+const REVOCATION_DOMAIN: &[u8] = b"lattice-revocation-v1";
+
+/// A root-signed, monotonically numbered set of revoked device PeerIds.
+///
+/// A higher `seq` from the same root supersedes a lower one (and may un-revoke
+/// a device — the root is the authority). Lists are tiny and travel in the
+/// peer auth bundle; propagation is lazy.
+#[derive(Clone, Debug)]
+pub struct RevocationList {
+    root: PeerId,
+    seq: u64,
+    issued_at: u64,
+    revoked: Vec<PeerId>,
+    sig: Signature,
+}
+
+impl RevocationList {
+    /// `REVOCATION_DOMAIN ‖ root[32] ‖ u64le(seq) ‖ u64le(issued_at) ‖ u32le(n) ‖ n×peer_id[32]`.
+    fn message(root: &PeerId, seq: u64, issued_at: u64, revoked: &[PeerId]) -> Vec<u8> {
+        let mut m =
+            Vec::with_capacity(REVOCATION_DOMAIN.len() + 32 + 8 + 8 + 4 + 32 * revoked.len());
+        m.extend_from_slice(REVOCATION_DOMAIN);
+        m.extend_from_slice(&root.0);
+        m.extend_from_slice(&seq.to_le_bytes());
+        m.extend_from_slice(&issued_at.to_le_bytes());
+        m.extend_from_slice(&(revoked.len() as u32).to_le_bytes());
+        for p in revoked {
+            m.extend_from_slice(&p.0);
+        }
+        m
+    }
+
+    /// The issuing root.
+    pub fn root(&self) -> &PeerId {
+        &self.root
+    }
+
+    /// Monotonic sequence number.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Unix seconds at which the root issued this list (informational).
+    pub fn issued_at(&self) -> u64 {
+        self.issued_at
+    }
+
+    /// Revoked device PeerIds, sorted ascending by bytes, no duplicates.
+    pub fn revoked(&self) -> &[PeerId] {
+        &self.revoked
+    }
+
+    /// Whether `device` is listed. Pure; does not check the signature.
+    pub fn is_revoked(&self, device: &PeerId) -> bool {
+        self.revoked
+            .binary_search_by(|p| p.0.cmp(&device.0))
+            .is_ok()
+    }
+
+    /// True iff same root and `self.seq > other.seq`.
+    pub fn supersedes(&self, other: &RevocationList) -> bool {
+        self.root == other.root && self.seq > other.seq
+    }
+
+    /// Verify the list was signed by `root` and is well-formed. Never panics.
+    pub fn verify(&self, root: &PublicIdentity) -> bool {
+        if root.peer_id() != self.root
+            || self.revoked.len() > MAX_REVOKED
+            || !self.revoked.windows(2).all(|w| w[0].0 < w[1].0)
+            || self.is_revoked(&self.root)
+        {
+            return false;
+        }
+        root.verify(
+            &Self::message(&self.root, self.seq, self.issued_at, &self.revoked),
+            &self.sig,
+        )
+    }
+
+    /// `root[32] ‖ u64le(seq) ‖ u64le(issued_at) ‖ u32le(n) ‖ n×32 ‖ u32le(sig_len) ‖ sig`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut v =
+            Vec::with_capacity(32 + 8 + 8 + 4 + 32 * self.revoked.len() + 4 + self.sig.0.len());
+        v.extend_from_slice(&self.root.0);
+        v.extend_from_slice(&self.seq.to_le_bytes());
+        v.extend_from_slice(&self.issued_at.to_le_bytes());
+        v.extend_from_slice(&(self.revoked.len() as u32).to_le_bytes());
+        for p in &self.revoked {
+            v.extend_from_slice(&p.0);
+        }
+        v.extend_from_slice(&(self.sig.0.len() as u32).to_le_bytes());
+        v.extend_from_slice(&self.sig.0);
+        v
+    }
+
+    /// Strict parser for [`RevocationList::to_bytes`]. Does not check the
+    /// signature; callers must call [`RevocationList::verify`].
+    pub fn from_bytes(b: &[u8]) -> Result<Self> {
+        if b.len() > MAX_REVOCATION_LIST_LEN {
+            return Err(Error::Crypto("revocation list too large".into()));
+        }
+        let mut rest = b;
+        let mut root = [0u8; 32];
+        root.copy_from_slice(take(&mut rest, 32)?);
+        let seq = u64::from_le_bytes(take(&mut rest, 8)?.try_into().expect("8 bytes"));
+        let issued_at = u64::from_le_bytes(take(&mut rest, 8)?.try_into().expect("8 bytes"));
+        let n = take_u32(&mut rest)? as usize;
+        if n > MAX_REVOKED {
+            return Err(Error::Crypto("too many revoked devices".into()));
+        }
+        let raw = take(&mut rest, n * 32)?;
+        let mut revoked: Vec<PeerId> = Vec::with_capacity(n);
+        for c in raw.chunks_exact(32) {
+            let mut id = [0u8; 32];
+            id.copy_from_slice(c);
+            if let Some(prev) = revoked.last() {
+                if prev.0 >= id {
+                    return Err(Error::Crypto("revocation list not strictly sorted".into()));
+                }
+            }
+            revoked.push(PeerId(id));
+        }
+        let sig_len = take_u32(&mut rest)? as usize;
+        let sig = take(&mut rest, sig_len)?.to_vec();
+        if !rest.is_empty() {
+            return Err(Error::Crypto("trailing bytes after revocation list".into()));
+        }
+        Ok(Self {
+            root: PeerId(root),
+            seq,
+            issued_at,
+            revoked,
+            sig: Signature(sig),
+        })
+    }
+}
+
+impl Keypair {
+    /// Sign a revocation list under this (root) keypair. `devices` may be in
+    /// any order and contain duplicates; they are sorted and deduplicated.
+    /// Fails if the root's own PeerId is listed or if more than
+    /// [`MAX_REVOKED`] distinct entries remain. An empty list is allowed.
+    pub fn revoke_devices(
+        &self,
+        seq: u64,
+        issued_at: u64,
+        devices: &[PeerId],
+    ) -> Result<RevocationList> {
+        let root = self.public.peer_id();
+        let mut revoked: Vec<PeerId> = devices.to_vec();
+        revoked.sort_by_key(|p| p.0);
+        revoked.dedup_by(|a, b| a.0 == b.0);
+        if revoked.contains(&root) {
+            return Err(Error::Crypto("cannot revoke the root itself".into()));
+        }
+        if revoked.len() > MAX_REVOKED {
+            return Err(Error::Crypto("too many revoked devices".into()));
+        }
+        let sig = self.sign(&RevocationList::message(&root, seq, issued_at, &revoked));
+        Ok(RevocationList {
+            root,
+            seq,
+            issued_at,
+            revoked,
+            sig,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pid(n: u8) -> PeerId {
+        PeerId([n; 32])
+    }
+
+    fn revocation_suites() -> Vec<CryptoSuite> {
+        #[cfg(feature = "pq")]
+        {
+            vec![CryptoSuite::Classical, CryptoSuite::Hybrid]
+        }
+        #[cfg(not(feature = "pq"))]
+        {
+            vec![CryptoSuite::Classical]
+        }
+    }
+
+    #[test]
+    fn revoke_sorts_dedups_and_verifies() {
+        for suite in revocation_suites() {
+            let root = Keypair::generate(suite).unwrap();
+            let l = root
+                .revoke_devices(3, 10, &[pid(9), pid(2), pid(9), pid(5)])
+                .unwrap();
+            assert_eq!(l.revoked(), &[pid(2), pid(5), pid(9)]);
+            assert!(l.verify(root.public()));
+            assert!(l.is_revoked(&pid(5)) && !l.is_revoked(&pid(6)));
+            assert_eq!((l.seq(), l.issued_at()), (3, 10));
+            let rt = RevocationList::from_bytes(&l.to_bytes()).unwrap();
+            assert_eq!(rt.to_bytes(), l.to_bytes());
+            assert!(rt.verify(root.public()));
+            let other = Keypair::generate(suite).unwrap();
+            assert!(!l.verify(other.public()));
+        }
+    }
+
+    #[test]
+    fn revoke_limits() {
+        for suite in revocation_suites() {
+            let root = Keypair::generate(suite).unwrap();
+            assert!(root.revoke_devices(1, 1, &[]).is_ok());
+            assert!(root.revoke_devices(1, 1, &[root.peer_id()]).is_err());
+            let ids = |n: usize| -> Vec<PeerId> {
+                (0..n)
+                    .map(|i| {
+                        let mut b = [0u8; 32];
+                        b[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+                        PeerId(b)
+                    })
+                    .collect()
+            };
+            assert!(root.revoke_devices(1, 1, &ids(MAX_REVOKED + 1)).is_err());
+            let max = root.revoke_devices(1, 1, &ids(MAX_REVOKED)).unwrap();
+            assert!(max.to_bytes().len() <= MAX_REVOCATION_LIST_LEN);
+            assert!(max.verify(root.public()));
+        }
+    }
+
+    #[test]
+    fn revocation_tamper_and_parse_rejections() {
+        let root = Keypair::generate(CryptoSuite::Classical).unwrap();
+        let l = root.revoke_devices(1, 2, &[pid(3), pid(4)]).unwrap();
+        let good = l.to_bytes();
+        // Flip one byte in every field region (root, seq, issued_at, entries, sig).
+        for i in [0usize, 32, 40, 52, 84, good.len() - 1] {
+            let mut t = good.clone();
+            t[i] ^= 1;
+            if let Ok(p) = RevocationList::from_bytes(&t) {
+                assert!(!p.verify(root.public()), "byte {i}");
+            }
+        }
+        let mut trailing = good.clone();
+        trailing.push(0);
+        assert!(RevocationList::from_bytes(&trailing).is_err());
+        assert!(RevocationList::from_bytes(&good[..good.len() - 1]).is_err());
+        let mut huge = good[..52].to_vec();
+        huge[48..52].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(RevocationList::from_bytes(&huge).is_err());
+        assert!(RevocationList::from_bytes(&vec![0u8; MAX_REVOCATION_LIST_LEN + 1]).is_err());
+        // Unsorted and duplicate entries.
+        let mut unsorted = good.clone();
+        unsorted[52..84].fill(4);
+        unsorted[84..116].fill(3);
+        assert!(RevocationList::from_bytes(&unsorted).is_err());
+        let mut dup = good.clone();
+        dup[84..116].fill(3);
+        assert!(RevocationList::from_bytes(&dup).is_err());
+    }
+
+    #[test]
+    fn supersedes_rules() {
+        let a = Keypair::generate(CryptoSuite::Classical).unwrap();
+        let b = Keypair::generate(CryptoSuite::Classical).unwrap();
+        let l1 = a.revoke_devices(1, 0, &[]).unwrap();
+        let l2 = a.revoke_devices(2, 0, &[]).unwrap();
+        let m2 = b.revoke_devices(2, 0, &[]).unwrap();
+        assert!(l2.supersedes(&l1));
+        assert!(!l1.supersedes(&l2) && !l1.supersedes(&l1.clone()));
+        assert!(!m2.supersedes(&l1));
+    }
+
+    #[test]
+    fn verify_with_revocation_cases() {
+        for suite in revocation_suites() {
+            let root = Keypair::generate(suite).unwrap();
+            let dev = Keypair::generate(suite).unwrap();
+            let cert = root.authorize_device(dev.public(), 100).unwrap();
+            assert!(cert.verify_with_revocation(root.public(), 50, None));
+            let ok = root.revoke_devices(1, 0, &[pid(1)]).unwrap();
+            assert!(cert.verify_with_revocation(root.public(), 50, Some(&ok)));
+            let bad = root.revoke_devices(2, 0, &[dev.peer_id()]).unwrap();
+            assert!(!cert.verify_with_revocation(root.public(), 50, Some(&bad)));
+            let other = Keypair::generate(suite).unwrap();
+            let foreign = other.revoke_devices(1, 0, &[]).unwrap();
+            assert!(!cert.verify_with_revocation(root.public(), 50, Some(&foreign)));
+            assert!(!cert.verify_with_revocation(root.public(), 101, None));
+        }
+    }
 
     #[cfg(feature = "pq")]
     #[test]

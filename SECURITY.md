@@ -28,25 +28,48 @@
   (8 each), dropping the excess. This is not Sybil or flood resistance: a
   sustained flood can keep those slots full and lock legitimate peers out for
   as long as it lasts.
-- The `lattice-net` listen ticket is a reachability bearer token. It is signed
-  by the listener's Lattice identity: the signature (`lattice-ticket-v2`) covers
-  the listener's iroh endpoint id, its full address (relay URLs and direct
-  addresses) and its identity, so an edited ticket is rejected before dialing.
-  The dialer checks the signature before dialing and checks that it reached that
-  endpoint. Both the handshake transcripts and
-  the resume proofs are bound to both endpoint ids (`lattice-net-cb-v1`,
-  `lattice-resume-v2`). The ticket still grants reachability: anyone holding it
-  can try to connect.
+- The `lattice-net` listen ticket (v3) is a compact, **unsigned** bearer token:
+  the listener's iroh address plus its root and device PeerIds, small enough for
+  a QR code. It grants reachability: anyone holding it can try to connect. It
+  is no weaker than the old signed ticket (`lattice-ticket-v2`, historical and
+  superseded): the ticket travels out of band, and an attacker who can edit it
+  could equally replace the PeerIds, so a signature added nothing. Substituting
+  the relay URL or direct addresses can only deny service, because TLS pins the
+  iroh endpoint id and the listener's hello, handshake and certificate chain pin
+  the device and root. The dialer checks the listener's hello (device and root
+  PeerIds equal the ticket's, valid unexpired cert, not revoked) before the
+  handshake, and that it reached the ticket's endpoint. Both the handshake
+  transcripts and the resume proofs are bound to both endpoint ids
+  (`lattice-net-cb-v1`, `lattice-resume-v2`). A v2 ticket, or a peer on the
+  previous wire version, fails with a clear version error.
+- `lattice-net` signs handshakes with a separate Hybrid **device** key, not the
+  root identity. The root (recoverable from its mnemonic) only issues and
+  renews device certificates (30-day lifetime, auto-renewed within 7 days of
+  expiry) and signs revocation lists; it can be removed from a store with
+  `forget-root`. The root's own secret is still a single point of total
+  compromise: there is no root rotation.
+- Revocation lists (`lattice-revocation-v1`) are signed by the root, monotonic by
+  `seq`, and capped at 1024 entries. Peers cache the highest-seq verified list
+  per root and enforce it on fresh handshakes and on resume. **Propagation is
+  lazy**: a peer learns a revocation only when it next talks to a non-revoked
+  device of the same root, which sends the list in its hello or auth bundle. v3
+  tickets carry no list. Until then a revoked device is accepted; the 30-day
+  certificate lifetime bounds that window. A higher-seq list from the root can
+  un-revoke a device; the root is the authority.
 - Resuming a kept session in `lattice-net` requires a mutual HMAC proof bound to
   that session's secret and the channel binding (`lattice-resume-v2`). Anyone
   holding the current session state (for example a compromised device) can still
   resume.
-- On first contact, compare fingerprints (`lattice-net whoami`) with your peer
-  out of band (trust on first use): the ticket itself is not authenticated out
-  of band. The fingerprint comparison is manual; nothing enforces it.
+- On first contact, compare the peer's **root** fingerprint (`lattice-net
+  whoami`, and the one printed on connect) with your peer out of band (trust on
+  first use): the ticket itself is not authenticated. The fingerprint comparison
+  is manual; nothing enforces it.
 - Metadata (who talks to whom) is not hidden.
-- There is no identity hiding: identities are sent in the clear (the dialer's
-  identity bundle in the `lattice-net` preamble, the listener's in the ticket).
+- There is no identity hiding: the dialer's device identity (in the
+  `lattice-net` preamble) and the listener's device identity, root identity and
+  certificate chain (in its hello) are sent in the clear. Only the auth bundles
+  exchanged after the handshake are encrypted. The first byte of the preamble is
+  a wire-version byte.
 - Capabilities are single-hop signed grants, with no attenuation chain, expiry
   or revocation.
 - Signatures are bound to the signer's full identity (crypto suite and PeerId,
@@ -57,10 +80,10 @@
   (hybrid) identity and carry a mandatory expiry (`not_after`). A Hybrid root
   cannot delegate to a Classical device. v1 device certs no longer verify
   (pre-1.0, no migration).
-- Lattice has no revocation list yet: a leaked device key stays valid until its
-  certificate's `not_after`.
-- `lattice-net` still uses the root identity directly as its everyday key;
-  device keys are not yet wired into the example app.
+- Other applications built on `lattice-identity` get no revocation checking
+  unless they call `DeviceCert::verify_with_revocation` with a list they have
+  obtained; only `lattice-net` distributes and enforces lists (lazily, see
+  above).
 - Public identity and signature encodings are parsed strictly and canonically:
   trailing bytes, wrong-length or invalid keys and small-order Ed25519 keys are
   rejected at parse time.
