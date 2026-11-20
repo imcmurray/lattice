@@ -19,6 +19,10 @@
 - Resuming a kept session in `lattice-net` requires a mutual HMAC proof bound to
   that session's secret (`lattice-resume-v1`). Anyone holding the current
   session state (for example a compromised device) can still resume.
+- Signatures are bound to the signer's full identity (crypto suite and PeerId,
+  `lattice-sig-v2`), so a signature cannot move between the Classical and Hybrid
+  identities derived from one mnemonic. This changes every signature: logs,
+  caps and device certs signed earlier no longer verify (pre-1.0, no migration).
 - `lattice-net` must not be used for real secrets.
 
 ## Reporting a vulnerability

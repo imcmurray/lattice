@@ -30,6 +30,14 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test
         run: cargo test --workspace
+      - name: clippy (identity+storage)
+        run: cargo clippy -p lattice-identity --features storage --all-targets -- -D warnings
+      - name: test (identity+storage)
+        run: cargo test -p lattice-identity --features storage
+      - name: clippy (transport+iroh)
+        run: cargo clippy -p lattice-transport --features iroh --all-targets -- -D warnings
+      - name: test (transport+iroh)
+        run: cargo test -p lattice-transport --features iroh
 
   # Catch platform breakage in the framework itself, on the same targets the
   # clients build for. Mirrors the clients' `lattice` + iroh feature.

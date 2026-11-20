@@ -18,7 +18,11 @@
 //!
 //! Hybrid rule: a signature is valid only if **every** present component
 //! (Ed25519 and, for `Hybrid`, ML-DSA) verifies — secure if *either* primitive
-//! holds (DESIGN.md §5).
+//! holds (DESIGN.md §5). Every component signs the same bound message
+//! (`lattice-sig-v2 ‖ suite ‖ PeerId ‖ len ‖ msg`), so a signature cannot be
+//! moved between the Classical and Hybrid identities of one mnemonic (which
+//! share an Ed25519 key), and a `Classical` identity rejects any signature
+//! carrying a PQ part.
 
 use lattice_core::{CryptoSuite, Error, Identity, PeerId, Result, Signature, Verify};
 
@@ -51,6 +55,21 @@ type MlKemDk = DecapsulationKey<MlKem768>;
 const HKDF_SALT: &[u8] = b"lattice-hkdf-v1";
 const PEERID_DOMAIN: &[u8] = b"lattice-id-v1";
 const DEVICE_CERT_DOMAIN: &[u8] = b"lattice-device-cert-v1";
+const SIG_DOMAIN: &[u8] = b"lattice-sig-v2";
+
+/// The exact bytes both signature halves cover:
+/// `SIG_DOMAIN ‖ suite_tag (1) ‖ peer_id (32) ‖ u32le(msg.len()) ‖ msg`.
+/// Binding the signer's suite and PeerId keeps a signature from moving between
+/// the identities (Classical / Hybrid) derived from one mnemonic.
+fn bound_message(suite: CryptoSuite, peer_id: &PeerId, msg: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(SIG_DOMAIN.len() + 1 + 32 + 4 + msg.len());
+    v.extend_from_slice(SIG_DOMAIN);
+    v.push(suite_tag(suite));
+    v.extend_from_slice(&peer_id.0);
+    v.extend_from_slice(&(msg.len() as u32).to_le_bytes());
+    v.extend_from_slice(msg);
+    v
+}
 
 // ---------------------------------------------------------------------------
 // Key derivation (deterministic; no RNG — that's what makes recovery work).
@@ -281,6 +300,13 @@ impl Verify for PublicIdentity {
             return false;
         };
 
+        // A Classical identity carries no PQ component; reject any extra part.
+        if self.suite == CryptoSuite::Classical && !pq_sig.is_empty() {
+            return false;
+        }
+
+        let bound = bound_message(self.suite, &self.peer_id, msg);
+
         // Classical half (always required).
         let ed_arr: [u8; 64] = match ed_sig.try_into() {
             Ok(a) => a,
@@ -291,7 +317,7 @@ impl Verify for PublicIdentity {
             Err(_) => return false,
         };
         let ed_signature = ed25519_dalek::Signature::from_bytes(&ed_arr);
-        if vk.verify_strict(msg, &ed_signature).is_err() {
+        if vk.verify_strict(&bound, &ed_signature).is_err() {
             return false;
         }
 
@@ -308,7 +334,7 @@ impl Verify for PublicIdentity {
                     Ok(s) => s,
                     Err(_) => return false,
                 };
-                if pq_vk.verify(msg, &pq_signature).is_err() {
+                if pq_vk.verify(&bound, &pq_signature).is_err() {
                     return false;
                 }
             }
@@ -419,14 +445,15 @@ impl Identity for Keypair {
     }
 
     fn sign(&self, msg: &[u8]) -> Signature {
-        let ed_sig = ed_signing(&self.seed).sign(msg).to_bytes();
+        let bound = bound_message(self.suite, &self.public.peer_id, msg);
+        let ed_sig = ed_signing(&self.seed).sign(&bound).to_bytes();
 
         let pq_sig: Vec<u8> = match self.suite {
             CryptoSuite::Classical => Vec::new(),
             CryptoSuite::Hybrid => {
                 #[cfg(feature = "pq")]
                 {
-                    let s: DsaSignature<MlDsa65> = dsa_signing(&self.seed).sign(msg);
+                    let s: DsaSignature<MlDsa65> = dsa_signing(&self.seed).sign(&bound);
                     s.to_bytes().to_vec()
                 }
                 #[cfg(not(feature = "pq"))]
@@ -576,6 +603,126 @@ mod tests {
         // A signature from the original verifies under the parsed public id.
         let sig = kp.sign(b"wire");
         assert!(parsed.verify(b"wire", &sig));
+    }
+
+    const MNEMONIC: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const MSG: &[u8] = b"bind me to my identity";
+
+    fn hex32(s: &str) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap();
+        }
+        out
+    }
+
+    fn pair() -> (Keypair, Keypair) {
+        (
+            Keypair::from_mnemonic(CryptoSuite::Classical, MNEMONIC).unwrap(),
+            Keypair::from_mnemonic(CryptoSuite::Hybrid, MNEMONIC).unwrap(),
+        )
+    }
+
+    #[test]
+    fn peer_ids_are_stable_for_fixed_mnemonic() {
+        let (c, h) = pair();
+        assert_eq!(
+            c.peer_id().0,
+            hex32("39e4342c8705ea0a485f78880b94d5f19af0a2b4ffbbc945a4aaafe6c22e63ca")
+        );
+        assert_eq!(
+            h.peer_id().0,
+            hex32("3a922421c64cc123866e6c7fa9e9a35a39918075134ff2ea3090eea283a219fe")
+        );
+        assert_ne!(c.peer_id(), h.peer_id());
+        assert_eq!(c.public().ed25519_bytes(), h.public().ed25519_bytes());
+    }
+
+    #[test]
+    fn bound_message_layout() {
+        let pid = PeerId([7u8; 32]);
+        let b = bound_message(CryptoSuite::Hybrid, &pid, b"abc");
+        let mut want = b"lattice-sig-v2".to_vec();
+        want.push(1);
+        want.extend_from_slice(&[7u8; 32]);
+        want.extend_from_slice(&3u32.to_le_bytes());
+        want.extend_from_slice(b"abc");
+        assert_eq!(b, want);
+        assert_eq!(bound_message(CryptoSuite::Classical, &pid, b"")[14], 0);
+    }
+
+    #[test]
+    fn cross_suite_strip_is_rejected() {
+        let (c, h) = pair();
+        let sig = h.sign(MSG);
+        let (ed, _) = decode_hybrid(&sig.0).unwrap();
+        let stripped = Signature(encode_hybrid(ed, &[]));
+        assert!(!c.public().verify(MSG, &stripped));
+    }
+
+    #[test]
+    fn signatures_do_not_cross_suites() {
+        let (c, h) = pair();
+        assert!(!h.public().verify(MSG, &c.sign(MSG)));
+        assert!(!c.public().verify(MSG, &h.sign(MSG)));
+    }
+
+    #[test]
+    fn classical_rejects_non_empty_pq_part() {
+        let (c, h) = pair();
+        let sig = c.sign(MSG);
+        let (ed, _) = decode_hybrid(&sig.0).unwrap();
+        assert!(c.public().verify(MSG, &sig));
+        let padded = Signature(encode_hybrid(ed, &[0u8; 16]));
+        assert!(!c.public().verify(MSG, &padded));
+        let hsig = h.sign(MSG);
+        let (_, pq) = decode_hybrid(&hsig.0).unwrap();
+        let with_pq = Signature(encode_hybrid(ed, pq));
+        assert!(!c.public().verify(MSG, &with_pq));
+    }
+
+    #[test]
+    fn raw_unbound_ed25519_is_rejected() {
+        let (c, _) = pair();
+        let raw = ed_signing(&c.seed).sign(MSG).to_bytes();
+        let sig = Signature(encode_hybrid(&raw, &[]));
+        assert!(!c.public().verify(MSG, &sig));
+    }
+
+    #[test]
+    fn signature_does_not_verify_under_other_identity() {
+        for suite in [CryptoSuite::Classical, CryptoSuite::Hybrid] {
+            let a = Keypair::generate(suite).unwrap();
+            let b = Keypair::generate(suite).unwrap();
+            let sig = a.sign(MSG);
+            assert!(a.public().verify(MSG, &sig));
+            assert!(!b.public().verify(MSG, &sig));
+        }
+    }
+
+    #[test]
+    fn empty_message_roundtrip_and_wrong_message() {
+        let (c, h) = pair();
+        for kp in [&c, &h] {
+            let sig = kp.sign(b"");
+            assert!(kp.public().verify(b"", &sig));
+            assert!(!kp.public().verify(b"x", &sig));
+            let sig2 = kp.sign(MSG);
+            assert!(!kp.public().verify(b"", &sig2));
+        }
+    }
+
+    #[test]
+    fn malformed_signatures_return_false() {
+        let (c, _) = pair();
+        assert!(!c.public().verify(MSG, &Signature(vec![])));
+        assert!(!c.public().verify(MSG, &Signature(vec![1, 0, 0])));
+        let short = Signature(encode_hybrid(&[0u8; 63], &[]));
+        assert!(!c.public().verify(MSG, &short));
+        let mut trunc = c.sign(MSG);
+        trunc.0.truncate(trunc.0.len() - 1);
+        assert!(!c.public().verify(MSG, &trunc));
     }
 
     #[test]
