@@ -18,8 +18,8 @@
   handshake is hybrid, mixing fresh X25519 and ML-KEM ephemerals from both
   sides, which are erased after the handshake. A compromised long-term identity
   can still impersonate its owner in NEW sessions.
-- The `lattice-net` listen ticket is signed by the listener's Lattice identity
-  and names its iroh endpoint. The dialer checks the signature before dialing
+- The `lattice-net` listen ticket is a reachability bearer token. It is signed
+  by the listener's Lattice identity and names its iroh endpoint. The dialer checks the signature before dialing
   and checks that it reached that endpoint. Both the handshake transcripts and
   the resume proofs are bound to both endpoint ids (`lattice-net-cb-v1`,
   `lattice-resume-v2`). The ticket still grants reachability: anyone holding it
@@ -30,7 +30,12 @@
   resume.
 - On first contact, compare fingerprints (`lattice-net whoami`) with your peer
   out of band (trust on first use): the ticket itself is not authenticated out
-  of band.
+  of band. The fingerprint comparison is manual; nothing enforces it.
+- Metadata (who talks to whom) is not hidden.
+- There is no identity hiding: identities are sent in the clear (the dialer's
+  identity bundle in the `lattice-net` preamble, the listener's in the ticket).
+- Capabilities are single-hop signed grants, with no attenuation chain, expiry
+  or revocation.
 - Signatures are bound to the signer's full identity (crypto suite and PeerId,
   `lattice-sig-v2`), so a signature cannot move between the Classical and Hybrid
   identities derived from one mnemonic. This changes every signature: logs,

@@ -26,8 +26,16 @@
 //! only when both verify do they rebind to the new connection with no
 //! re-handshake. If either side lost its state (e.g. a restart), they fall back
 //! to a fresh handshake.
+//!
+//! Every pre-chat step (preamble, resume challenge/response, handshake) is
+//! limited to 15 s on both sides, so one slow or silent peer cannot stall the
+//! listener. A separate acceptor task keeps accepting while a chat runs; any
+//! connection that arrives while a chat (or negotiation) is in progress gets a
+//! one-byte "busy" reply and is dropped, and a dialer treats that as a failed
+//! attempt and retries with backoff.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,6 +59,11 @@ const DECISION_FRESH: u8 = 0;
 // Legacy unauthenticated resume: no longer sent; a dialer receiving it errors.
 const DECISION_RESUMED: u8 = 1;
 const DECISION_CHALLENGE: u8 = 2;
+/// Listener reply to a connection that arrives while a chat is in progress.
+const DECISION_BUSY: u8 = 3;
+/// Upper bound on every pre-chat step (preamble, resume challenge/response,
+/// v3 handshake) on both the listener and the dialer.
+const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(15);
 const NONCE_LEN: usize = 32;
 const TAG_LEN: usize = 32;
 /// Domain separator of the channel binding passed to the handshake and resume.
@@ -228,21 +241,50 @@ async fn listen(me: Keypair, mut lines: StdinLines) -> Result<()> {
     let ticket = t.ticket(&app_identity, &app_sig).await?;
     println!("\n=== TICKET (copy to the other device) ===\n{ticket}\n=========================================\n");
 
+    // Acceptor task: keeps accepting while a chat runs. A free gate hands the
+    // connection to this loop; a taken gate gets a one-byte "busy" reply.
+    let t = Arc::new(t);
+    let gate = Arc::new(ChatGate::new());
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<IrohConn>(1);
+    let acceptor = {
+        let t = t.clone();
+        let gate = gate.clone();
+        tokio::spawn(async move {
+            loop {
+                let conn = match t.accept_conn().await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("[lattice-net] accept failed: {e} — still listening");
+                        continue;
+                    }
+                };
+                if gate.try_claim() {
+                    if tx.send(conn).await.is_err() {
+                        break;
+                    }
+                } else {
+                    tokio::spawn(async move {
+                        let _ = tokio::time::timeout(NEGOTIATION_TIMEOUT, reply_busy(conn)).await;
+                    });
+                }
+            }
+        })
+    };
+
     let mut sessions: HashMap<PeerId, SecureSession> = HashMap::new();
     loop {
         eprintln!("[lattice-net] waiting for a peer to connect...");
-        let conn = match t.accept_conn().await {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("[lattice-net] accept failed: {e} — still listening");
-                continue;
-            }
+        let Some(conn) = rx.recv().await else {
+            break; // acceptor ended
         };
         let binding = channel_binding(&conn.remote_endpoint_id(), &t.endpoint_id_bytes());
-        let (peer_id, sess) = match accept_or_resume(conn, &me, &mut sessions, &binding).await {
+        let limit = NEGOTIATION_TIMEOUT;
+        let accepted = negotiate_accept(conn, &me, &mut sessions, &binding, limit).await;
+        let (peer_id, sess) = match accepted {
             Ok(x) => x,
             Err(e) => {
                 eprintln!("[lattice-net] negotiation failed: {e} — still listening");
+                gate.release();
                 continue;
             }
         };
@@ -259,8 +301,73 @@ async fn listen(me: Keypair, mut lines: StdinLines) -> Result<()> {
             }
             Err(e) => eprintln!("[lattice-net] session error: {e} — back to listening"),
         }
+        gate.release();
     }
+    acceptor.abort();
     Ok(())
+}
+
+/// Single-chat gate shared by the acceptor task and the listen loop.
+struct ChatGate(AtomicBool);
+
+impl ChatGate {
+    fn new() -> Self {
+        ChatGate(AtomicBool::new(false))
+    }
+
+    /// Atomically claim the gate; true iff it was free.
+    fn try_claim(&self) -> bool {
+        !self.0.swap(true, Ordering::AcqRel)
+    }
+
+    /// Free the gate.
+    fn release(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Send exactly one frame `[DECISION_BUSY]` without reading anything from
+/// `conn`, then drop it. Never touches identities or the session map.
+async fn reply_busy<C: Connection>(mut conn: C) -> Result<()> {
+    conn.send(&[DECISION_BUSY]).await?;
+    // Best effort: give the transport a moment to flush before the drop.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    Ok(())
+}
+
+/// `accept_or_resume` bounded by `limit`. A timed-out future is dropped
+/// mid-await; `accept_or_resume` only mutates `sessions` after its last
+/// `.await`, so a timeout leaves the map unchanged (keep it that way).
+async fn negotiate_accept<C: Connection>(
+    conn: C,
+    me: &Keypair,
+    sessions: &mut HashMap<PeerId, SecureSession>,
+    binding: &[u8],
+    limit: Duration,
+) -> Result<(PeerId, ConnectedSession<C>)> {
+    match tokio::time::timeout(limit, accept_or_resume(conn, me, sessions, binding)).await {
+        Ok(r) => r,
+        Err(_) => Err(Error::Transport(format!(
+            "negotiation timed out after {limit:?}"
+        ))),
+    }
+}
+
+/// `negotiate_dial` bounded by `limit`.
+async fn negotiate_dial_within<C: Connection>(
+    conn: C,
+    me: &Keypair,
+    peer: &PublicIdentity,
+    kept: &mut Option<SecureSession>,
+    binding: &[u8],
+    limit: Duration,
+) -> Result<ConnectedSession<C>> {
+    match tokio::time::timeout(limit, negotiate_dial(conn, me, peer, kept, binding)).await {
+        Ok(r) => r,
+        Err(_) => Err(Error::Transport(format!(
+            "negotiation timed out after {limit:?}"
+        ))),
+    }
 }
 
 /// Read the dialer's preamble; resume a kept session if asked and available,
@@ -444,6 +551,7 @@ async fn negotiate_dial<C: Connection>(
             announce_peer(&peer.peer_id(), "resumed — no re-handshake");
             Ok(ConnectedSession::resume(conn, sess))
         }
+        Some(DECISION_BUSY) => Err(Error::Transport("listener is busy".into())),
         Some(DECISION_RESUMED) => Err(Error::Verify(
             "peer sent legacy unauthenticated resume decision".into(),
         )),
@@ -470,7 +578,8 @@ async fn dial_once(
     }
     let binding = channel_binding(&t.endpoint_id_bytes(), &conn.remote_endpoint_id());
 
-    let cs = negotiate_dial(conn, me, &verified.identity, kept, &binding).await?;
+    let limit = NEGOTIATION_TIMEOUT;
+    let cs = negotiate_dial_within(conn, me, &verified.identity, kept, &binding, limit).await?;
 
     match chat(cs, lines).await {
         Ok((Outcome::PeerDisconnected, recovered)) => {
@@ -809,6 +918,120 @@ mod tests {
         assert!(r.is_err());
         assert_eq!(p[0], MODE_FRESH);
         assert!(p[1..1 + NONCE_LEN].iter().all(|b| *b == 0));
+    }
+
+    // ---- negotiation timeouts, busy reply, gate ----
+
+    const SHORT: Duration = Duration::from_millis(50);
+
+    #[test]
+    fn negotiation_constants() {
+        assert_eq!(NEGOTIATION_TIMEOUT, Duration::from_secs(15));
+        assert_eq!(DECISION_BUSY, 3);
+    }
+
+    #[tokio::test]
+    async fn silent_dialer_times_out_and_keeps_sessions() {
+        let (alice, bob) = (id(), id());
+        let mut sessions = stale(&alice, &bob);
+        let (_dial, listen) = pair().await;
+        let r = negotiate_accept(listen, &bob, &mut sessions, &bnd(), SHORT).await;
+        assert!(matches!(
+            r,
+            Err(Error::Transport(_)) | Err(Error::Verify(_))
+        ));
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions.contains_key(&alice.peer_id()));
+    }
+
+    #[tokio::test]
+    async fn resume_without_tag_times_out_and_session_still_resumes() {
+        let (alice, bob, a, b) = genuine();
+        let mut sessions = HashMap::from([(alice.peer_id(), b)]);
+        let (mut eve, listen) = pair().await;
+        eve.send(&resume_preamble(&[7u8; NONCE_LEN], &alice))
+            .await
+            .unwrap();
+        let r = negotiate_accept(listen, &bob, &mut sessions, &bnd(), SHORT).await;
+        assert!(r.is_err());
+        assert!(sessions.contains_key(&alice.peer_id()));
+        drop(eve);
+
+        // A genuine resume on a new pair still works.
+        let mut kept = Some(a);
+        let (dial, listen) = pair().await;
+        let bd = bnd();
+        let (d, l) = tokio::join!(
+            negotiate_dial(dial, &alice, bob.public(), &mut kept, &bd),
+            accept_or_resume(listen, &bob, &mut sessions, &bd)
+        );
+        assert!(d.is_ok());
+        assert!(l.is_ok());
+    }
+
+    #[tokio::test]
+    async fn fresh_without_msg1_times_out_and_keeps_sessions() {
+        let (alice, bob) = (id(), id());
+        let mut sessions = stale(&alice, &bob);
+        let (mut dial, listen) = pair().await;
+        preamble(&mut dial, MODE_FRESH, &alice).await;
+        let r = negotiate_accept(listen, &bob, &mut sessions, &bnd(), SHORT).await;
+        assert!(r.is_err());
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions.contains_key(&alice.peer_id()));
+    }
+
+    #[tokio::test]
+    async fn silent_listener_times_out_and_keeps_kept() {
+        let (alice, bob, a, _b) = genuine();
+        let mut kept = Some(a);
+        let (dial, _listen) = pair().await;
+        let r = negotiate_dial_within(dial, &alice, bob.public(), &mut kept, &bnd(), SHORT).await;
+        assert!(matches!(r, Err(Error::Transport(_))));
+        assert!(kept.is_some());
+    }
+
+    #[tokio::test]
+    async fn busy_listener_is_an_error_and_keeps_kept() {
+        let (alice, bob, a, _b) = genuine();
+        let mut kept = Some(a);
+        let (dial, mut listen) = pair().await;
+        listen.send(&[DECISION_BUSY]).await.unwrap();
+        let r = negotiate_dial(dial, &alice, bob.public(), &mut kept, &bnd()).await;
+        assert!(matches!(r, Err(Error::Transport(_))));
+        assert!(kept.is_some());
+
+        let (dial, mut listen) = pair().await;
+        listen.send(&[DECISION_BUSY]).await.unwrap();
+        let r = negotiate_dial_within(dial, &alice, bob.public(), &mut kept, &bnd(), SHORT).await;
+        assert!(matches!(r, Err(Error::Transport(_))));
+        assert!(kept.is_some());
+
+        let mut none = None;
+        let (dial, mut listen) = pair().await;
+        listen.send(&[DECISION_BUSY]).await.unwrap();
+        let r = negotiate_dial(dial, &alice, bob.public(), &mut none, &bnd()).await;
+        assert!(matches!(r, Err(Error::Transport(_))));
+        assert!(none.is_none());
+    }
+
+    #[tokio::test]
+    async fn reply_busy_sends_one_byte_and_closes() {
+        let alice = id();
+        let (mut dial, listen) = pair().await;
+        preamble(&mut dial, MODE_FRESH, &alice).await; // stays unread
+        reply_busy(listen).await.unwrap();
+        assert_eq!(dial.recv().await.unwrap(), [DECISION_BUSY]);
+        assert!(dial.recv().await.is_err());
+    }
+
+    #[test]
+    fn chat_gate_claims_once_until_released() {
+        let g = ChatGate::new();
+        assert!(g.try_claim());
+        assert!(!g.try_claim());
+        g.release();
+        assert!(g.try_claim());
     }
 
     // ---- channel binding ----

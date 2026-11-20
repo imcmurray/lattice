@@ -211,4 +211,126 @@ mod tests {
         assert!(log.get(0).unwrap().is_some());
         assert!(log.get(1).unwrap().is_none());
     }
+
+    // ---- real signatures (lattice-identity, dev-dependency only) ----
+
+    use lattice_core::CryptoSuite;
+    use lattice_identity::Keypair;
+
+    fn keypair(suite: CryptoSuite) -> Keypair {
+        Keypair::generate(suite).unwrap()
+    }
+
+    /// A 3-entry log appended by `kp`, bound to `kp`'s public identity.
+    fn real_log(kp: &Keypair) -> MemLog {
+        let mut log = MemLog::new(kp.public().clone());
+        for p in [&b"one"[..], b"two", b"three"] {
+            log.append(p, kp).unwrap();
+        }
+        log
+    }
+
+    #[test]
+    fn real_hybrid_chain_verifies() {
+        let kp = keypair(CryptoSuite::Hybrid);
+        let log = real_log(&kp);
+        assert_eq!(log.len(), 3);
+        log.verify().expect("a genuine hybrid chain must verify");
+    }
+
+    #[test]
+    fn zeroed_or_empty_signature_fails_at_every_index() {
+        let kp = keypair(CryptoSuite::Hybrid);
+        for i in 0..3 {
+            let mut log = real_log(&kp);
+            let len = log.entries[i].sig.0.len();
+            log.entries[i].sig = Signature(vec![0u8; len]);
+            assert!(log.verify().is_err(), "zero sig at {i}");
+
+            let mut log = real_log(&kp);
+            log.entries[i].sig = Signature(vec![]);
+            assert!(log.verify().is_err(), "empty sig at {i}");
+        }
+    }
+
+    #[test]
+    fn signature_from_another_key_fails() {
+        let (kp, other) = (keypair(CryptoSuite::Hybrid), keypair(CryptoSuite::Hybrid));
+        for i in 0..3 {
+            let mut log = real_log(&kp);
+            let hash = log.entries[i].hash;
+            log.entries[i].sig = other.sign(&hash);
+            assert!(log.verify().is_err(), "foreign sig at {i}");
+        }
+    }
+
+    #[test]
+    fn changed_payload_or_hash_fails() {
+        let kp = keypair(CryptoSuite::Hybrid);
+        for i in 0..3 {
+            let mut log = real_log(&kp);
+            log.entries[i].payload = b"forged".to_vec();
+            assert!(log.verify().is_err(), "payload at {i}");
+
+            let mut log = real_log(&kp);
+            log.entries[i].hash[0] ^= 1;
+            assert!(log.verify().is_err(), "hash at {i}");
+
+            // A forged hash re-signed by the real author still fails.
+            let mut log = real_log(&kp);
+            log.entries[i].hash = [0xAA; 32];
+            let h = log.entries[i].hash;
+            log.entries[i].sig = kp.sign(&h);
+            assert!(log.verify().is_err(), "re-signed hash at {i}");
+        }
+    }
+
+    #[test]
+    fn chain_by_one_identity_fails_under_another() {
+        let (a, b) = (keypair(CryptoSuite::Hybrid), keypair(CryptoSuite::Hybrid));
+        let log = real_log(&a);
+        let wrong = MemLog {
+            author: Box::new(b.public().clone()),
+            entries: log.entries.clone(),
+        };
+        assert!(wrong.verify().is_err());
+
+        let mut a_log = MemLog::new(a.public().clone());
+        assert!(a_log.append(b"x", &b).is_err());
+    }
+
+    #[test]
+    fn classical_chain_does_not_verify_under_hybrid_twin() {
+        let c = keypair(CryptoSuite::Classical);
+        let h = Keypair::from_mnemonic(CryptoSuite::Hybrid, c.mnemonic()).unwrap();
+        assert_ne!(c.peer_id(), h.peer_id());
+        let log = real_log(&c);
+        log.verify().expect("classical chain under classical key");
+
+        // As-is: the author check fails.
+        let twin = MemLog {
+            author: Box::new(h.public().clone()),
+            entries: log.entries.clone(),
+        };
+        assert!(twin.verify().is_err());
+
+        // Re-chained onto the hybrid PeerId, keeping the classical signatures:
+        // only the signature check can reject it.
+        let mut entries = log.entries.clone();
+        let mut prev = [0u8; 32];
+        for e in entries.iter_mut() {
+            e.author = h.peer_id();
+            e.prev_hash = prev;
+            e.hash = entry_hash(e.seq, &e.author, &e.prev_hash, &e.payload);
+            prev = e.hash;
+        }
+        let rechained = MemLog {
+            author: Box::new(h.public().clone()),
+            entries,
+        };
+        match rechained.verify() {
+            Err(Error::Verify(m)) => assert!(m.contains("bad signature"), "{m}"),
+            other => panic!("expected a signature failure, got {other:?}"),
+        }
+    }
 }

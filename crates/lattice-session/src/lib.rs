@@ -333,7 +333,8 @@ impl PendingInitiator {
 
         // Double Ratchet init (initiator): the responder's ephemeral is DHr.
         let dhr = resp.eph_r;
-        let (rk, cks) = kdf_rk(&sk, &dh(&ratchet_secret, &dhr));
+        let dh_first = nonzero(dh(&ratchet_secret, &dhr))?;
+        let (rk, cks) = kdf_rk(&sk, &dh_first);
         Ok(SecureSession {
             core: RatchetCore {
                 rk,
@@ -663,17 +664,22 @@ fn skip_recv(
 /// Perform a DH ratchet step on the scratch state: re-key the root from the
 /// peer's new ratchet public key, reset chains, and generate our next key.
 fn dh_ratchet(w: &mut RatchetCore, their_pub: [u8; 32]) -> Result<()> {
+    // Both DH outputs are checked before `w` is touched: an all-zero (low-order)
+    // peer key is rejected without changing any state.
+    let dh_recv = nonzero(dh(&w.dhs, &their_pub))?;
+    let (new_dhs, new_pub) = gen_ratchet_key()?;
+    let dh_send = nonzero(dh(&new_dhs, &their_pub))?;
+
     w.pn = w.ns;
     w.ns = 0;
     w.nr = 0;
     w.dhr = Some(their_pub);
 
-    let (rk1, ckr) = kdf_rk(&w.rk, &dh(&w.dhs, &their_pub));
+    let (rk1, ckr) = kdf_rk(&w.rk, &dh_recv);
     w.rk = rk1;
     w.ckr = Some(ckr);
 
-    let (new_dhs, new_pub) = gen_ratchet_key()?;
-    let (rk2, cks) = kdf_rk(&w.rk, &dh(&new_dhs, &their_pub));
+    let (rk2, cks) = kdf_rk(&w.rk, &dh_send);
     w.rk = rk2;
     w.cks = Some(cks);
     w.dhs = new_dhs;
@@ -1637,6 +1643,94 @@ mod tests {
             SecureSession::respond(&bob, alice.public(), B, &m1),
             Err(Error::Verify(_))
         ));
+    }
+
+    // ---- handshake hardening ----
+
+    #[test]
+    fn zero_eph_i_is_rejected_even_when_resigned() {
+        let (alice, bob) = (id(), id());
+        let (mut m1, _) = SecureSession::initiate(&alice, bob.public(), B).unwrap();
+        m1.eph_i = [0u8; 32];
+        m1.sig_i = alice.sign(&t1_of(&m1, B, &alice, &bob));
+        assert!(matches!(
+            SecureSession::respond(&bob, alice.public(), B, &m1),
+            Err(Error::Verify(_))
+        ));
+    }
+
+    #[test]
+    fn zero_ratchet_pub_i_is_rejected_even_when_resigned() {
+        let (alice, bob) = (id(), id());
+        let (mut m1, _) = SecureSession::initiate(&alice, bob.public(), B).unwrap();
+        m1.ratchet_pub_i = [0u8; 32];
+        m1.sig_i = alice.sign(&t1_of(&m1, B, &alice, &bob));
+        assert!(matches!(
+            SecureSession::respond(&bob, alice.public(), B, &m1),
+            Err(Error::Verify(_))
+        ));
+    }
+
+    /// Re-sign a msg2 under `bob` over the T2 built from its current fields.
+    fn resign_m2(m1: &HandshakeInit, m2: &mut HandshakeResp, a: &Keypair, b: &Keypair) {
+        let mut prefix = t1_of(m1, B, a, b);
+        put_lp(&mut prefix, &m1.sig_i.0);
+        m2.sig_r = b.sign(&transcript_t2(&prefix, &m2.eph_r, &m2.kem_ct_e));
+    }
+
+    #[test]
+    fn zero_eph_r_is_rejected_even_when_resigned() {
+        let (alice, bob) = (id(), id());
+        let (m1, pending) = SecureSession::initiate(&alice, bob.public(), B).unwrap();
+        let (mut m2, _) = SecureSession::respond(&bob, alice.public(), B, &m1).unwrap();
+        m2.eph_r = [0u8; 32];
+        resign_m2(&m1, &mut m2, &alice, &bob);
+        assert!(matches!(pending.finish(&m2), Err(Error::Verify(_))));
+    }
+
+    #[test]
+    fn zero_ratchet_header_is_rejected_without_desync() {
+        let (mut a, mut b) = pair();
+        let mut frame = vec![0u8; 32];
+        frame.extend_from_slice(&0u64.to_le_bytes());
+        frame.extend_from_slice(&0u64.to_le_bytes());
+        frame.extend_from_slice(&[0u8; 32]);
+        assert!(matches!(b.open(&frame), Err(Error::Verify(_))));
+        let ct = a.seal(b"still fine").unwrap();
+        assert_eq!(b.open(&ct).unwrap(), b"still fine");
+        let ct = b.seal(b"and back").unwrap();
+        assert_eq!(a.open(&ct).unwrap(), b"and back");
+    }
+
+    #[test]
+    fn hybrid_responder_rejects_emptied_kem_ct_e() {
+        let (alice, bob) = (id(), id());
+        let (m1, pending) = SecureSession::initiate(&alice, bob.public(), B).unwrap();
+        let (mut m2, _) = SecureSession::respond(&bob, alice.public(), B, &m1).unwrap();
+        m2.kem_ct_e.clear();
+        resign_m2(&m1, &mut m2, &alice, &bob);
+        assert!(matches!(pending.finish(&m2), Err(Error::Verify(_))));
+    }
+
+    #[test]
+    fn mixed_suite_classical_initiator_hybrid_responder_uses_pq_legs() {
+        let (alice, bob) = (classical(), id());
+        let (m1, m2, mut a, mut b) = handshake(&alice, &bob, B);
+        assert!(!m1.kem_ct_s.is_empty());
+        assert!(!m1.kem_ek_i.is_empty());
+        assert!(!m2.kem_ct_e.is_empty());
+        let ct = a.seal(b"c2h").unwrap();
+        assert_eq!(b.open(&ct).unwrap(), b"c2h");
+        let ct = b.seal(b"h2c").unwrap();
+        assert_eq!(a.open(&ct).unwrap(), b"h2c");
+    }
+
+    #[test]
+    fn reflected_msg1_is_rejected() {
+        let (alice, bob) = (id(), id());
+        let (m1, _) = SecureSession::initiate(&alice, bob.public(), B).unwrap();
+        assert!(SecureSession::respond(&alice, bob.public(), B, &m1).is_err());
+        assert!(SecureSession::respond(&alice, alice.public(), B, &m1).is_err());
     }
 
     #[test]

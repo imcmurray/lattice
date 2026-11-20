@@ -14,4 +14,8 @@ workspace = true
 lattice-core = { path = "../lattice-core" }
 blake3 = "1"
 # Signature verification consumes any `lattice_core::Verify` (the author's
-# public identity) — no dependency on the concrete identity crate needed.
+# public identity) — no normal dependency on the concrete identity crate needed.
+
+[dev-dependencies]
+# Tests only: exercise the log with real hybrid/classical signatures.
+lattice-identity = { path = "../lattice-identity" }

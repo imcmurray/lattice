@@ -2,7 +2,7 @@
 
 > **Working codename:** *Lattice* (a P2P mesh; placeholder, easy to rename).
 > **One line:** A 100% Rust, security-forward peer-to-peer application framework — the Holepunch/Keet model, redesigned with clean trait boundaries, post-quantum-hybrid identity, and a transport substrate you can swap.
-> **Status:** v0.1 implemented (local git, no remote). This doc is both the design contract and a map of what's built — per-section notes and the §5.1 status table mark done vs pending. The full stack (identity, signed log, hybrid-KEM + Double-Ratchet session, capabilities, in-memory + iroh transport) is implemented and tested; the `lattice-net` CLI does real two-device chat.
+> **Status:** v0.1 implemented (local git, no remote). This doc is both the design contract and a map of what's built — per-section notes and the §5.1 status table mark done vs pending. The stack (identity, signed log, hybrid-KEM + Double-Ratchet session, single-hop capabilities, in-memory + iroh transport) is implemented and tested; the `lattice-net` CLI does two-device chat. It is experimental and **not externally audited**; §5, §5.1, §6.4, §6.5 and SECURITY.md list the known limitations.
 
 ---
 
@@ -58,10 +58,10 @@ It is explicitly a **framework for others to build on**, not a single app. The n
 │  append-only signed log + CRDT merge → replicated state     │  ← we hand-build
 ├───────────────────────────────────────────────────────────┤
 │  Session crypto (lattice-session)                           │
-│  hybrid-KEM handshake + Double Ratchet (FS + PCS)           │
+│  signed hybrid handshake + Double Ratchet (FS + PCS)        │
 ├───────────────────────────────────────────────────────────┤
 │  Identity (lattice-identity)                                │
-│  PQ-hybrid keypair = identity; rotation, multi-device       │
+│  PQ-hybrid keypair = identity; device certs (multi-device)  │
 ├───────────────────────────────────────────────────────────┤
 │  Transport TRAIT (lattice-transport)                        │  ← the swap seam
 │    impls: in-memory + iroh QUIC (relay, holepunch)          │
@@ -76,11 +76,11 @@ Dependencies point downward only. No layer reaches around another. The `Transpor
 
 ### 3.1 Layer responsibilities (brief)
 - **core** — error type, ID/hash types, the trait definitions, crypto-suite enum (`Classical`, `Hybrid`), feature flags.
-- **transport** — `connect(peer) → Stream`, `accept() → Stream`, peer discovery by topic, relay fallback. Hides NAT traversal entirely.
-- **identity** — generate/load a hybrid keypair; derive a stable `PeerId`; sign/verify; key rotation + multi-device linkage.
+- **transport** — `connect(addr) → Conn`, `accept() → (addr, Conn)`, peer discovery by topic, relay fallback. Hides NAT traversal entirely. Addresses are transport-specific and are not identities.
+- **identity** — generate/load a hybrid keypair; derive a stable `PeerId`; sign/verify; root→device certificates (multi-device linkage). Key rotation is planned, not implemented.
 - **session** — turn a raw transport stream into an authenticated, encrypted, forward-secret channel between two identities.
 - **log** — the append-only signed log: append, verify, replicate, and a merge strategy for concurrent writers (CRDT). The state engine.
-- **caps** — mint/verify/attenuate/revoke capability tokens that gate who may read or append to a given log/room.
+- **caps** — mint/verify single-hop signed capability tokens that gate who may read or append to a given log/room. Attenuation chains, expiry and revocation are not implemented.
 - **app API** — `Room`/`Document` abstractions, subscription/event stream, the thing example apps and third parties import.
 
 ---
@@ -104,11 +104,12 @@ pub trait Connection: Send {         // an established channel carrying framed m
     async fn recv(&mut self) -> Result<Vec<u8>>;
 }
 pub trait Transport {                // the swap seam — MemoryTransport today, IrohTransport (feature)
+    type Addr;                       // transport address; NOT an identity (ADR-011)
     type Conn: Connection;
-    async fn connect(&self, peer: &PeerId) -> Result<Self::Conn>;
-    async fn accept(&self) -> Result<(PeerId, Self::Conn)>;
+    async fn connect(&self, addr: &Self::Addr) -> Result<Self::Conn>;
+    async fn accept(&self) -> Result<(Self::Addr, Self::Conn)>;
     async fn announce(&self, topic: &Topic) -> Result<()>;
-    async fn lookup(&self, topic: &Topic) -> Result<Vec<PeerId>>;
+    async fn lookup(&self, topic: &Topic) -> Result<Vec<Self::Addr>>;
 }
 
 pub trait Session {                  // an encrypted channel (ConnectedSession impls it)
@@ -136,14 +137,35 @@ Why `Identity`/`Verify` are split: a signature can't be checked against a `PeerI
 |---|---|---|---|
 | Identity signatures | Ed25519 | ML-DSA (Dilithium) | hybrid sig = both must verify |
 | Key agreement | X25519 | ML-KEM (Kyber) | hybrid KEM, combined into one shared secret |
-| Session handshake | Noise (XX/IK pattern) | — over hybrid KEM | mutual auth, identity-hiding from passive observers |
-| Forward secrecy | Double-Ratchet (Signal-style) | — | per-message key evolution |
-| Hashing / IDs | BLAKE3 | — | log entry hashes, content addressing |
-| AEAD | ChaCha20-Poly1305 | — | record encryption |
+| Session handshake | X25519 (two DHs) + HKDF-SHA256 | ML-KEM-768 (two encapsulations) | `lattice-session-hs-v3`: Lattice's own two-message handshake, signed by both sides with the hybrid identity signatures. No identity hiding |
+| Forward secrecy / PCS | Double Ratchet: X25519 DH ratchet, HKDF-SHA256 root/chain KDFs | — | per-message key evolution; the healing leg is classical |
+| Record encryption | ChaCha20-Poly1305 | — | per-message key; the ratchet header is the AAD |
+| Resume proofs | HMAC-SHA256 | — | `lattice-resume-v2`, keyed from the session root |
+| Signature domain | — | — | `lattice-sig-v2`: signatures bind the signer's suite and PeerId |
+| Tickets | hybrid signature | — | `lattice-ticket-v1`: signed iroh endpoint id + identity |
+| Hashing / IDs | BLAKE3 | — | log entry hashes, PeerId, content addressing |
 
 Hybrid construction rule: **a hybrid primitive is secure if *either* component is secure.** We never ship PQ-only (immature) or classical-only (harvest-now-decrypt-later risk). This reuses the Kyber+Ed25519 pattern already proven in ShadowWhisper, now using NIST-standardized ML-KEM/ML-DSA names.
 
-Crate status: **pinned & wired** in `lattice-identity` — `ed25519-dalek` 2, `x25519-dalek` 2, `ml-dsa` 0.1 (FIPS 204), `ml-kem` 0.3 (FIPS 203), `bip39` 2, `hkdf`/`sha2`, `blake3`, `zeroize`. **Still to pin** for `lattice-session`: `snow` (Noise) and `chacha20poly1305` (AEAD). All RustCrypto-family where possible for audit-surface consistency.
+**The v3 handshake (`lattice-session-hs-v3`).** Two messages:
+- msg1 (initiator → responder) = `eph_i, ratchet_pub_i, kem_ct_s, kem_ek_i, sig_i`.
+- msg2 (responder → initiator) = `eph_r, kem_ct_e, sig_r`.
+
+Four secrets are mixed: `ss1` = X25519(eph_i, responder static key); `ss2` = ML-KEM encapsulation to the responder's static key; `ss3` = X25519(eph_i, eph_r); `ss4` = ML-KEM encapsulation to the initiator's ephemeral `kem_ek_i`. `ss2` and `ss4` exist only when the responder is Hybrid (§5.1). The transcript is `T1` = domain ‖ lp(binding) ‖ both identities ‖ eph_i ‖ ratchet_pub_i ‖ lp(kem_ct_s) ‖ lp(kem_ek_i); then `T2` = T1 ‖ lp(sig_i) ‖ eph_r ‖ lp(kem_ct_e); then `T` = T2 ‖ lp(sig_r). The root key is `HKDF(salt = T, ikm = ss1 ‖ ss2 ‖ ss3 ‖ ss4)`. Both sides sign: the initiator signs `T1`, the responder signs `T2`. Each side verifies the peer's signature **before** any DH or decapsulation. The `nonzero` check rejects all-zero X25519 outputs, including on every ratchet DH step. Ephemeral secrets are erased after the handshake (the ephemeral ML-KEM key is zeroized on drop).
+
+The `binding` is supplied by the caller. `lattice-net` uses `lattice-net-cb-v1` ‖ dialer endpoint id ‖ listener endpoint id, so a handshake or resume proof cannot be replayed onto another QUIC connection.
+
+**Double Ratchet.** The root key seeds a Double Ratchet. Out-of-order and dropped frames use a skipped-key cache bounded by `MAX_SKIP` (1000 per step) and `MAX_SKIPPED_KEYS` (2048 total, FIFO-evicted). `open` skips and ratchets on a scratch copy of the state and commits only after the AEAD verifies, so a forged frame cannot advance or desync the ratchet.
+
+**Resume proofs.** A reconnecting `lattice-net` dialer can resume a kept session only after both sides exchange an HMAC-SHA256 proof (`lattice-resume-v2`). The proof key is derived from the session root. The MAC covers both nonces, both identities, the role and the endpoint binding. Resume does not change the ratchet.
+
+**Identity-bound signatures and tickets.** Signatures (`lattice-sig-v2`) cover the signer's crypto suite and PeerId, so a signature cannot move between the Classical and Hybrid identities derived from one mnemonic. A `lattice-net` ticket (`lattice-ticket-v1`) is signed by the listener's identity over its iroh endpoint id; the dialer verifies it before dialing and checks that it reached that endpoint.
+
+**Parsing and limits.** Public identities and signatures are parsed canonically and strictly (trailing bytes, wrong lengths, invalid keys and small-order Ed25519 keys are rejected). Frames and handshake data are capped at 64 KiB: `MAX_FRAME_LEN` in the iroh framing, and `MAX_HANDSHAKE_LEN` per handshake message and per field. The identity store fails closed: a keyring error other than "no entry" is fatal, and nothing is generated or written.
+
+Crate status: `lattice-identity` uses `ed25519-dalek` 2, `x25519-dalek` 2, `ml-dsa` 0.1 (FIPS 204), `ml-kem` 0.3 (FIPS 203), `bip39` 2, `hkdf`/`sha2`, `blake3` and `zeroize`. `lattice-session` uses `x25519-dalek` 2, `chacha20poly1305` 0.10, `hkdf`, `hmac`, `sha2` and `zeroize`. RustCrypto-family crates throughout, for audit-surface consistency.
+
+Note on duplicate versions: `ed25519-dalek 3.0.0-rc.0` appears in `Cargo.lock` because iroh 1.0.1 uses it for its transport keys. Lattice identities use `ed25519-dalek` 2.x. The duplicate goes away with an iroh upgrade.
 
 ### 5.1 Post-quantum posture
 
@@ -151,9 +173,11 @@ Crate status: **pinned & wired** in `lattice-identity` — `ed25519-dalek` 2, `x
 
 **Design rules (binding):**
 - **Hybrid, never PQ-only or classical-only.** Every primitive pairs a vetted classical scheme with a NIST-standardized PQ scheme. Security holds if *either* component holds — hedging both PQ immaturity and quantum risk.
-- **KDF combiner, never XOR.** A hybrid shared secret is combined as `HKDF(ss_classical ‖ ss_pq ‖ transcript)`. Hybrid signatures require **every** component to verify (AND, not OR).
+- **KDF combiner, never XOR.** The session root is `HKDF(salt = transcript, ikm = ss1 ‖ ss2 ‖ ss3 ‖ ss4)` (see §5). Hybrid signatures require **every** component to verify (AND, not OR).
 - **Standardized algorithms only:** ML-KEM (FIPS 203), ML-DSA (FIPS 204), via audited RustCrypto crates. No bespoke or pre-standard schemes; we do not roll our own.
-- **Crypto-agility is mandatory.** The `CryptoSuite` tag is bound into the `PeerId`; signatures are length-prefixed; HKDF is domain-separated. A new suite (e.g. ML-KEM-1024, or a replacement if ML-DSA is weakened) must be introduceable via negotiation without breaking existing identities.
+- **Crypto-agility is mandatory.** The `CryptoSuite` tag is bound into the `PeerId`; signatures are length-prefixed; HKDF is domain-separated. A new suite (e.g. ML-KEM-1024, or a replacement if ML-DSA is weakened) must be introduceable via negotiation without breaking existing identities. There is no suite negotiation today.
+
+**Suites in the session.** The `Classical` suite exists (Ed25519 + X25519 only). The session's PQ legs (`ss2`, `ss4`) are on if and only if the **responder** is Hybrid. A Classical initiator talking to a Hybrid responder still gets both PQ legs; a Classical responder gets none, whatever the initiator is. The ratchet's healing leg is classical X25519.
 
 **Status by layer:**
 
@@ -161,15 +185,15 @@ Crate status: **pinned & wired** in `lattice-identity` — `ed25519-dalek` 2, `x
 |---|---|---|
 | Identity signatures | Ed25519 + ML-DSA-65 hybrid (AND-verify) | **Done** |
 | Identity key material | carries X25519 + ML-KEM-768 public keys | **Done** (keys derived & published) |
-| Session confidentiality | hybrid KEM (X25519 + ML-KEM-768) → HKDF combiner → Double Ratchet → ChaCha20-Poly1305 | **Done** — handshake + Double Ratchet (forward secrecy + post-compromise security) + bounded skipped-key cache (out-of-order / dropped frames) |
-| Access control | UCAN-style signed capabilities (offline-verifiable) | **Done** — single-hop grants; multi-hop delegation pending |
+| Session | v3 handshake: both sides sign the transcript; X25519 + ML-KEM-768 (when the responder is Hybrid) → HKDF(salt = transcript) → Double Ratchet → ChaCha20-Poly1305 | **Done** — `lattice-session-hs-v3` + Double Ratchet (forward secrecy + post-compromise security) + bounded skipped-key cache + resume proofs |
+| Access control | UCAN-style signed capabilities (offline-verifiable) | **Done** — single-hop grants; no attenuation chain, expiry or revocation |
 | Transport (iroh/QUIC-TLS) | independent; app-layer session crypto is the real protection | out of our hands; do not rely on it for E2E |
-| Capabilities | signed with the hybrid identity | inherited once caps sign via `Identity` |
+| Capabilities | signed via the `Identity` trait, so hybrid when the issuer is Hybrid | **Done** |
 
 **Caveats recorded honestly:**
 - **PQ ≠ forward secrecy** — orthogonal, and the session has both axes: the PQ-hybrid handshake protects the *initial* secret; the Double Ratchet provides per-message *forward secrecy* (symmetric chain) and *post-compromise security* (DH ratchet re-keys the root each direction flip). Out-of-order / dropped frames are handled by a bounded skipped-key cache (`MAX_SKIP` per step, FIFO-evicted total), and `open` skips/ratchets on a scratch copy committed only on AEAD success — so a forged header can't advance the ratchet. Note the DH ratchet's healing leg is classical X25519 — fully-PQ ratcheting remains open research.
 - **Size/bandwidth cost is real** — ML-DSA-65 signatures ≈ 3.3 KB and ML-KEM-768 keys ≈ 1.2 KB, vs. 64 B for Ed25519. In a system that gossips keys and signs every log entry this is a genuine budget; measure early and consider signing batch roots rather than every entry.
-- **Until the session KEM lands, message confidentiality is classical-only and therefore HNDL-exposed.** This is the next PQ priority.
+- **The ratchet's healing leg is classical.** After the handshake, post-compromise recovery relies on X25519 only; an adversary with a CRQC who recorded the traffic and later compromises a session state could follow the ratchet. A PQ ratchet is not implemented.
 
 ---
 
@@ -202,18 +226,30 @@ Crate status: **pinned & wired** in `lattice-identity` — `ed25519-dalek` 2, `x
 
 | Threat | Where | Vector | Mitigation |
 |---|---|---|---|
-| **S**poofing identity | Peer/Discovery | Claim to be another `PeerId` | Identity = public key; every entry signed (hybrid); session handshake binds stream to verified identity |
+| **S**poofing identity | Peer/Discovery | Claim to be another `PeerId` | Identity = public key; every entry signed (hybrid); the v3 handshake has mutual transcript signatures and a caller-supplied channel binding; `lattice-net` tickets are signed; first contact is TOFU with a manual fingerprint comparison |
 | **T**ampering content | Transport/Peer | Alter messages/log entries in flight or at rest | AEAD per record; append-only log is a signed hash chain — any edit breaks verification, `verify()` fails closed |
 | **R**epudiation | Peer | "I never wrote that" | Per-entry hybrid signatures are non-repudiable within a room |
-| **I**nfo disclosure | Transport/Relay | Read plaintext | E2E AEAD; relay sees only ciphertext + endpoints; Noise hides peer identities from passive `N` |
-| **I**nfo disclosure (metadata) | Discovery/Relay | Learn who talks to whom | **v1: accepted risk (A7 deferred).** v2: tor/mix `Transport` impl |
-| **D**enial of service | Transport/Discovery | Drop/flood/eclipse | Relay fallback for reachability; cap-gated writes limit spam; Sybil-resistance hooks (see §6.6) |
-| **E**levation of privilege | Caps | Forge/replay a capability to gain write/admin | Caps are signed, attenuable, audience- and action-scoped; revocation via epoch bump; verified locally, no server to trick |
+| **I**nfo disclosure | Transport/Relay | Read plaintext | E2E AEAD; relay sees only ciphertext + endpoints. Identities are **not** hidden: they are sent in the clear (the `lattice-net` preamble carries the dialer's identity bundle, the ticket carries the listener's), so a passive observer of the handshake can learn them |
+| **I**nfo disclosure (metadata) | Discovery/Relay | Learn who talks to whom | **v1: accepted risk (A7 deferred).** Metadata is not hidden. v2: tor/mix `Transport` impl |
+| **D**enial of service | Transport/Discovery | Drop/flood/eclipse | Relay fallback for reachability; cap-gated writes limit spam; 64 KiB caps on frames and handshake fields; `MAX_SKIP` bounds ratchet work; `lattice-net` limits each pre-chat step to 15 s and answers a connection that arrives during a chat with a one-byte busy reply; Sybil-resistance hooks (see §6.6). Residual: `IrohTransport::accept_conn` has no timeout of its own, so a peer that completes QUIC but never opens a stream can still delay the acceptor task |
+| **E**levation of privilege | Caps | Forge/replay a capability to gain write/admin | Caps are signed and audience- and action-scoped, and verified locally (no server to trick). They are single-hop: no attenuation chain, no expiry and no revocation |
 
 ### 6.5 Key compromise handling
 - **Session key leak** → Double-Ratchet limits blast radius to a window of messages, not the whole history (forward secrecy + post-compromise recovery as the ratchet heals).
-- **Identity key leak** → rotation: publish a signed rotation entry from the old key naming the new key; peers update binding. Multi-device uses per-device subkeys linked under the identity so losing one device ≠ losing the identity.
-- **Recovery** → social/multi-device recovery (no server to reset against). **Open question (§8):** exact recovery UX. This is the sharpest tradeoff in keypair-as-identity systems and we will not hand-wave it.
+- **Identity key leak** → forward secrecy protects recorded sessions, but the attacker can impersonate the owner in new sessions. No rotation or revocation mechanism is implemented. Device certificates (`lattice-device-cert-v2`) bind the full device identity and carry a mandatory `not_after`; they have no revocation, so a leaked device key stays valid until `not_after`. `lattice-net` uses the root identity directly as its everyday key.
+- **Resume** → anyone holding the session state (for example a compromised device) can resume that session; resuming requires the mutual proof, which is derived from that state.
+- **Recovery** → the BIP39 mnemonic (ADR-004); there is no server to reset against and no guardian scheme. **Open question (§8):** exact recovery UX. This is the sharpest tradeoff in keypair-as-identity systems and we will not hand-wave it.
+
+**Known limitations** (SECURITY.md lists the same items):
+- (a) Device certs have no revocation: a leaked device key stays valid until its `not_after`.
+- (b) `lattice-net` uses the root identity as its everyday key; device keys are not wired into it.
+- (c) Tickets are reachability bearer tokens: anyone holding one can try to connect.
+- (d) TOFU fingerprint comparison is manual; nothing enforces that the user does it.
+- (e) Metadata (who talks to whom) is not hidden.
+- (f) A compromised identity can impersonate its owner in new sessions.
+- (g) Resume requires, and is available to anyone holding, the session state.
+- (h) No identity hiding: identities are sent in the clear in the preamble and ticket.
+- (i) Capabilities are single-hop, with no expiry or revocation.
 
 ### 6.6 Sybil / eclipse posture (v1 best-effort)
 No server means no central rate-limiter. v1 mitigations: capability-gated writes (uninvited peers can't append), proof-of-membership before relay assistance, and pluggable peer-scoring hooks. Strong Sybil resistance is acknowledged as **hard and partial** in v1 — documented, not pretended away.
@@ -222,11 +258,13 @@ No server means no central rate-limiter. v1 mitigations: capability-gated writes
 Rooted/compromised device; nation-state traffic-analysis of the social graph (A7); global consensus/double-spend concerns (no ledger); legal compulsion of a participant to hand over their own keys; denial-of-availability when *all* holders of a dataset are offline (inherent to P2P — mitigated by optional always-on "pinning" peers, not solved).
 
 ### 6.8 Security non-negotiables (acceptance gates)
-- No code path sends A1 content unencrypted. (test-enforced)
-- `Log::verify()` rejects any tampered chain. (test-enforced)
-- No `unsafe` in authored crates. (`#![forbid(unsafe_code)]` + CI)
-- `cargo-deny`, `cargo-audit` green in CI; deps pinned; `cargo-vet` for review provenance.
-- Reproducible, signed release artifacts.
+Enforcement status of each gate today:
+- No A1 content unencrypted: holds for the session API (`SecureSession` / `ConnectedSession` only send AEAD frames). Applications that use a `Connection` directly, as `lattice-net` does for its preamble and resume frames, send those bytes unencrypted; they carry identities and nonces, not chat content. Not enforced by a dedicated test.
+- `Log::verify()` rejects tampered chains: test-enforced, including with real hybrid and classical signatures.
+- No `unsafe` in authored crates: `forbid(unsafe_code)` is a workspace lint.
+- fmt, clippy and tests run in CI, and so does `cargo-deny` (`.github/workflows/ci.yml`).
+- `cargo-audit` and `cargo-vet`: not in CI.
+- Reproducible, signed release artifacts: not done.
 
 ---
 
@@ -255,9 +293,15 @@ Lattice/                  (cargo workspace root)
 - **ADR-001 (decided):** Delegate transport/NAT/holepunch to **iroh** behind a `Transport` trait, rather than reimplementing a DHT + QUIC + holepunching. Rationale: that layer is where subtle security/reliability bugs concentrate; n0 has years invested; the trait keeps us free to swap. *Cost accepted: a large dependency we don't control.* **Status:** the `Transport`/`Connection`/`Session` async traits are real, with an in-memory loopback impl (`MemoryTransport`) and `ConnectedSession` running the full handshake + Double Ratchet over a `Connection` — tested end-to-end. The iroh QUIC backend (`IrohTransport`) now implements the same trait — framed bi-streams, n0 relays + discovery, ticket-based dialing — and ships with the `lattice-net` CLI for real two-device chat. (The build/dev sandbox can't reach iroh's relay network, so the networked path is verified by compilation + the in-memory end-to-end test here; the actual cross-machine run is exercised on real infrastructure.)
 - **ADR-002 (open):** CRDT choice for multi-writer room state — bespoke set-of-logs merge vs. adopting `automerge`/`yrs`. Tradeoff: control & footprint vs. proven convergence.
 - **ADR-003 (decided):** **UCAN-style** signed capabilities over macaroons. Each capability is signed by the issuer's identity key and verified offline against the issuer's public identity — reusing the hybrid signatures and needing no shared secret (macaroons' HMAC root secret doesn't fit a no-central-server P2P model). *v1:* single-hop signed grant binding issuer/audience/resource/action. *Pending:* multi-hop delegation with attenuation (the body layout and `Action` ordering are already shaped for it).
-- **ADR-004 (decided):** **Deterministic identity from a BIP39 mnemonic + root→device delegation.** Master seed (mnemonic) → HKDF-SHA256 with per-algorithm domain labels → Ed25519 / X25519 / ML-DSA / ML-KEM keypairs; `PeerId = BLAKE3(canonical public-key bundle)`, so the same mnemonic reproduces the same identity. *Recovery* = re-enter the mnemonic (offline, no guardians). *Multi-device* = each device holds a fresh signing key authorized by a root-signed `DeviceCert`; lose-a-device → revoke, lose-all → restore from mnemonic. *Rejected:* social/Shamir as the v1 default (online-guardian + UX cost) → deferred to an optional `lattice-recovery` module; device-linking-only (no seed) → no offline floor for total device loss. *Cost accepted:* the mnemonic is a long-lived root secret — mitigated by offline custody, day-to-day signing via device subkeys, and session-layer forward secrecy.
+- **ADR-004 (decided):** **Deterministic identity from a BIP39 mnemonic + root→device delegation.** Master seed (mnemonic) → HKDF-SHA256 with per-algorithm domain labels → Ed25519 / X25519 / ML-DSA / ML-KEM keypairs; `PeerId = BLAKE3(canonical public-key bundle)`, so the same mnemonic reproduces the same identity. *Recovery* = re-enter the mnemonic (offline, no guardians). *Multi-device* = each device holds a fresh signing key authorized by a root-signed `DeviceCert`; lose-a-device → no revocation yet (the cert expires at `not_after`), lose-all → restore from mnemonic. *Rejected:* social/Shamir as the v1 default (online-guardian + UX cost) → deferred to an optional `lattice-recovery` module; device-linking-only (no seed) → no offline floor for total device loss. *Cost accepted:* the mnemonic is a long-lived root secret — mitigated by offline custody, day-to-day signing via device subkeys, and session-layer forward secrecy.
 - **ADR-005 (decided):** At-rest key storage = **OS keychain primary, age-encrypted file fallback** (`lattice-identity`, `storage` feature). The keychain (Secret Service / Keychain / Credential Manager) gives a seamless no-passphrase experience on desktops; headless/server hosts fall back to an `age` scrypt/passphrase-encrypted file (`identity.age`, `0600`; passphrase via `LATTICE_PASSPHRASE` or prompt). Backend recorded in `config.toml`; legacy plaintext files are migrated (re-encrypted, plaintext backed up). `LATTICE_STORAGE=age` forces the file backend. This removes the plaintext-mnemonic exposure from the device boundary (A3).
-- **ADR-006 (decided):** Session resumption across transport drops. The ratchet is transport-independent, so the library primitive is `ConnectedSession::resume(conn, session)` — rebind an existing `SecureSession` to a fresh connection with **no re-handshake**; counters/chains carry over and the skipped-key cache absorbs frames lost in the gap (done + tested). Resume needs no re-authentication: the ratchet keys *are* the continuity proof (only the real peer produces decryptable frames). *CLI negotiation (done):* on reconnect the dialer signals intent with a 1-byte mode prefix (`fresh` vs `resume`) + its `PeerId`; the listener keeps a `PeerId → SecureSession` map and resumes if it holds the session, else replies `fresh` and both run a handshake (e.g. when a peer restarted and lost its in-memory state). Implemented in `lattice-net`. *Out of scope:* reliable redelivery of in-flight messages (acks/resend) — a message dropped at the instant of disconnect is lost, not recovered.
+- **ADR-006 (decided):** Session resumption across transport drops. The ratchet is transport-independent, so the library primitive is `ConnectedSession::resume(conn, session)` — rebind an existing `SecureSession` to a fresh connection with **no re-handshake**; counters/chains carry over and the skipped-key cache absorbs frames lost in the gap (done + tested). Resume now requires a mutual proof of the session secret (ADR-009). *CLI negotiation (done):* on reconnect the dialer signals intent with a 1-byte mode prefix (`fresh` vs `resume`) + its `PeerId`; the listener keeps a `PeerId → SecureSession` map and resumes if it holds the session, else replies `fresh` and both run a handshake (e.g. when a peer restarted and lost its in-memory state). Implemented in `lattice-net`. *Out of scope:* reliable redelivery of in-flight messages (acks/resend) — a message dropped at the instant of disconnect is lost, not recovered.
+- **ADR-007 (accepted):** v3 handshake (`lattice-session-hs-v3`): two messages, both sides sign the transcript, four mixed secrets (two X25519, two ML-KEM when the responder is Hybrid), caller-supplied channel binding, root = HKDF(salt = transcript).
+- **ADR-008 (accepted):** Identity-bound signatures (`lattice-sig-v2`): every signature covers the signer's crypto suite and PeerId.
+- **ADR-009 (accepted):** Resume proof (`lattice-resume-v2`): HMAC-SHA256 under a key derived from the session root, covering both nonces, both identities, the role and the endpoint binding; both sides must verify before a session is rebound.
+- **ADR-010 (accepted):** Channel binding + signed ticket: `lattice-net-cb-v1` (dialer and listener iroh endpoint ids) is bound into the handshake and resume proofs; `lattice-ticket-v1` signs the listener's endpoint id and identity.
+- **ADR-011 (accepted):** Transport addressing: `Transport::Addr` is transport-specific, and addresses are not identities.
+- **ADR-012 (accepted):** Hybrid device certs v2 (`lattice-device-cert-v2`): bind the full device identity and carry a mandatory `not_after`; no revocation.
 - **Naming:** "Lattice" is a placeholder. Decide before first publish.
 
 ---
