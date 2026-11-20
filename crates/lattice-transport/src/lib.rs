@@ -20,8 +20,9 @@ use tokio::sync::Mutex as AsyncMutex;
 mod quic;
 #[cfg(feature = "iroh")]
 pub use quic::{
-    parse_ticket, read_frame, ticket_message, write_frame, ConnHandle, IrohConn, IrohEndpointId,
-    IrohTransport, LinkInfo, RecvStream, SendStream, ALPN, MAX_TICKET_LEN,
+    encode_ticket, parse_ticket, read_frame, ticket_message, write_frame, ConnHandle, IrohConn,
+    IrohEndpointId, IrohTransport, LinkInfo, ParsedTicket, RecvStream, SendStream, TicketAddr,
+    ALPN, MAX_TICKET_LEN,
 };
 
 type Inbox = mpsc::UnboundedSender<(PeerId, MemoryConn)>;

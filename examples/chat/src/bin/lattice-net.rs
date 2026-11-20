@@ -10,9 +10,11 @@
 //! Double-Ratchet handshake over an iroh QUIC connection and relays stdin lines
 //! as end-to-end-encrypted messages.
 //!
-//! The TICKET is signed by the listener's Lattice identity and names its iroh
-//! endpoint. The dialer verifies that signature *before dialing*, then checks
-//! that it actually reached the endpoint the ticket names. Both the handshake
+//! The TICKET is signed by the listener's Lattice identity (`lattice-ticket-v2`)
+//! and the signature covers its full iroh address: endpoint id, relay URLs and
+//! direct addresses. The dialer verifies that signature *before dialing*, so an
+//! edited ticket is rejected, then checks that it actually reached the endpoint
+//! the ticket names. Both the handshake
 //! transcript and the resume proofs are bound to the dialer's and listener's
 //! iroh endpoint ids (`lattice-net-cb-v1`), so a session cannot be replayed onto
 //! a different QUIC connection. The ticket still grants reachability, and a
@@ -43,7 +45,8 @@ use lattice::identity::storage::IdentityStore;
 use lattice::prelude::*;
 use lattice::session::{resume_nonce, ResumeRole};
 use lattice::transport::{
-    parse_ticket, read_frame, ticket_message, write_frame, IrohConn, IrohTransport,
+    encode_ticket, parse_ticket, read_frame, ticket_message, write_frame, IrohConn, IrohTransport,
+    ParsedTicket,
 };
 use tokio::io::{AsyncBufReadExt, BufReader, Lines, Stdin};
 use tokio::sync::{Mutex, Notify};
@@ -144,14 +147,10 @@ fn channel_binding(dialer_ep: &[u8; 32], listener_ep: &[u8; 32]) -> Vec<u8> {
 }
 
 /// Verify a ticket's signature under the identity it carries (pure; no network).
-fn verify_ticket(
-    app_identity: &[u8],
-    app_sig: &[u8],
-    endpoint_id: &[u8; 32],
-) -> Result<PublicIdentity> {
-    let id = PublicIdentity::from_bytes(app_identity)?;
-    let msg = ticket_message(endpoint_id, app_identity);
-    if app_sig.is_empty() || !id.verify(&msg, &Signature(app_sig.to_vec())) {
+fn verify_ticket(t: &ParsedTicket) -> Result<PublicIdentity> {
+    let id = PublicIdentity::from_bytes(&t.app_identity)?;
+    let msg = ticket_message(&t.endpoint_id, &t.addr_bytes, &t.app_identity);
+    if t.app_sig.is_empty() || !id.verify(&msg, &Signature(t.app_sig.clone())) {
         return Err(Error::Verify("ticket signature invalid".into()));
     }
     Ok(id)
@@ -234,11 +233,13 @@ async fn run() -> Result<()> {
 async fn listen(me: Keypair, mut lines: StdinLines) -> Result<()> {
     let t = IrohTransport::bind().await?;
     eprintln!("[lattice-net] coming online (contacting relay)...");
-    // The ticket is signed by our Lattice identity and names our iroh endpoint.
+    // The ticket is signed by our Lattice identity and covers our full iroh
+    // address. One snapshot is both signed and encoded.
     let app_identity = me.public().to_bytes();
-    let msg = ticket_message(&t.endpoint_id_bytes(), &app_identity);
+    let addr = t.ticket_addr().await?;
+    let msg = ticket_message(&addr.endpoint_id(), addr.as_bytes(), &app_identity);
     let app_sig = me.sign(&msg).0;
-    let ticket = t.ticket(&app_identity, &app_sig).await?;
+    let ticket = encode_ticket(&addr, &app_identity, &app_sig)?;
     println!("\n=== TICKET (copy to the other device) ===\n{ticket}\n=========================================\n");
 
     // Acceptor task: keeps accepting while a chat runs. A free gate hands the
@@ -441,22 +442,26 @@ struct VerifiedTicket {
     identity_bytes: Vec<u8>,
     /// The iroh endpoint id the ticket names (covered by the signature).
     endpoint_id: [u8; 32],
+    /// The serialized address bytes exactly as carried by the ticket (covered
+    /// by the signature).
+    addr_bytes: Vec<u8>,
 }
 
 /// Dialer loop: dial, negotiate resume-vs-fresh, chat; keep the `SecureSession`
 /// across drops so the next dial can resume.
 async fn connect(me: Keypair, ticket: String, mut lines: StdinLines) -> Result<()> {
     // Verify the ticket before binding or dialing; a bad ticket is fatal, not retried.
-    let (identity_bytes, sig, endpoint_id) = parse_ticket(&ticket)?;
-    let identity = verify_ticket(&identity_bytes, &sig, &endpoint_id)?;
+    let parsed = parse_ticket(&ticket)?;
+    let identity = verify_ticket(&parsed)?;
     eprintln!(
         "[lattice-net] peer fingerprint (from ticket): {} — compare this with your peer out of band",
         identity.peer_id().fingerprint()
     );
     let verified = VerifiedTicket {
         identity,
-        identity_bytes,
-        endpoint_id,
+        identity_bytes: parsed.app_identity,
+        endpoint_id: parsed.endpoint_id,
+        addr_bytes: parsed.addr_bytes,
     };
 
     let t = IrohTransport::bind().await?;
@@ -568,14 +573,17 @@ async fn dial_once(
     lines: &mut StdinLines,
 ) -> Result<Outcome> {
     eprintln!("[lattice-net] dialing peer...");
-    let (peer_bytes, _sig, ticket_ep, conn) = t.connect_ticket(ticket).await?;
+    let (dialed, conn) = t.connect_ticket(ticket).await?;
     // The ticket we dialed must be the one we verified, and we must have
     // reached the endpoint it names.
-    check_endpoint(&verified.endpoint_id, &ticket_ep)?;
-    check_endpoint(&ticket_ep, &conn.remote_endpoint_id())?;
-    if peer_bytes != verified.identity_bytes {
+    check_endpoint(&verified.endpoint_id, &dialed.endpoint_id)?;
+    if dialed.app_identity != verified.identity_bytes {
         return Err(Error::Verify("ticket identity changed".into()));
     }
+    if dialed.addr_bytes != verified.addr_bytes {
+        return Err(Error::Verify("ticket address changed".into()));
+    }
+    check_endpoint(&dialed.endpoint_id, &conn.remote_endpoint_id())?;
     let binding = channel_binding(&t.endpoint_id_bytes(), &conn.remote_endpoint_id());
 
     let limit = NEGOTIATION_TIMEOUT;
@@ -652,6 +660,7 @@ async fn chat(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lattice::transport::TicketAddr;
 
     fn id() -> Keypair {
         Keypair::generate(CryptoSuite::Hybrid).unwrap()
@@ -1057,52 +1066,121 @@ mod tests {
 
     // ---- ticket verification ----
 
-    fn signed_ticket(k: &Keypair, ep: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
+    /// A valid iroh endpoint id: a Lattice keypair's Ed25519 public key.
+    fn ep_of(k: &Keypair) -> [u8; 32] {
+        k.public().ed25519_bytes()
+    }
+
+    fn taddr(ep: &[u8; 32], relay: &str, direct: &[&str]) -> TicketAddr {
+        let direct: Vec<std::net::SocketAddr> = direct.iter().map(|s| s.parse().unwrap()).collect();
+        TicketAddr::from_parts(ep, &[relay], &direct).unwrap()
+    }
+
+    fn base_addr(ep: &[u8; 32]) -> TicketAddr {
+        taddr(ep, "https://relay.example.org./", &["192.0.2.1:4433"])
+    }
+
+    /// Sign `msg` with `k` and return the encoded-then-parsed ticket.
+    fn issue(k: &Keypair, addr: &TicketAddr, msg: &[u8]) -> ParsedTicket {
         let ident = k.public().to_bytes();
-        let sig = k.sign(&ticket_message(ep, &ident)).0;
-        (ident, sig)
+        let sig = k.sign(msg).0;
+        parse_ticket(&encode_ticket(addr, &ident, &sig).unwrap()).unwrap()
+    }
+
+    fn genuine_msg(k: &Keypair, addr: &TicketAddr) -> Vec<u8> {
+        ticket_message(&addr.endpoint_id(), addr.as_bytes(), &k.public().to_bytes())
+    }
+
+    fn signed_ticket(k: &Keypair) -> (ParsedTicket, TicketAddr) {
+        let addr = base_addr(&ep_of(k));
+        let t = issue(k, &addr, &genuine_msg(k, &addr));
+        (t, addr)
     }
 
     #[test]
     fn verify_ticket_accepts_genuine() {
         let k = id();
-        let ep = [5u8; 32];
-        let (ident, sig) = signed_ticket(&k, &ep);
-        let got = verify_ticket(&ident, &sig, &ep).unwrap();
+        let (t, _) = signed_ticket(&k);
+        let got = verify_ticket(&t).unwrap();
         assert_eq!(got.peer_id(), k.peer_id());
     }
 
     #[test]
     fn verify_ticket_rejects_tampering() {
         let (k, other) = (id(), id());
-        let ep = [5u8; 32];
-        let (ident, sig) = signed_ticket(&k, &ep);
+        let (t, _) = signed_ticket(&k);
 
         // Changed endpoint id.
-        let mut ep2 = ep;
-        ep2[0] ^= 1;
-        let r = verify_ticket(&ident, &sig, &ep2);
-        assert!(matches!(r, Err(Error::Verify(_))));
+        let mut bad = t.clone();
+        bad.endpoint_id[0] ^= 1;
+        assert!(matches!(verify_ticket(&bad), Err(Error::Verify(_))));
         // Signature from a different keypair.
-        let (_, other_sig) = signed_ticket(&other, &ep);
-        let r = verify_ticket(&ident, &other_sig, &ep);
-        assert!(matches!(r, Err(Error::Verify(_))));
+        let (o, _) = signed_ticket(&other);
+        let mut bad = t.clone();
+        bad.app_sig = o.app_sig.clone();
+        assert!(matches!(verify_ticket(&bad), Err(Error::Verify(_))));
         // Empty signature.
-        let r = verify_ticket(&ident, &[], &ep);
-        assert!(matches!(r, Err(Error::Verify(_))));
+        let mut bad = t.clone();
+        bad.app_sig = vec![];
+        assert!(matches!(verify_ticket(&bad), Err(Error::Verify(_))));
         // Swapped identity (valid identity, signature not made by it).
-        let other_ident = other.public().to_bytes();
-        let r = verify_ticket(&other_ident, &sig, &ep);
-        assert!(r.is_err());
-        // Tampered identity bytes.
-        let mut bad = ident.clone();
-        let mid = bad.len() / 2;
-        bad[mid] ^= 1;
-        let r = verify_ticket(&bad, &sig, &ep);
-        assert!(r.is_err());
+        let mut bad = t.clone();
+        bad.app_identity = other.public().to_bytes();
+        assert!(verify_ticket(&bad).is_err());
+        // Flipped identity bytes.
+        let mut bad = t.clone();
+        let mid = bad.app_identity.len() / 2;
+        bad.app_identity[mid] ^= 1;
+        assert!(verify_ticket(&bad).is_err());
         // Truncated identity bytes.
-        let r = verify_ticket(&ident[..ident.len() / 2], &sig, &ep);
-        assert!(r.is_err());
+        let mut bad = t.clone();
+        bad.app_identity.truncate(t.app_identity.len() / 2);
+        assert!(verify_ticket(&bad).is_err());
+    }
+
+    #[test]
+    fn verify_ticket_rejects_edited_address() {
+        let k = id();
+        let ep = ep_of(&k);
+        let (t, addr) = signed_ticket(&k);
+        let ident = k.public().to_bytes();
+        let sig = t.app_sig.clone();
+        let variants = [
+            // (a) different relay URL
+            taddr(&ep, "https://other.example.org./", &["192.0.2.1:4433"]),
+            // (b) different direct address (IP, then port)
+            taddr(&ep, "https://relay.example.org./", &["192.0.2.2:4433"]),
+            taddr(&ep, "https://relay.example.org./", &["192.0.2.1:4434"]),
+            // (c) extra direct address
+            taddr(
+                &ep,
+                "https://relay.example.org./",
+                &["192.0.2.1:4433", "198.51.100.7:1"],
+            ),
+            // (d) direct address removed
+            taddr(&ep, "https://relay.example.org./", &[]),
+        ];
+        for v in variants {
+            assert_ne!(v.as_bytes(), addr.as_bytes());
+            let edited = parse_ticket(&encode_ticket(&v, &ident, &sig).unwrap()).unwrap();
+            assert!(
+                matches!(verify_ticket(&edited), Err(Error::Verify(_))),
+                "edited address must not verify"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_ticket_rejects_v1_signature() {
+        let k = id();
+        let addr = base_addr(&ep_of(&k));
+        let ident = k.public().to_bytes();
+        let mut v1 = b"lattice-ticket-v1".to_vec();
+        v1.extend_from_slice(&addr.endpoint_id());
+        v1.extend_from_slice(&(ident.len() as u32).to_le_bytes());
+        v1.extend_from_slice(&ident);
+        let t = issue(&k, &addr, &v1);
+        assert!(matches!(verify_ticket(&t), Err(Error::Verify(_))));
     }
 
     #[test]

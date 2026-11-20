@@ -3,10 +3,12 @@
 //! `IrohTransport` binds an iroh endpoint (n0 relays + discovery) and yields
 //! `IrohConn`s — framed (`u32`-BE length prefix) over a single QUIC bi-stream,
 //! preserving in-order delivery for the Double Ratchet. Tickets carry our
-//! iroh address, an opaque app-identity blob, and an opaque signature
-//! (`app_sig`) over [`ticket_message`] (domain ‖ endpoint id ‖ identity), so the
+//! iroh address (as the exact serialized bytes that were signed), an opaque
+//! app-identity blob, and an opaque signature (`app_sig`) over
+//! [`ticket_message`] (domain ‖ endpoint id ‖ full address ‖ identity), so the
 //! dialer can verify — *before dialing* — that the ticket was issued by that
-//! identity for that endpoint. The transport is identity-agnostic: the
+//! identity for that endpoint and address (relay URLs and direct addresses
+//! included). The transport is identity-agnostic: the
 //! app-identity bytes and the signature are opaque here and are never
 //! interpreted or verified by this crate; the application does that.
 //! Addresses ([`IrohEndpointId`]) are unauthenticated transport locators, not
@@ -29,7 +31,8 @@ pub const ALPN: &[u8] = b"lattice/0";
 /// Max accepted ticket length in hex characters (after trim): 16 KiB.
 pub const MAX_TICKET_LEN: usize = 16 * 1024;
 
-const TICKET_DOMAIN: &[u8] = b"lattice-ticket-v1";
+const TICKET_DOMAIN: &[u8] = b"lattice-ticket-v2";
+const TICKET_VERSION: u8 = 2;
 
 fn terr(ctx: &str, e: impl core::fmt::Display) -> Error {
     Error::Transport(format!("{ctx}: {e}"))
@@ -46,30 +49,100 @@ impl core::fmt::Debug for IrohEndpointId {
     }
 }
 
+/// Wire struct, postcard-encoded then hex-encoded.
 #[derive(Serialize, Deserialize)]
 struct Ticket {
-    addr: EndpointAddr,
+    /// Must equal [`TICKET_VERSION`].
+    version: u8,
+    /// The exact `postcard(EndpointAddr)` bytes that were signed.
+    addr: Vec<u8>,
     app_identity: Vec<u8>,
     app_sig: Vec<u8>,
 }
 
+/// A frozen snapshot of an endpoint address and its exact serialized bytes.
+#[derive(Clone, Debug)]
+pub struct TicketAddr {
+    addr: EndpointAddr,
+    bytes: Vec<u8>,
+}
+
+impl TicketAddr {
+    /// Serializes exactly once.
+    fn from_addr(addr: EndpointAddr) -> Result<Self> {
+        let bytes = postcard::to_allocvec(&addr).map_err(|e| terr("ticket addr encode", e))?;
+        Ok(Self { addr, bytes })
+    }
+
+    /// Pure. Build from parts (for tests and tools). Errors on an invalid
+    /// endpoint id, an unparsable relay URL, or a serialization failure.
+    pub fn from_parts(
+        endpoint_id: &[u8; 32],
+        relay_urls: &[&str],
+        direct_addrs: &[std::net::SocketAddr],
+    ) -> Result<Self> {
+        let id = EndpointId::from_bytes(endpoint_id).map_err(|e| terr("endpoint id", e))?;
+        let mut addr = EndpointAddr::new(id);
+        for u in relay_urls {
+            let url: iroh::RelayUrl = u.parse().map_err(|e| terr("relay url", e))?;
+            addr = addr.with_relay_url(url);
+        }
+        for a in direct_addrs {
+            addr = addr.with_ip_addr(*a);
+        }
+        Self::from_addr(addr)
+    }
+
+    /// The iroh endpoint id inside the address.
+    pub fn endpoint_id(&self) -> [u8; 32] {
+        *self.addr.id.as_bytes()
+    }
+
+    /// The exact `postcard(EndpointAddr)` bytes that are signed and put in the ticket.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// A decoded ticket. Nothing here has been signature-verified.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedTicket {
+    pub app_identity: Vec<u8>,
+    pub app_sig: Vec<u8>,
+    /// Decoded `EndpointAddr.id`.
+    pub endpoint_id: [u8; 32],
+    /// Raw address bytes exactly as carried by the ticket.
+    pub addr_bytes: Vec<u8>,
+}
+
 /// The bytes a listener signs to issue a ticket:
-/// `b"lattice-ticket-v1" ‖ endpoint_id ‖ u32le(app_identity.len()) ‖ app_identity`.
-pub fn ticket_message(endpoint_id: &[u8; 32], app_identity: &[u8]) -> Vec<u8> {
-    let mut m = Vec::with_capacity(TICKET_DOMAIN.len() + 32 + 4 + app_identity.len());
+/// `b"lattice-ticket-v2" ‖ endpoint_id ‖ u32le(addr.len()) ‖ addr ‖
+/// u32le(app_identity.len()) ‖ app_identity`.
+pub fn ticket_message(endpoint_id: &[u8; 32], addr: &[u8], app_identity: &[u8]) -> Vec<u8> {
+    let mut m =
+        Vec::with_capacity(TICKET_DOMAIN.len() + 32 + 4 + addr.len() + 4 + app_identity.len());
     m.extend_from_slice(TICKET_DOMAIN);
     m.extend_from_slice(endpoint_id);
+    m.extend_from_slice(&(addr.len() as u32).to_le_bytes());
+    m.extend_from_slice(addr);
     m.extend_from_slice(&(app_identity.len() as u32).to_le_bytes());
     m.extend_from_slice(app_identity);
     m
 }
 
-fn encode_ticket(t: &Ticket) -> Result<String> {
-    let bytes = postcard::to_allocvec(t).map_err(|e| terr("ticket encode", e))?;
+/// Pure: `hex(postcard(Ticket { version: 2, addr: addr.as_bytes(), .. }))`.
+pub fn encode_ticket(addr: &TicketAddr, app_identity: &[u8], app_sig: &[u8]) -> Result<String> {
+    let t = Ticket {
+        version: TICKET_VERSION,
+        addr: addr.as_bytes().to_vec(),
+        app_identity: app_identity.to_vec(),
+        app_sig: app_sig.to_vec(),
+    };
+    let bytes = postcard::to_allocvec(&t).map_err(|e| terr("ticket encode", e))?;
     Ok(hex::encode(bytes))
 }
 
-fn decode_ticket(ticket: &str) -> Result<Ticket> {
+fn decode_ticket(ticket: &str) -> Result<(ParsedTicket, EndpointAddr)> {
     let ticket = ticket.trim();
     if ticket.len() > MAX_TICKET_LEN {
         return Err(Error::Transport(format!(
@@ -78,15 +151,35 @@ fn decode_ticket(ticket: &str) -> Result<Ticket> {
         )));
     }
     let bytes = hex::decode(ticket).map_err(|e| terr("ticket hex", e))?;
-    postcard::from_bytes(&bytes).map_err(|e| terr("ticket decode", e))
+    let (t, rest): (Ticket, &[u8]) =
+        postcard::take_from_bytes(&bytes).map_err(|e| terr("ticket decode", e))?;
+    if !rest.is_empty() {
+        return Err(Error::Transport("ticket has trailing bytes".into()));
+    }
+    if t.version != TICKET_VERSION {
+        return Err(Error::Transport(format!(
+            "unsupported ticket version {}",
+            t.version
+        )));
+    }
+    let (addr, rest): (EndpointAddr, &[u8]) =
+        postcard::take_from_bytes(&t.addr).map_err(|e| terr("ticket addr decode", e))?;
+    if !rest.is_empty() {
+        return Err(Error::Transport("ticket addr has trailing bytes".into()));
+    }
+    let parsed = ParsedTicket {
+        app_identity: t.app_identity,
+        app_sig: t.app_sig,
+        endpoint_id: *addr.id.as_bytes(),
+        addr_bytes: t.addr,
+    };
+    Ok((parsed, addr))
 }
 
-/// Pure (no network): bounded hex + postcard decode of a ticket string.
-/// Returns `(app_identity, app_sig, ticket_endpoint_id)`. Does not verify the
-/// signature.
-pub fn parse_ticket(ticket: &str) -> Result<(Vec<u8>, Vec<u8>, [u8; 32])> {
-    let t = decode_ticket(ticket)?;
-    Ok((t.app_identity, t.app_sig, *t.addr.id.as_bytes()))
+/// Pure (no network): bounded hex + strict postcard decode of a ticket string.
+/// Does not verify the signature.
+pub fn parse_ticket(ticket: &str) -> Result<ParsedTicket> {
+    decode_ticket(ticket).map(|(p, _)| p)
 }
 
 /// Largest frame body `read_frame` will accept (64 KiB).
@@ -227,39 +320,26 @@ impl IrohTransport {
         *self.ep.id().as_bytes()
     }
 
-    /// A copy-pasteable ticket: our (online) address, an opaque app-identity
-    /// blob, and the app's opaque signature over [`ticket_message`] for this
-    /// endpoint id and identity.
-    pub async fn ticket(&self, app_identity: &[u8], app_sig: &[u8]) -> Result<String> {
+    /// Wait until online, then snapshot our address ONCE. Sign
+    /// [`TicketAddr::as_bytes`] via [`ticket_message`] and pass the same value
+    /// to [`encode_ticket`].
+    pub async fn ticket_addr(&self) -> Result<TicketAddr> {
         self.ep.online().await;
-        let t = Ticket {
-            addr: self.ep.addr(),
-            app_identity: app_identity.to_vec(),
-            app_sig: app_sig.to_vec(),
-        };
-        encode_ticket(&t)
+        TicketAddr::from_addr(self.ep.addr())
     }
 
-    /// Dial a ticket. Returns `(app_identity, app_sig, ticket_endpoint_id, conn)`.
-    /// Does NOT verify `app_sig`; callers should [`parse_ticket`] and verify first.
-    pub async fn connect_ticket(
-        &self,
-        ticket: &str,
-    ) -> Result<(Vec<u8>, Vec<u8>, [u8; 32], IrohConn)> {
-        let t = decode_ticket(ticket)?;
-        let ticket_id = *t.addr.id.as_bytes();
+    /// Dial the address decoded from a ticket. Returns the [`ParsedTicket`] and
+    /// the connection. Does NOT verify `app_sig`; callers should
+    /// [`parse_ticket`] and verify first.
+    pub async fn connect_ticket(&self, ticket: &str) -> Result<(ParsedTicket, IrohConn)> {
+        let (parsed, addr) = decode_ticket(ticket)?;
         let conn = self
             .ep
-            .connect(t.addr, ALPN)
+            .connect(addr, ALPN)
             .await
             .map_err(|e| terr("connect", e))?;
         let (send, recv) = conn.open_bi().await.map_err(|e| terr("open_bi", e))?;
-        Ok((
-            t.app_identity,
-            t.app_sig,
-            ticket_id,
-            IrohConn { conn, send, recv },
-        ))
+        Ok((parsed, IrohConn { conn, send, recv }))
     }
 
     /// Accept one inbound connection's first bi-stream.
@@ -335,31 +415,106 @@ mod tests {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
+    fn sample_addr(seed: u8) -> TicketAddr {
+        TicketAddr::from_parts(
+            test_id(seed).as_bytes(),
+            &["https://relay.example.org./"],
+            &["192.0.2.1:4433".parse().unwrap()],
+        )
+        .unwrap()
+    }
+
+    fn raw_ticket(version: u8, addr: Vec<u8>) -> Ticket {
+        Ticket {
+            version,
+            addr,
+            app_identity: b"identity".to_vec(),
+            app_sig: b"sig".to_vec(),
+        }
+    }
+
+    fn hex_of(t: &Ticket) -> String {
+        hex::encode(postcard::to_allocvec(t).unwrap())
+    }
+
     #[test]
     fn ticket_roundtrip() {
-        let id = test_id(7);
-        let t = Ticket {
-            addr: EndpointAddr::new(id),
-            app_identity: b"identity-bytes".to_vec(),
-            app_sig: b"sig-bytes".to_vec(),
-        };
-        let s = encode_ticket(&t).unwrap();
-        let (ident, sig, ep) = parse_ticket(&s).unwrap();
-        assert_eq!(ident, b"identity-bytes");
-        assert_eq!(sig, b"sig-bytes");
-        assert_eq!(&ep, id.as_bytes());
+        let addr = sample_addr(7);
+        let s = encode_ticket(&addr, b"identity-bytes", b"sig-bytes").unwrap();
+        let p = parse_ticket(&s).unwrap();
+        assert_eq!(p.app_identity, b"identity-bytes");
+        assert_eq!(p.app_sig, b"sig-bytes");
+        assert_eq!(p.endpoint_id, addr.endpoint_id());
+        assert_eq!(&p.endpoint_id, test_id(7).as_bytes());
+        assert_eq!(p.addr_bytes, addr.as_bytes());
         // Surrounding whitespace is tolerated.
-        assert!(parse_ticket(&format!("  {s}\n")).is_ok());
+        assert_eq!(parse_ticket(&format!("  {s}\n")).unwrap(), p);
+    }
+
+    #[test]
+    fn ticket_encoding_is_deterministic() {
+        let s1 = encode_ticket(&sample_addr(7), b"i", b"s").unwrap();
+        let p = parse_ticket(&s1).unwrap();
+        let s2 = encode_ticket(&sample_addr(7), &p.app_identity, &p.app_sig).unwrap();
+        assert_eq!(s1, s2);
     }
 
     #[test]
     fn ticket_message_layout() {
         let id = [9u8; 32];
-        let mut want = b"lattice-ticket-v1".to_vec();
+        let mut want = b"lattice-ticket-v2".to_vec();
         want.extend_from_slice(&id);
+        want.extend_from_slice(&[2, 0, 0, 0]);
+        want.extend_from_slice(b"AD");
         want.extend_from_slice(&[3, 0, 0, 0]);
         want.extend_from_slice(b"xyz");
-        assert_eq!(ticket_message(&id, b"xyz"), want);
+        assert_eq!(ticket_message(&id, b"AD", b"xyz"), want);
+    }
+
+    #[test]
+    fn from_parts_rejects_bad_relay_url() {
+        let r = TicketAddr::from_parts(test_id(1).as_bytes(), &["not a url"], &[]);
+        assert!(matches!(r, Err(Error::Transport(_))));
+        // id-only address is allowed.
+        assert!(TicketAddr::from_parts(test_id(1).as_bytes(), &[], &[]).is_ok());
+    }
+
+    #[test]
+    fn wrong_version_is_rejected() {
+        let a = sample_addr(1);
+        assert!(parse_ticket(&hex_of(&raw_ticket(1, a.as_bytes().to_vec()))).is_err());
+        assert!(parse_ticket(&hex_of(&raw_ticket(3, a.as_bytes().to_vec()))).is_err());
+        assert!(parse_ticket(&hex_of(&raw_ticket(2, a.as_bytes().to_vec()))).is_ok());
+    }
+
+    #[test]
+    fn trailing_bytes_are_rejected() {
+        let a = sample_addr(1);
+        // Extra byte inside the addr blob.
+        let mut inner = a.as_bytes().to_vec();
+        inner.push(0);
+        assert!(parse_ticket(&hex_of(&raw_ticket(2, inner))).is_err());
+        // Extra byte after the outer struct.
+        let mut outer = postcard::to_allocvec(&raw_ticket(2, a.as_bytes().to_vec())).unwrap();
+        outer.push(0);
+        assert!(parse_ticket(&hex::encode(outer)).is_err());
+    }
+
+    #[test]
+    fn v1_signed_layout_is_rejected() {
+        #[derive(Serialize)]
+        struct V1Ticket {
+            addr: EndpointAddr,
+            app_identity: Vec<u8>,
+            app_sig: Vec<u8>,
+        }
+        let v1 = V1Ticket {
+            addr: EndpointAddr::new(test_id(1)),
+            app_identity: b"identity".to_vec(),
+            app_sig: b"sig".to_vec(),
+        };
+        let s = hex::encode(postcard::to_allocvec(&v1).unwrap());
+        assert!(parse_ticket(&s).is_err());
     }
 
     #[test]

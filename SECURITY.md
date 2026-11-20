@@ -19,8 +19,11 @@
   sides, which are erased after the handshake. A compromised long-term identity
   can still impersonate its owner in NEW sessions.
 - The `lattice-net` listen ticket is a reachability bearer token. It is signed
-  by the listener's Lattice identity and names its iroh endpoint. The dialer checks the signature before dialing
-  and checks that it reached that endpoint. Both the handshake transcripts and
+  by the listener's Lattice identity: the signature (`lattice-ticket-v2`) covers
+  the listener's iroh endpoint id, its full address (relay URLs and direct
+  addresses) and its identity, so an edited ticket is rejected before dialing.
+  The dialer checks the signature before dialing and checks that it reached that
+  endpoint. Both the handshake transcripts and
   the resume proofs are bound to both endpoint ids (`lattice-net-cb-v1`,
   `lattice-resume-v2`). The ticket still grants reachability: anyone holding it
   can try to connect.

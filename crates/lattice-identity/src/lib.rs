@@ -727,6 +727,7 @@ impl DeviceCert {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "pq")]
     #[test]
     fn sign_verify_roundtrip_hybrid() {
         let kp = Keypair::generate(CryptoSuite::Hybrid).unwrap();
@@ -750,12 +751,11 @@ mod tests {
         assert!(pq.is_empty());
     }
 
-    #[test]
-    fn mnemonic_recovery_reproduces_identity() {
-        let original = Keypair::generate(CryptoSuite::Hybrid).unwrap();
+    fn mnemonic_recovery_for(suite: CryptoSuite) {
+        let original = Keypair::generate(suite).unwrap();
         let phrase = original.mnemonic().to_string();
 
-        let recovered = Keypair::from_mnemonic(CryptoSuite::Hybrid, &phrase).unwrap();
+        let recovered = Keypair::from_mnemonic(suite, &phrase).unwrap();
         assert_eq!(
             original.peer_id(),
             recovered.peer_id(),
@@ -768,8 +768,18 @@ mod tests {
     }
 
     #[test]
-    fn tampered_signature_fails() {
-        let kp = Keypair::generate(CryptoSuite::Hybrid).unwrap();
+    fn mnemonic_recovery_reproduces_identity_classical() {
+        mnemonic_recovery_for(CryptoSuite::Classical);
+    }
+
+    #[cfg(feature = "pq")]
+    #[test]
+    fn mnemonic_recovery_reproduces_identity() {
+        mnemonic_recovery_for(CryptoSuite::Hybrid);
+    }
+
+    fn tampered_signature_for(suite: CryptoSuite) {
+        let kp = Keypair::generate(suite).unwrap();
         let mut sig = kp.sign(b"payload");
         let last = sig.0.len() - 1;
         sig.0[last] ^= 0x01;
@@ -777,8 +787,18 @@ mod tests {
     }
 
     #[test]
-    fn public_identity_serialization_roundtrip() {
-        let kp = Keypair::generate(CryptoSuite::Hybrid).unwrap();
+    fn tampered_signature_fails_classical() {
+        tampered_signature_for(CryptoSuite::Classical);
+    }
+
+    #[cfg(feature = "pq")]
+    #[test]
+    fn tampered_signature_fails() {
+        tampered_signature_for(CryptoSuite::Hybrid);
+    }
+
+    fn public_identity_roundtrip_for(suite: CryptoSuite) {
+        let kp = Keypair::generate(suite).unwrap();
         let bytes = kp.public().to_bytes();
         let parsed = PublicIdentity::from_bytes(&bytes).unwrap();
         assert_eq!(
@@ -789,6 +809,17 @@ mod tests {
         // A signature from the original verifies under the parsed public id.
         let sig = kp.sign(b"wire");
         assert!(parsed.verify(b"wire", &sig));
+    }
+
+    #[test]
+    fn public_identity_serialization_roundtrip_classical() {
+        public_identity_roundtrip_for(CryptoSuite::Classical);
+    }
+
+    #[cfg(feature = "pq")]
+    #[test]
+    fn public_identity_serialization_roundtrip() {
+        public_identity_roundtrip_for(CryptoSuite::Hybrid);
     }
 
     const MNEMONIC: &str =
@@ -803,13 +834,27 @@ mod tests {
         out
     }
 
+    fn classical() -> Keypair {
+        Keypair::from_mnemonic(CryptoSuite::Classical, MNEMONIC).unwrap()
+    }
+
+    #[cfg(feature = "pq")]
     fn pair() -> (Keypair, Keypair) {
         (
-            Keypair::from_mnemonic(CryptoSuite::Classical, MNEMONIC).unwrap(),
+            classical(),
             Keypair::from_mnemonic(CryptoSuite::Hybrid, MNEMONIC).unwrap(),
         )
     }
 
+    #[test]
+    fn classical_peer_id_is_stable_for_fixed_mnemonic() {
+        assert_eq!(
+            classical().peer_id().0,
+            hex32("39e4342c8705ea0a485f78880b94d5f19af0a2b4ffbbc945a4aaafe6c22e63ca")
+        );
+    }
+
+    #[cfg(feature = "pq")]
     #[test]
     fn peer_ids_are_stable_for_fixed_mnemonic() {
         let (c, h) = pair();
@@ -838,6 +883,7 @@ mod tests {
         assert_eq!(bound_message(CryptoSuite::Classical, &pid, b"")[14], 0);
     }
 
+    #[cfg(feature = "pq")]
     #[test]
     fn cross_suite_strip_is_rejected() {
         let (c, h) = pair();
@@ -847,6 +893,7 @@ mod tests {
         assert!(!c.public().verify(MSG, &stripped));
     }
 
+    #[cfg(feature = "pq")]
     #[test]
     fn signatures_do_not_cross_suites() {
         let (c, h) = pair();
@@ -856,12 +903,20 @@ mod tests {
 
     #[test]
     fn classical_rejects_non_empty_pq_part() {
-        let (c, h) = pair();
+        let c = classical();
         let sig = c.sign(MSG);
         let (ed, _) = decode_hybrid(&sig.0).unwrap();
         assert!(c.public().verify(MSG, &sig));
         let padded = Signature(encode_hybrid(ed, &[0u8; 16]));
         assert!(!c.public().verify(MSG, &padded));
+    }
+
+    #[cfg(feature = "pq")]
+    #[test]
+    fn classical_rejects_hybrid_pq_part() {
+        let (c, h) = pair();
+        let csig = c.sign(MSG);
+        let (ed, _) = decode_hybrid(&csig.0).unwrap();
         let hsig = h.sign(MSG);
         let (_, pq) = decode_hybrid(&hsig.0).unwrap();
         let with_pq = Signature(encode_hybrid(ed, pq));
@@ -870,7 +925,7 @@ mod tests {
 
     #[test]
     fn raw_unbound_ed25519_is_rejected() {
-        let (c, _) = pair();
+        let c = classical();
         let raw = ed_signing(&c.seed).sign(MSG).to_bytes();
         let sig = Signature(encode_hybrid(&raw, &[]));
         assert!(!c.public().verify(MSG, &sig));
@@ -878,7 +933,11 @@ mod tests {
 
     #[test]
     fn signature_does_not_verify_under_other_identity() {
-        for suite in [CryptoSuite::Classical, CryptoSuite::Hybrid] {
+        #[cfg(feature = "pq")]
+        let suites = [CryptoSuite::Classical, CryptoSuite::Hybrid];
+        #[cfg(not(feature = "pq"))]
+        let suites = [CryptoSuite::Classical];
+        for suite in suites {
             let a = Keypair::generate(suite).unwrap();
             let b = Keypair::generate(suite).unwrap();
             let sig = a.sign(MSG);
@@ -889,8 +948,12 @@ mod tests {
 
     #[test]
     fn empty_message_roundtrip_and_wrong_message() {
-        let (c, h) = pair();
-        for kp in [&c, &h] {
+        let c = classical();
+        #[cfg(feature = "pq")]
+        let kps = [c, pair().1];
+        #[cfg(not(feature = "pq"))]
+        let kps = [c];
+        for kp in &kps {
             let sig = kp.sign(b"");
             assert!(kp.public().verify(b"", &sig));
             assert!(!kp.public().verify(b"x", &sig));
@@ -901,7 +964,7 @@ mod tests {
 
     #[test]
     fn malformed_signatures_return_false() {
-        let (c, _) = pair();
+        let c = classical();
         assert!(!c.public().verify(MSG, &Signature(vec![])));
         assert!(!c.public().verify(MSG, &Signature(vec![1, 0, 0])));
         let short = Signature(encode_hybrid(&[0u8; 63], &[]));
