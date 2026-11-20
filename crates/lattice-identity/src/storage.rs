@@ -21,8 +21,16 @@
 //!   The passphrase comes from `LATTICE_PASSPHRASE` or an interactive prompt.
 //!
 //! Other files: `device.cert`, `root.pub`, `revocation.bin` (this root's latest
-//! [`RevocationList`]) and `peers/<root peer id hex>.rev` (a bounded cache of
-//! other roots' lists, at most [`MAX_PEER_REVOCATIONS`]).
+//! [`RevocationList`]), `peers/<root peer id hex>.rev` (a bounded cache of
+//! other roots' lists, at most [`MAX_PEER_REVOCATIONS`]), `known_peers` (root
+//! PeerIds the user verified by comparing safety numbers: one lowercase hex id
+//! per line, sorted, at most [`MAX_KNOWN_PEERS`]; a malformed file is an error,
+//! never silently reset) and `seen_peers` (the last [`MAX_SEEN_PEERS`] roots
+//! that authenticated, oldest first; a convenience cache that never marks
+//! anyone verified, replaced if malformed). Both are written atomically
+//! (temp file + rename, mode 0600), so readers never see a torn file; two
+//! simultaneous writers are last-writer-wins and may lose one update (no
+//! locking).
 //!
 //! A legacy plaintext `<dir>/identity` file is migrated on first load:
 //! re-encrypted under the new scheme, then deleted (no `.bak` copy).
@@ -45,7 +53,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::{DeviceCert, Keypair, PublicIdentity, RevocationList, MAX_REVOCATION_LIST_LEN};
-use lattice_core::{CryptoSuite, Error, Identity, Result, Verify};
+use lattice_core::{CryptoSuite, Error, Identity, PeerId, Result, Verify};
 
 const KEYRING_SERVICE: &str = "lattice";
 const KEYRING_USER: &str = "identity-mnemonic";
@@ -673,6 +681,160 @@ impl IdentityStore {
     }
 }
 
+// --- peer lists (known_peers / seen_peers) ----------------------------------
+
+/// Max root PeerIds in `<dir>/known_peers`.
+pub const MAX_KNOWN_PEERS: usize = 1024;
+/// Max root PeerIds in `<dir>/seen_peers` (most recent kept).
+pub const MAX_SEEN_PEERS: usize = 64;
+
+/// Bytes per peer-list line: 64 hex chars plus `\n`.
+const PEER_LINE_LEN: usize = 65;
+
+/// Strict parser for a peer-list file: zero or more lines, each exactly 64
+/// lowercase hex chars followed by '\n'. No blank lines, no '\r', no other
+/// whitespace, no duplicates, at most `max` entries; file order is preserved.
+pub fn parse_peer_list(bytes: &[u8], max: usize) -> Result<Vec<PeerId>> {
+    if !bytes.is_ascii() {
+        return Err(Error::Other("peer list is not ASCII".into()));
+    }
+    let mut out: Vec<PeerId> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let Some((&last, body)) = bytes.split_last() else {
+        return Ok(out);
+    };
+    if last != b'\n' {
+        return Err(Error::Other(
+            "peer list: missing final newline on the last line".into(),
+        ));
+    }
+    for (i, line) in body.split(|&b| b == b'\n').enumerate() {
+        let n = i + 1;
+        if line.len() != 64 {
+            return Err(Error::Other(format!(
+                "peer list line {n}: expected 64 hex chars, found {}",
+                line.len()
+            )));
+        }
+        let mut id = [0u8; 32];
+        for (j, o) in id.iter_mut().enumerate() {
+            let (hi, lo) = (hex_val(line[2 * j]), hex_val(line[2 * j + 1]));
+            match (hi, lo) {
+                (Some(h), Some(l)) => *o = (h << 4) | l,
+                _ => {
+                    return Err(Error::Other(format!(
+                        "peer list line {n}: not lowercase hex"
+                    )))
+                }
+            }
+        }
+        if out.len() >= max {
+            return Err(Error::Other(format!(
+                "peer list line {n}: more than {max} entries"
+            )));
+        }
+        if !seen.insert(id) {
+            return Err(Error::Other(format!("peer list line {n}: duplicate id")));
+        }
+        out.push(PeerId(id));
+    }
+    Ok(out)
+}
+
+/// Lowercase hex digit value (uppercase is rejected on purpose).
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        _ => None,
+    }
+}
+
+/// Inverse of [`parse_peer_list`] (each id as `{id}\n`, in the given order).
+pub fn encode_peer_list(ids: &[PeerId]) -> Vec<u8> {
+    let mut s = String::with_capacity(ids.len() * PEER_LINE_LEN);
+    for id in ids {
+        s.push_str(&id.to_string());
+        s.push('\n');
+    }
+    s.into_bytes()
+}
+
+/// Read and strictly parse a peer-list file. Missing file → empty list.
+/// Files larger than `max * 65` bytes are rejected before reading.
+fn read_peer_list(path: &Path, max: usize) -> Result<Vec<PeerId>> {
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(io(&format!("stat {}", path.display()), e)),
+    };
+    if meta.len() > (max * PEER_LINE_LEN) as u64 {
+        return Err(Error::Other(format!(
+            "{} is too large (more than {max} entries)",
+            path.display()
+        )));
+    }
+    let b = std::fs::read(path).map_err(|e| io(&format!("read {}", path.display()), e))?;
+    parse_peer_list(&b, max).map_err(|e| Error::Other(format!("{}: {e}", path.display())))
+}
+
+impl IdentityStore {
+    fn known_peers_path(&self) -> PathBuf {
+        self.dir.join("known_peers")
+    }
+    fn seen_peers_path(&self) -> PathBuf {
+        self.dir.join("seen_peers")
+    }
+
+    /// Verified root PeerIds from `<dir>/known_peers` (sorted ascending).
+    /// A missing file means an empty list; a malformed or oversized file is an Err.
+    pub fn load_known_peers(&self) -> Result<Vec<PeerId>> {
+        read_peer_list(&self.known_peers_path(), MAX_KNOWN_PEERS)
+    }
+
+    /// Mark `root` verified. Ok(true) = added, Ok(false) = already present (no write).
+    /// Err if the existing file is malformed or already holds `MAX_KNOWN_PEERS` entries.
+    ///
+    /// Writes are atomic; two simultaneous writers are last-writer-wins.
+    pub fn add_known_peer(&self, root: &PeerId) -> Result<bool> {
+        let mut ids = self.load_known_peers()?;
+        if ids.contains(root) {
+            return Ok(false);
+        }
+        if ids.len() >= MAX_KNOWN_PEERS {
+            return Err(Error::Other(format!(
+                "known_peers already holds the maximum of {MAX_KNOWN_PEERS} entries"
+            )));
+        }
+        ids.push(root.clone());
+        ids.sort_by_key(|p| p.0);
+        std::fs::create_dir_all(&self.dir).map_err(|e| io("create dir", e))?;
+        write_atomic(&self.known_peers_path(), &encode_peer_list(&ids))?;
+        Ok(true)
+    }
+
+    /// Recently authenticated root PeerIds from `<dir>/seen_peers`, oldest first.
+    /// A missing file means an empty list; a malformed file is an Err.
+    pub fn load_seen_peers(&self) -> Result<Vec<PeerId>> {
+        read_peer_list(&self.seen_peers_path(), MAX_SEEN_PEERS)
+    }
+
+    /// Record that `root` just authenticated: move or append it to the end, and
+    /// drop the oldest while there are more than `MAX_SEEN_PEERS`. Never marks
+    /// verified. A malformed `seen_peers` is treated as empty and overwritten
+    /// (it is a convenience cache, not a trust store).
+    pub fn note_seen_peer(&self, root: &PeerId) -> Result<()> {
+        let mut ids = self.load_seen_peers().unwrap_or_default();
+        ids.retain(|p| p != root);
+        ids.push(root.clone());
+        while ids.len() > MAX_SEEN_PEERS {
+            ids.remove(0);
+        }
+        std::fs::create_dir_all(&self.dir).map_err(|e| io("create dir", e))?;
+        write_atomic(&self.seen_peers_path(), &encode_peer_list(&ids))
+    }
+}
+
 /// The cert must be for this device, issued by `root`, with a valid signature
 /// (expiry ignored: `not_after >= 1`, so `now = 0` never trips it).
 fn check_device_consistency(
@@ -1131,6 +1293,159 @@ mod tests {
         let l = root.revoke_devices(1, 0, &[]).unwrap();
         assert!(!store.store_peer_revocation(&l).unwrap());
         assert!(store.load_peer_revocations().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn pid2(n: u16) -> PeerId {
+        let mut b = [0u8; 32];
+        b[0] = (n >> 8) as u8;
+        b[1] = n as u8;
+        b[31] = 7;
+        PeerId(b)
+    }
+
+    #[test]
+    fn peer_list_round_trips_in_order() {
+        for ids in [vec![], vec![pid(1)], vec![pid(9), pid(2), pid(5), pid(7)]] {
+            assert_eq!(parse_peer_list(&encode_peer_list(&ids), 16).unwrap(), ids);
+        }
+    }
+
+    #[test]
+    fn peer_list_rejects_malformed_input() {
+        // Hex letters, so that upper-casing actually changes the line.
+        let good = format!("{}\n", pid(0xab));
+        assert!(parse_peer_list(good.as_bytes(), 4).is_ok());
+        let upper = good.to_uppercase();
+        let two = format!("{good}{}\n", pid(2));
+        let cases: Vec<Vec<u8>> = vec![
+            "é\n".as_bytes().to_vec(),
+            upper.into_bytes(),
+            b"0101\n".to_vec(),
+            format!("{}0\n", pid(1)).into_bytes(),
+            good.trim_end().as_bytes().to_vec(),
+            format!("{good}\n").into_bytes(),
+            b"\n".to_vec(),
+            good.replace('\n', "\r\n").into_bytes(),
+            format!(" {good}").into_bytes(),
+            format!("{} \n", pid(1)).into_bytes(),
+            format!("{good}{good}").into_bytes(),
+        ];
+        for c in &cases {
+            assert!(
+                parse_peer_list(c, 4).is_err(),
+                "{:?}",
+                String::from_utf8_lossy(c)
+            );
+        }
+        assert_eq!(parse_peer_list(two.as_bytes(), 2).unwrap().len(), 2);
+        assert!(parse_peer_list(two.as_bytes(), 1).is_err());
+        let msg = parse_peer_list(format!("{good}zz\n").as_bytes(), 4)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("line 2"), "{msg}");
+    }
+
+    #[test]
+    fn peer_list_max_boundary() {
+        let ids: Vec<PeerId> = (0..5).map(pid2).collect();
+        assert_eq!(
+            parse_peer_list(&encode_peer_list(&ids), 5).unwrap().len(),
+            5
+        );
+        assert!(parse_peer_list(&encode_peer_list(&ids), 4).is_err());
+    }
+
+    #[test]
+    fn peer_list_constants() {
+        assert_eq!(MAX_KNOWN_PEERS, 1024);
+        assert_eq!(MAX_SEEN_PEERS, 64);
+    }
+
+    #[test]
+    fn known_peers_add_load_and_sort() {
+        let tmp = tmp_dir("known");
+        let store = IdentityStore::with_dir(tmp.clone());
+        assert_eq!(store.load_known_peers().unwrap(), vec![]);
+        assert!(store.add_known_peer(&pid(5)).unwrap());
+        assert!(!store.add_known_peer(&pid(5)).unwrap());
+        assert_eq!(store.load_known_peers().unwrap(), vec![pid(5)]);
+        let raw = std::fs::read(tmp.join("known_peers")).unwrap();
+        assert_eq!(
+            parse_peer_list(&raw, MAX_KNOWN_PEERS).unwrap(),
+            vec![pid(5)]
+        );
+        for n in [9u8, 1, 7, 3] {
+            store.add_known_peer(&pid(n)).unwrap();
+        }
+        assert_eq!(
+            store.load_known_peers().unwrap(),
+            vec![pid(1), pid(3), pid(5), pid(7), pid(9)]
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn known_peers_corrupt_file_fails_closed() {
+        let tmp = tmp_dir("known-bad");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let bad = format!("{}\n", pid(0xab)).to_uppercase().into_bytes();
+        std::fs::write(tmp.join("known_peers"), &bad).unwrap();
+        let store = IdentityStore::with_dir(tmp.clone());
+        assert!(store.load_known_peers().is_err());
+        assert!(store.add_known_peer(&pid(1)).is_err());
+        assert_eq!(std::fs::read(tmp.join("known_peers")).unwrap(), bad);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn known_peers_full_file_rejects_add() {
+        let tmp = tmp_dir("known-full");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let ids: Vec<PeerId> = (0..MAX_KNOWN_PEERS as u16).map(pid2).collect();
+        let bytes = encode_peer_list(&ids);
+        std::fs::write(tmp.join("known_peers"), &bytes).unwrap();
+        let store = IdentityStore::with_dir(tmp.clone());
+        assert_eq!(store.load_known_peers().unwrap().len(), MAX_KNOWN_PEERS);
+        let e = store.add_known_peer(&pid2(60000)).unwrap_err().to_string();
+        assert!(e.contains("1024"), "{e}");
+        assert_eq!(std::fs::read(tmp.join("known_peers")).unwrap(), bytes);
+        // Already-present ids are still reported as such.
+        assert!(!store.add_known_peer(&pid2(3)).unwrap());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn seen_peers_bounded_oldest_first() {
+        let tmp = tmp_dir("seen");
+        let store = IdentityStore::with_dir(tmp.clone());
+        assert_eq!(store.load_seen_peers().unwrap(), vec![]);
+        for n in 0..70u16 {
+            store.note_seen_peer(&pid2(n)).unwrap();
+        }
+        let seen = store.load_seen_peers().unwrap();
+        assert_eq!(seen.len(), MAX_SEEN_PEERS);
+        assert_eq!(seen[0], pid2(6));
+        assert_eq!(seen[MAX_SEEN_PEERS - 1], pid2(69));
+        store.note_seen_peer(&pid2(10)).unwrap();
+        let seen = store.load_seen_peers().unwrap();
+        assert_eq!(seen.len(), MAX_SEEN_PEERS);
+        assert_eq!(seen.last().unwrap(), &pid2(10));
+        assert_eq!(seen.iter().filter(|p| **p == pid2(10)).count(), 1);
+        assert!(!tmp.join("known_peers").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn seen_peers_corrupt_file_is_replaced_and_known_untouched() {
+        let tmp = tmp_dir("seen-bad");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("seen_peers"), b"garbage").unwrap();
+        let store = IdentityStore::with_dir(tmp.clone());
+        assert!(store.load_seen_peers().is_err());
+        store.note_seen_peer(&pid(4)).unwrap();
+        assert_eq!(store.load_seen_peers().unwrap(), vec![pid(4)]);
+        assert!(!tmp.join("known_peers").exists());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

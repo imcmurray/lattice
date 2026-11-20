@@ -60,10 +60,14 @@
   that session's secret and the channel binding (`lattice-resume-v2`). Anyone
   holding the current session state (for example a compromised device) can still
   resume.
-- On first contact, compare the peer's **root** fingerprint (`lattice-net
-  whoami`, and the one printed on connect) with your peer out of band (trust on
-  first use): the ticket itself is not authenticated. The fingerprint comparison
-  is manual; nothing enforces it.
+- On first contact, compare the 60-digit **safety number** of the two root
+  identities (printed on every connection; `lattice-net whoami` shows the root
+  fingerprint) with your peer by voice or in person (trust on first use): the
+  ticket itself is not authenticated. After comparing, run `lattice-net
+  verify-peer` to record the peer's root in `known_peers`; later connections
+  then say "verified peer", and every other one says "UNVERIFIED peer". The
+  comparison is still manual: nothing enforces it, and `lattice-net` never
+  verifies a peer automatically.
 - Metadata (who talks to whom) is not hidden.
 - There is no identity hiding: the dialer's device identity (in the
   `lattice-net` preamble) and the listener's device identity, root identity and
@@ -85,8 +89,11 @@
   obtained; only `lattice-net` distributes and enforces lists (lazily, see
   above).
 - Public identity and signature encodings are parsed strictly and canonically:
-  trailing bytes, wrong-length or invalid keys and small-order Ed25519 keys are
-  rejected at parse time.
+  trailing bytes, wrong-length or invalid keys, small-order Ed25519 keys, and
+  low-order or non-canonical X25519 keys are rejected at parse time.
+- The `lattice-net` listener keeps at most 64 sessions for resume
+  (`MAX_KEPT_SESSIONS`) and evicts the least recently used. Outgoing QUIC
+  connect and `open_bi` are each bounded by a 15 s `CONNECT_TIMEOUT`.
 - `lattice-net` must not be used for real secrets.
 
 ## Reporting a vulnerability

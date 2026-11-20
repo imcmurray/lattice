@@ -30,6 +30,10 @@
 //! PeerIds. Checking one is the caller's job
 //! ([`DeviceCert::verify_with_revocation`]); distributing lists is up to the
 //! application (`lattice-net` sends them lazily in its auth bundles).
+//!
+//! Two people can compare a symmetric 60-digit [`safety_number`] of their two
+//! root identities instead of two hex fingerprints (DESIGN.md §5.2). It is
+//! display-only: comparing it is a manual step.
 
 use lattice_core::{CryptoSuite, Error, Identity, PeerId, Result, Signature, Verify};
 
@@ -65,6 +69,102 @@ const DEVICE_CERT_DOMAIN: &[u8] = b"lattice-device-cert-v2";
 /// Hard cap on an encoded [`DeviceCert`] (bytes).
 const MAX_DEVICE_CERT_LEN: usize = 64 * 1024;
 const SIG_DOMAIN: &[u8] = b"lattice-sig-v2";
+
+/// Domain string of the safety number.
+pub const SAFETY_NUMBER_DOMAIN: &[u8] = b"lattice-safety-number-v1";
+/// Number of 5-digit groups (12 × 5 = 60 decimal digits).
+pub const SAFETY_NUMBER_GROUPS: usize = 12;
+
+/// Exclusive bound for rejection sampling: 167 × 100 000, the largest multiple
+/// of 100 000 below 2^24.
+const SAFETY_NUMBER_LIMIT: u32 = 16_700_000;
+
+/// Symmetric safety number of two (root) identities: 12 groups of 5 decimal
+/// digits separated by single spaces (71 chars).
+/// `safety_number(a, b) == safety_number(b, a)`.
+///
+/// Construction (DESIGN.md §5.2; the hash is not iterated):
+/// 1. Order the identities canonically: `(x, y) = if a.peer_id().0 <= b.peer_id().0
+///    { (a, b) } else { (b, a) }` (raw 32 bytes, lexicographic).
+/// 2. `h = blake3::Hasher::new()`; `h.update(SAFETY_NUMBER_DOMAIN)`; then for
+///    each `p` in `[x, y]` with `bytes = p.to_bytes()`: `h.update(u32le(bytes.len()))`
+///    and `h.update(bytes)`.
+/// 3. Read the BLAKE3 XOF `h.finalize_xof()` three bytes at a time;
+///    `v = u32le([b0, b1, b2, 0])`; if `v < 16_700_000` the group value is
+///    `v % 100_000`, otherwise draw again (unbiased rejection sampling).
+/// 4. Format each of the 12 groups as `{:05}`, joined by single spaces.
+///
+/// Never panics and never fails; identities of either suite are accepted.
+pub fn safety_number(a: &PublicIdentity, b: &PublicIdentity) -> String {
+    let (x, y) = if a.peer_id().0 <= b.peer_id().0 {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    let mut h = blake3::Hasher::new();
+    h.update(SAFETY_NUMBER_DOMAIN);
+    for p in [x, y] {
+        let bytes = p.to_bytes();
+        h.update(&(bytes.len() as u32).to_le_bytes());
+        h.update(&bytes);
+    }
+    let mut xof = h.finalize_xof();
+    let mut groups = Vec::with_capacity(SAFETY_NUMBER_GROUPS);
+    while groups.len() < SAFETY_NUMBER_GROUPS {
+        let mut b = [0u8; 3];
+        xof.fill(&mut b);
+        let v = u32::from_le_bytes([b[0], b[1], b[2], 0]);
+        if v < SAFETY_NUMBER_LIMIT {
+            groups.push(format!("{:05}", v % 100_000));
+        }
+    }
+    groups.join(" ")
+}
+
+/// Low-order / non-canonical X25519 u-coordinates (libsodium `has_small_order`
+/// blacklist, little-endian). Kept explicitly for documentation; the range
+/// checks in [`x25519_public_ok`] already cover `p` and `p + 1`.
+const X25519_BLACKLIST: [[u8; 32]; 7] = [
+    [0; 32],
+    [
+        1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0,
+    ],
+    [
+        0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f, 0xc4,
+        0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16, 0x5f, 0x49,
+        0xb8, 0x00,
+    ],
+    [
+        0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83, 0xef,
+        0x5b, 0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd, 0xd0, 0x9f,
+        0x11, 0x57,
+    ],
+    x25519_p_plus(0xec),
+    x25519_p_plus(0xed),
+    x25519_p_plus(0xee),
+];
+
+/// `ff × 30 ‖ 7f` with the given first byte: p − 1 (`ec`), p (`ed`), p + 1 (`ee`).
+const fn x25519_p_plus(first: u8) -> [u8; 32] {
+    let mut k = [0xffu8; 32];
+    k[0] = first;
+    k[31] = 0x7f;
+    k
+}
+
+/// True iff `k` is an acceptable X25519 public key: bit 255 clear, little-endian
+/// value < p = 2^255 - 19, and not one of the low-order u-coordinates above.
+fn x25519_public_ok(k: &[u8; 32]) -> bool {
+    if k[31] & 0x80 != 0 {
+        return false;
+    }
+    // value >= p  <=>  top byte 0x7f, middle bytes all 0xff, first byte >= 0xed.
+    if k[31] == 0x7f && k[1..31].iter().all(|&b| b == 0xff) && k[0] >= 0xed {
+        return false;
+    }
+    !X25519_BLACKLIST.iter().any(|bad| bad == k)
+}
 
 /// The exact bytes both signature halves cover:
 /// `SIG_DOMAIN ‖ suite_tag (1) ‖ peer_id (32) ‖ u32le(msg.len()) ‖ msg`.
@@ -236,6 +336,9 @@ impl PublicIdentity {
         match EdVerifyingKey::from_bytes(&ed25519) {
             Ok(vk) if !vk.is_weak() => {}
             _ => return Err(Error::Crypto("invalid Ed25519 public key".into())),
+        }
+        if !x25519_public_ok(&x25519) {
+            return Err(Error::Crypto("invalid X25519 public key".into()));
         }
 
         match suite {
@@ -1409,5 +1512,178 @@ mod tests {
                 .peer_id(),
             device.peer_id()
         );
+    }
+
+    // ----- safety numbers -----
+
+    fn gen_classical() -> Keypair {
+        Keypair::generate(CryptoSuite::Classical).unwrap()
+    }
+
+    fn well_formed(sn: &str) -> bool {
+        sn.len() == 71
+            && sn.split(' ').count() == SAFETY_NUMBER_GROUPS
+            && sn
+                .split(' ')
+                .all(|g| g.len() == 5 && g.bytes().all(|c| c.is_ascii_digit()))
+    }
+
+    #[test]
+    fn safety_number_constants() {
+        assert_eq!(SAFETY_NUMBER_DOMAIN, b"lattice-safety-number-v1");
+        assert_eq!(SAFETY_NUMBER_GROUPS, 12);
+    }
+
+    #[test]
+    fn safety_number_is_symmetric_and_well_formed() {
+        let (a, b) = (gen_classical(), gen_classical());
+        let ab = safety_number(a.public(), b.public());
+        assert_eq!(ab, safety_number(b.public(), a.public()));
+        assert!(well_formed(&ab), "{ab}");
+        #[cfg(feature = "pq")]
+        {
+            let (h1, h2) = (
+                Keypair::generate(CryptoSuite::Hybrid).unwrap(),
+                Keypair::generate(CryptoSuite::Hybrid).unwrap(),
+            );
+            assert_eq!(
+                safety_number(h1.public(), h2.public()),
+                safety_number(h2.public(), h1.public())
+            );
+        }
+    }
+
+    #[test]
+    fn safety_number_same_identity_is_well_formed() {
+        let a = gen_classical();
+        assert!(well_formed(&safety_number(a.public(), a.public())));
+    }
+
+    #[test]
+    fn safety_number_changes_with_either_input() {
+        let (a, b, c) = (gen_classical(), gen_classical(), gen_classical());
+        let ab = safety_number(a.public(), b.public());
+        assert_ne!(ab, safety_number(a.public(), c.public()));
+        assert_ne!(ab, safety_number(c.public(), b.public()));
+    }
+
+    #[test]
+    fn safety_number_is_deterministic() {
+        let a = classical();
+        let b = Keypair::from_mnemonic(
+            CryptoSuite::Classical,
+            "legal winner thank year wave sausage worth useful legal winner thank yellow",
+        )
+        .unwrap();
+        let n1 = safety_number(a.public(), b.public());
+        let a2 = PublicIdentity::from_bytes(&a.public().to_bytes()).unwrap();
+        let b2 = Keypair::from_mnemonic(CryptoSuite::Classical, b.mnemonic()).unwrap();
+        assert_eq!(n1, safety_number(&a2, b2.public()));
+        assert_eq!(n1, safety_number(a.public(), b.public()));
+    }
+
+    #[cfg(feature = "pq")]
+    #[test]
+    fn safety_number_differs_between_suites_of_one_mnemonic() {
+        let (c, h) = pair();
+        let peer = gen_classical();
+        assert_ne!(
+            safety_number(c.public(), peer.public()),
+            safety_number(h.public(), peer.public())
+        );
+    }
+
+    #[test]
+    fn safety_number_matches_documented_construction() {
+        let a = classical();
+        let b = Keypair::from_mnemonic(
+            CryptoSuite::Classical,
+            "legal winner thank year wave sausage worth useful legal winner thank yellow",
+        )
+        .unwrap();
+        let (x, y) = if a.public().peer_id().0 <= b.public().peer_id().0 {
+            (a.public(), b.public())
+        } else {
+            (b.public(), a.public())
+        };
+        let mut h = blake3::Hasher::new();
+        h.update(b"lattice-safety-number-v1");
+        for p in [x, y] {
+            let bytes = p.to_bytes();
+            h.update(&(bytes.len() as u32).to_le_bytes());
+            h.update(&bytes);
+        }
+        let mut xof = h.finalize_xof();
+        let mut groups = Vec::new();
+        while groups.len() < 12 {
+            let mut buf = [0u8; 3];
+            xof.fill(&mut buf);
+            let v = u32::from(buf[0]) | (u32::from(buf[1]) << 8) | (u32::from(buf[2]) << 16);
+            if v < 16_700_000 {
+                groups.push(format!("{:05}", v % 100_000));
+            }
+        }
+        let expected = groups.join(" ");
+        assert_eq!(safety_number(a.public(), b.public()), expected);
+        assert_eq!(safety_number(b.public(), a.public()), expected);
+    }
+
+    // ----- X25519 public key validation -----
+
+    fn with_x25519(id: &PublicIdentity, k: [u8; 32]) -> Vec<u8> {
+        let mut b = id.to_bytes();
+        b[33..65].copy_from_slice(&k);
+        b
+    }
+
+    #[test]
+    fn from_bytes_rejects_blacklisted_x25519_keys() {
+        let kp = gen_classical();
+        for bad in X25519_BLACKLIST {
+            assert!(matches!(
+                PublicIdentity::from_bytes(&with_x25519(kp.public(), bad)),
+                Err(Error::Crypto(_))
+            ));
+        }
+        // The list matches the spec's hex (libsodium has_small_order).
+        assert_eq!(
+            X25519_BLACKLIST[2],
+            hex32("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800")
+        );
+        assert_eq!(
+            X25519_BLACKLIST[3],
+            hex32("5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157")
+        );
+    }
+
+    #[test]
+    fn from_bytes_rejects_non_canonical_x25519_keys() {
+        let kp = gen_classical();
+        let mut p_plus_2 = [0xffu8; 32];
+        p_plus_2[0] = 0xef;
+        p_plus_2[31] = 0x7f;
+        let mut all_ff_7f = [0xffu8; 32];
+        all_ff_7f[31] = 0x7f;
+        let mut high_bit = kp.public().x25519_bytes();
+        high_bit[31] |= 0x80;
+        for bad in [p_plus_2, all_ff_7f, high_bit] {
+            assert!(matches!(
+                PublicIdentity::from_bytes(&with_x25519(kp.public(), bad)),
+                Err(Error::Crypto(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn generated_keys_round_trip_through_from_bytes() {
+        for _ in 0..256 {
+            let kp = gen_classical();
+            assert!(PublicIdentity::from_bytes(&kp.public().to_bytes()).is_ok());
+        }
+        #[cfg(feature = "pq")]
+        for _ in 0..16 {
+            let kp = Keypair::generate(CryptoSuite::Hybrid).unwrap();
+            assert!(PublicIdentity::from_bytes(&kp.public().to_bytes()).is_ok());
+        }
     }
 }

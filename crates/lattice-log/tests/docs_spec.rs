@@ -131,6 +131,23 @@ fn security_md_qualifies_hybrid_handshake() {
 }
 
 #[test]
+fn docs_mention_safety_numbers_and_hardening() {
+    let d = read("DESIGN.md");
+    for need in [
+        "lattice-safety-number-v1",
+        "known_peers",
+        "MAX_KEPT_SESSIONS",
+        "CONNECT_TIMEOUT",
+    ] {
+        assert!(d.contains(need), "DESIGN.md missing {need:?}");
+    }
+    let s = read("SECURITY.md").to_lowercase();
+    for need in ["safety number", "verify-peer", "x25519"] {
+        assert!(s.contains(need), "SECURITY.md missing {need:?}");
+    }
+}
+
+#[test]
 fn security_md_has_new_limitations() {
     let s = read("SECURITY.md").to_lowercase();
     for kw in ["metadata", "identity hiding", "single-hop"] {

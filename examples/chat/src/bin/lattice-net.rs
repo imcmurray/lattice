@@ -6,6 +6,23 @@
 //!               `lattice-net show-recovery-phrase --i-understand`
 //!               `lattice-net renew-device` / `revoke-device <id>`
 //!               `lattice-net forget-root --i-understand` / `import-root`
+//!               `lattice-net verify-peer <root peer id | root fingerprint>`
+//!
+//! **Safety numbers.** After every successful authentication (fresh or
+//! resumed, on both sides) lattice-net prints one symmetric 60-digit safety
+//! number derived from both *root* identities (`lattice_identity::safety_number`,
+//! DESIGN.md §5.2) and says either "verified peer" or a prominent "UNVERIFIED
+//! peer" line. Compare the number with your peer by voice or in person, then
+//! run `verify-peer` to record that root in `<dir>/known_peers`. Verification
+//! is never automatic: only `verify-peer` writes `known_peers`. Recently seen
+//! roots are cached in `seen_peers` so a 40-hex fingerprint can be resolved.
+//! A peer with our own root counts as verified. If `known_peers` is corrupt,
+//! every peer is shown as unverified and the file is left alone.
+//!
+//! The listener keeps at most `MAX_KEPT_SESSIONS` (64) sessions for resume,
+//! evicting the least recently used. Outgoing QUIC connect and open_bi are
+//! bounded by `CONNECT_TIMEOUT` (15 s) in the transport; a timeout goes
+//! through the normal retry/backoff path.
 //!
 //! **Device keys (ADR-013).** The root identity (recoverable from its mnemonic)
 //! is *not* the everyday key. Each store holds a separate Hybrid **device**
@@ -60,6 +77,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use lattice::identity::safety_number;
 use lattice::identity::storage::{IdentityStore, StorageBackend};
 use lattice::prelude::*;
 use lattice::session::{resume_nonce, ResumeRole};
@@ -125,7 +143,8 @@ const USAGE: &str = "usage:
   lattice-net renew-device
   lattice-net revoke-device <64-hex device peer id>
   lattice-net forget-root --i-understand
-  lattice-net import-root        (the recovery phrase is read from stdin)";
+  lattice-net import-root        (the recovery phrase is read from stdin)
+  lattice-net verify-peer <64-hex root peer id | 40-hex root fingerprint>";
 
 const RECOVERY_REFUSAL: &str = "the recovery phrase is the root secret of your identity:
 anyone who has it can impersonate you. If you really want it printed, rerun with
@@ -170,7 +189,237 @@ enum Command {
     RevokeDevice(PeerId),
     ForgetRoot,
     ImportRoot,
+    VerifyPeer(VerifyTarget),
     Usage,
+}
+
+/// What `verify-peer` was given.
+#[derive(Debug, PartialEq)]
+enum VerifyTarget {
+    /// A full 64-hex root peer id.
+    Full(PeerId),
+    /// A 40-hex root fingerprint (first 20 bytes of the root peer id).
+    Fingerprint([u8; 20]),
+}
+
+/// Decode hex of either case; `None` on odd length or a non-hex character.
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    let b = s.as_bytes();
+    if !b.len().is_multiple_of(2) {
+        return None;
+    }
+    b.chunks(2)
+        .map(|p| {
+            let hi = (p[0] as char).to_digit(16)?;
+            let lo = (p[1] as char).to_digit(16)?;
+            Some((hi * 16 + lo) as u8)
+        })
+        .collect()
+}
+
+/// Concatenate `parts` (so an unquoted, space-separated fingerprint works),
+/// remove ASCII spaces, then: 64 hex chars → `Full`, 40 hex chars →
+/// `Fingerprint`, anything else (empty, other lengths, non-hex) → `Err`.
+fn parse_verify_target(parts: &[String]) -> Result<VerifyTarget> {
+    let joined: String = parts.concat().chars().filter(|c| *c != ' ').collect();
+    let bad = || {
+        Error::Other(
+            "usage: lattice-net verify-peer <64-hex root peer id | 40-hex root fingerprint>".into(),
+        )
+    };
+    let bytes = decode_hex(&joined).ok_or_else(bad)?;
+    match bytes.len() {
+        32 => {
+            let mut id = [0u8; 32];
+            id.copy_from_slice(&bytes);
+            Ok(VerifyTarget::Full(PeerId(id)))
+        }
+        20 => {
+            let mut fp = [0u8; 20];
+            fp.copy_from_slice(&bytes);
+            Ok(VerifyTarget::Fingerprint(fp))
+        }
+        _ => Err(bad()),
+    }
+}
+
+/// Resolve against candidate roots (`seen_peers`): exactly one whose first 20
+/// bytes match → `Ok(id)`; none or several → `Err`. `Full(id)` → `Ok(id)`
+/// without consulting the candidates.
+fn resolve_verify_target(t: &VerifyTarget, candidates: &[PeerId]) -> Result<PeerId> {
+    match t {
+        VerifyTarget::Full(id) => Ok(id.clone()),
+        VerifyTarget::Fingerprint(fp) => {
+            let mut hits = candidates.iter().filter(|c| c.0[..20] == fp[..]);
+            match (hits.next(), hits.next()) {
+                (Some(id), None) => Ok(id.clone()),
+                (None, _) => Err(Error::Other(
+                    "no recently seen peer has that fingerprint: connect to the peer first, or \
+                     pass the full 64-hex root peer id (the peer's `whoami` shows it)"
+                        .into(),
+                )),
+                (Some(_), Some(_)) => Err(Error::Other(
+                    "that fingerprint is ambiguous among recently seen peers: pass the full \
+                     64-hex root peer id"
+                        .into(),
+                )),
+            }
+        }
+    }
+}
+
+/// Pure: the lines printed after a successful auth (fresh or resumed).
+fn trust_lines(
+    own_root: &PublicIdentity,
+    peer_root: &PublicIdentity,
+    verified: bool,
+) -> Vec<String> {
+    let sn = safety_number(own_root, peer_root);
+    let peer_id = peer_root.peer_id();
+    let mut out = vec![
+        format!(
+            "[lattice-net] safety number: {sn} — compare this number with your peer by voice or in person"
+        ),
+        format!(
+            "[lattice-net] safety number (single line): {}",
+            sn.replace(' ', "")
+        ),
+    ];
+    if verified {
+        out.push(format!(
+            "[lattice-net] verified peer (root {})",
+            peer_id.fingerprint()
+        ));
+    } else {
+        out.push(format!(
+            "[lattice-net] ⚠ UNVERIFIED peer — compare the safety number, then run: lattice-net verify-peer {peer_id}"
+        ));
+    }
+    out
+}
+
+/// Load known_peers (on Err: warn and treat as unverified), compute
+/// verified = known.contains(peer) || peer == own root, record the peer as
+/// seen (warn on Err), and print `trust_lines` to stderr. Never verifies anyone.
+fn report_peer_trust(store: &IdentityStore, own_root: &PublicIdentity, peer_root: &PublicIdentity) {
+    let peer_id = peer_root.peer_id();
+    let known = match store.load_known_peers() {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("[lattice-net] warning: cannot read known_peers ({e}) — treating peers as unverified");
+            Vec::new()
+        }
+    };
+    let verified = known.contains(&peer_id) || peer_id == own_root.peer_id();
+    if let Err(e) = store.note_seen_peer(&peer_id) {
+        eprintln!("[lattice-net] warning: cannot record seen peer: {e}");
+    }
+    for line in trust_lines(own_root, peer_root, verified) {
+        eprintln!("{line}");
+    }
+}
+
+/// `verify-peer`: mark a root as verified. Touches only `known_peers` (and
+/// reads `seen_peers` for the fingerprint form); loads no identity.
+fn verify_peer_cmd(target: &VerifyTarget) -> Result<()> {
+    let store = IdentityStore::open_default();
+    let candidates = match target {
+        VerifyTarget::Fingerprint(_) => store.load_seen_peers()?,
+        VerifyTarget::Full(_) => Vec::new(),
+    };
+    let id = resolve_verify_target(target, &candidates)?;
+    let added = store.add_known_peer(&id)?;
+    println!(
+        "{}",
+        if added {
+            format!("marked root {} ({id}) as verified", id.fingerprint())
+        } else {
+            format!("root {} ({id}) was already verified", id.fingerprint())
+        }
+    );
+    Ok(())
+}
+
+/// Max sessions the listener keeps for resume; least recently used are evicted.
+const MAX_KEPT_SESSIONS: usize = 64;
+
+/// Bounded map PeerId -> V with least-recently-used eviction. "Use" = insert
+/// (a resumed or fresh session is removed and re-inserted after its chat).
+struct KeptSessions<V = KeptPeer> {
+    map: HashMap<PeerId, (u64, V)>,
+    tick: u64,
+    cap: usize,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl<V> KeptSessions<V> {
+    fn new() -> Self {
+        Self::with_cap(MAX_KEPT_SESSIONS)
+    }
+
+    fn with_cap(cap: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            tick: 0,
+            cap: cap.max(1),
+        }
+    }
+
+    /// Does not refresh the tick: resume removes the entry anyway.
+    fn get(&self, id: &PeerId) -> Option<&V> {
+        self.map.get(id).map(|(_, v)| v)
+    }
+
+    fn remove(&mut self, id: &PeerId) -> Option<V> {
+        self.map.remove(id).map(|(_, v)| v)
+    }
+
+    fn contains_key(&self, id: &PeerId) -> bool {
+        self.map.contains_key(id)
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Insert/replace with a fresh tick; then evict the min-tick entry while
+    /// len > cap. Returns the evicted ids (never `id` itself).
+    fn insert(&mut self, id: PeerId, v: V) -> Vec<PeerId> {
+        self.tick += 1;
+        self.map.insert(id.clone(), (self.tick, v));
+        let mut evicted = Vec::new();
+        while self.map.len() > self.cap {
+            let oldest = self
+                .map
+                .iter()
+                .filter(|(k, _)| **k != id)
+                .min_by_key(|(_, (t, _))| *t)
+                .map(|(k, _)| k.clone());
+            match oldest {
+                Some(k) => {
+                    self.map.remove(&k);
+                    evicted.push(k);
+                }
+                None => break,
+            }
+        }
+        evicted
+    }
+}
+
+impl<V, const N: usize> From<[(PeerId, V); N]> for KeptSessions<V> {
+    /// Inserts in array order.
+    fn from(items: [(PeerId, V); N]) -> Self {
+        let mut s = Self::new();
+        for (id, v) in items {
+            s.insert(id, v);
+        }
+        s
+    }
 }
 
 /// Parse 64 hex characters (either case) into a PeerId.
@@ -241,6 +490,7 @@ fn parse_command(args: &[String]) -> Result<Command> {
                 ))
             }
         }
+        Some("verify-peer") => Ok(Command::VerifyPeer(parse_verify_target(&args[2..])?)),
         _ => Ok(Command::Usage),
     }
 }
@@ -701,6 +951,7 @@ async fn run() -> Result<()> {
             return Ok(());
         }
         Command::ImportRoot => return import_root_cmd(now),
+        Command::VerifyPeer(target) => return verify_peer_cmd(&target),
         _ => {}
     }
 
@@ -803,7 +1054,7 @@ async fn run() -> Result<()> {
                 _ => Ok(()),
             }
         }
-        Command::ImportRoot | Command::Usage => Ok(()),
+        Command::ImportRoot | Command::VerifyPeer(_) | Command::Usage => Ok(()),
     }
 }
 
@@ -899,7 +1150,7 @@ async fn listen(
         })
     };
 
-    let mut sessions: HashMap<PeerId, KeptPeer> = HashMap::new();
+    let mut sessions: KeptSessions = KeptSessions::new();
     loop {
         eprintln!("[lattice-net] waiting for a peer to connect...");
         let Some(conn) = rx.recv().await else {
@@ -926,6 +1177,7 @@ async fn listen(
                 continue;
             }
         };
+        report_peer_trust(&store, &me.root, &auth.root);
         match chat(sess, &mut lines).await {
             Ok((Outcome::LocalClosed, _)) => {
                 eprintln!("[lattice-net] input closed — exiting");
@@ -933,8 +1185,14 @@ async fn listen(
             }
             Ok((Outcome::PeerDisconnected, recovered)) => {
                 if let Some(session) = recovered {
-                    // keep for a future resume
-                    sessions.insert(auth.device.peer_id(), KeptPeer { session, auth });
+                    // keep for a future resume (least recently used are evicted)
+                    let evicted =
+                        sessions.insert(auth.device.peer_id(), KeptPeer { session, auth });
+                    if !evicted.is_empty() {
+                        eprintln!(
+                            "[lattice-net] kept-session limit reached — dropped the least recently used session"
+                        );
+                    }
                 }
                 eprintln!("[lattice-net] peer disconnected — back to listening (session kept)");
             }
@@ -1058,7 +1316,7 @@ async fn reply_busy<C: Connection>(mut conn: C) -> Result<()> {
 async fn negotiate_accept<C: Connection>(
     conn: C,
     me: &DeviceCreds,
-    sessions: &mut HashMap<PeerId, KeptPeer>,
+    sessions: &mut KeptSessions,
     binding: &[u8],
     now: u64,
     cache: &mut RevocationCache,
@@ -1119,7 +1377,7 @@ async fn negotiate_dial_within<C: Connection>(
 async fn accept_or_resume<C: Connection>(
     mut conn: C,
     me: &DeviceCreds,
-    sessions: &mut HashMap<PeerId, KeptPeer>,
+    sessions: &mut KeptSessions,
     binding: &[u8],
     now: u64,
     cache: &mut RevocationCache,
@@ -1223,7 +1481,10 @@ async fn connect(
     let mut kept: Option<KeptPeer> = None;
     let mut backoff = 1u64;
     loop {
-        let r = dial_once(&t, &ticket, &parsed, &me, &mut kept, &mut cache, &mut lines).await;
+        let r = dial_once(
+            &t, &ticket, &parsed, &me, &mut kept, &mut cache, &store, &mut lines,
+        )
+        .await;
         persist_cache(&store, &mut cache);
         match r {
             Ok(Outcome::LocalClosed) => {
@@ -1387,6 +1648,7 @@ async fn negotiate_dial<C: Connection>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dial_once(
     t: &IrohTransport,
     ticket: &str,
@@ -1394,6 +1656,7 @@ async fn dial_once(
     me: &DeviceCreds,
     kept: &mut Option<KeptPeer>,
     cache: &mut RevocationCache,
+    store: &IdentityStore,
     lines: &mut StdinLines,
 ) -> Result<Outcome> {
     eprintln!("[lattice-net] dialing peer...");
@@ -1419,6 +1682,7 @@ async fn dial_once(
         limit,
     )
     .await?;
+    report_peer_trust(store, &me.root, &auth.root);
 
     match chat(cs, lines).await {
         Ok((Outcome::PeerDisconnected, recovered)) => {
@@ -1574,12 +1838,12 @@ mod tests {
     }
 
     /// Listener map holding a kept session for alice's device (responder = bob).
-    fn stale(alice: &DeviceCreds, bob: &DeviceCreds) -> HashMap<PeerId, KeptPeer> {
+    fn stale(alice: &DeviceCreds, bob: &DeviceCreds) -> KeptSessions {
         let (m1, pending) =
             SecureSession::initiate(&bob.device, alice.device.public(), b"").unwrap();
         let (m2, _) = SecureSession::respond(&alice.device, bob.device.public(), b"", &m1).unwrap();
         let s = pending.finish(&m2).unwrap();
-        HashMap::from([(alice.device.peer_id(), kept(s, alice))])
+        KeptSessions::from([(alice.device.peer_id(), kept(s, alice))])
     }
 
     async fn send_preamble(conn: &mut MemoryConn, mode: u8, nonce: [u8; NONCE_LEN], who: &Keypair) {
@@ -1609,7 +1873,7 @@ mod tests {
     #[tokio::test]
     async fn fresh_dial_and_accept_two_roots() {
         let (alice, bob) = (creds(), creds());
-        let mut sessions = HashMap::new();
+        let mut sessions = KeptSessions::new();
         let (mut ca, mut cb) = (cache(), cache());
         let mut k = None;
         let (dial, listen) = pair().await;
@@ -1674,7 +1938,7 @@ mod tests {
     #[tokio::test]
     async fn fresh_handshake_with_mismatched_bindings_fails() {
         let (alice, bob) = (creds(), creds());
-        let mut sessions = HashMap::new();
+        let mut sessions = KeptSessions::new();
         let (dial, listen) = pair().await;
         let b_dial = channel_binding(&[1u8; 32], &[2u8; 32]);
         let b_listen = channel_binding(&[1u8; 32], &[3u8; 32]);
@@ -1694,7 +1958,7 @@ mod tests {
     #[tokio::test]
     async fn genuine_resume_with_mutual_proof_succeeds() {
         let (alice, bob, a, b) = genuine();
-        let mut sessions = HashMap::from([(alice.device.peer_id(), b)]);
+        let mut sessions = KeptSessions::from([(alice.device.peer_id(), b)]);
         let mut k = Some(a);
         let (dial, listen) = pair().await;
         let bd = bnd();
@@ -1717,7 +1981,7 @@ mod tests {
     #[tokio::test]
     async fn resume_with_mismatched_bindings_fails_and_keeps_state() {
         let (alice, bob, a, b) = genuine();
-        let mut sessions = HashMap::from([(alice.device.peer_id(), b)]);
+        let mut sessions = KeptSessions::from([(alice.device.peer_id(), b)]);
         let mut k = Some(a);
         let (dial, listen) = pair().await;
         let b_dial = channel_binding(&[1u8; 32], &[2u8; 32]);
@@ -1743,7 +2007,7 @@ mod tests {
     #[tokio::test]
     async fn impostor_with_bogus_tag_cannot_resume() {
         let (alice, bob, _a, b) = genuine();
-        let mut sessions = HashMap::from([(alice.device.peer_id(), b)]);
+        let mut sessions = KeptSessions::from([(alice.device.peer_id(), b)]);
         let (mut eve, listen) = pair().await;
         eve.send(&resume_preamble(&[7u8; NONCE_LEN], &alice.device))
             .await
@@ -1762,7 +2026,7 @@ mod tests {
     #[tokio::test]
     async fn impostor_hanging_up_cannot_resume() {
         let (alice, bob, _a, b) = genuine();
-        let mut sessions = HashMap::from([(alice.device.peer_id(), b)]);
+        let mut sessions = KeptSessions::from([(alice.device.peer_id(), b)]);
         let (mut eve, listen) = pair().await;
         eve.send(&resume_preamble(&[7u8; NONCE_LEN], &alice.device))
             .await
@@ -1796,7 +2060,7 @@ mod tests {
             SecureSession::initiate(&alice.device, bob.device.public(), b"").unwrap();
         let (m2, b) = SecureSession::respond(&bob.device, alice.device.public(), b"", &m1).unwrap();
         let _a = pending.finish(&m2).unwrap();
-        let mut sessions = HashMap::from([(alice.device.peer_id(), kept(b, &alice))]);
+        let mut sessions = KeptSessions::from([(alice.device.peer_id(), kept(b, &alice))]);
         // Bob learns that alice's root revoked alice's device.
         let mut cb = cache();
         let list = alice_root
@@ -2255,7 +2519,7 @@ mod tests {
     #[tokio::test]
     async fn resume_without_tag_times_out_and_session_still_resumes() {
         let (alice, bob, a, b) = genuine();
-        let mut sessions = HashMap::from([(alice.device.peer_id(), b)]);
+        let mut sessions = KeptSessions::from([(alice.device.peer_id(), b)]);
         let (mut eve, listen) = pair().await;
         eve.send(&resume_preamble(&[7u8; NONCE_LEN], &alice.device))
             .await
@@ -2683,6 +2947,172 @@ mod tests {
         let mut args = vec!["lattice-net".to_string()];
         args.extend(a.iter().map(|s| s.to_string()));
         parse_command(&args)
+    }
+
+    // ---- safety numbers, verify-peer, kept sessions ----
+
+    #[test]
+    fn trust_lines_unverified_and_verified() {
+        let (a, b) = (id(), id());
+        let sn = safety_number(a.public(), b.public());
+        let peer_hex = b.public().peer_id().to_string();
+
+        let un = trust_lines(a.public(), b.public(), false);
+        assert!(un.iter().any(|l| l.contains(&sn)
+            && l.contains("compare this number with your peer by voice or in person")));
+        assert!(un.iter().any(|l| l.contains(&sn.replace(' ', ""))));
+        assert!(un.iter().any(
+            |l| l.contains("UNVERIFIED peer — compare the safety number")
+                && l.contains(&format!("verify-peer {peer_hex}"))
+        ));
+        assert!(!un.iter().any(|l| l.contains("verified peer (")));
+
+        let ok = trust_lines(a.public(), b.public(), true);
+        assert!(ok.iter().any(|l| l.contains("verified peer")));
+        assert!(!ok.iter().any(|l| l.contains("UNVERIFIED")));
+
+        // Both sides print the same safety number.
+        let ba = trust_lines(b.public(), a.public(), false);
+        assert_eq!(un[0], ba[0]);
+        assert_eq!(un[1], ba[1]);
+    }
+
+    #[test]
+    fn parse_command_verify_peer() {
+        let hex = "ab".repeat(32);
+        let full = Command::VerifyPeer(VerifyTarget::Full(PeerId([0xab; 32])));
+        assert_eq!(cmd(&["verify-peer", &hex]).unwrap(), full);
+        assert_eq!(cmd(&["verify-peer", &hex.to_uppercase()]).unwrap(), full);
+
+        let id32: Vec<u8> = (0u8..32).collect();
+        let fp_hex: String = id32[..20].iter().map(|b| format!("{b:02x}")).collect();
+        let mut fp = [0u8; 20];
+        fp.copy_from_slice(&id32[..20]);
+        let want = Command::VerifyPeer(VerifyTarget::Fingerprint(fp));
+        let spaced = fp_hex
+            .as_bytes()
+            .chunks(4)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(cmd(&["verify-peer", &spaced.join(" ")]).unwrap(), want);
+        let mut args = vec!["verify-peer"];
+        args.extend(spaced.iter().copied());
+        assert_eq!(args.len(), 11);
+        assert_eq!(cmd(&args).unwrap(), want);
+
+        assert!(cmd(&["verify-peer"]).is_err());
+        assert!(cmd(&["verify-peer", &"a".repeat(63)]).is_err());
+        assert!(cmd(&["verify-peer", &"a".repeat(65)]).is_err());
+        assert!(cmd(&["verify-peer", &"a".repeat(39)]).is_err());
+        assert!(cmd(&["verify-peer", &"g".repeat(64)]).is_err());
+        assert!(cmd(&["verify-peer", &"z".repeat(40)]).is_err());
+    }
+
+    #[test]
+    fn resolve_verify_target_cases() {
+        let a = PeerId([1; 32]);
+        let mut b_bytes = [2u8; 32];
+        b_bytes[25] = 9;
+        let b = PeerId(b_bytes);
+        assert_eq!(
+            resolve_verify_target(&VerifyTarget::Full(a.clone()), &[]).unwrap(),
+            a
+        );
+        let mut fp = [0u8; 20];
+        fp.copy_from_slice(&b.0[..20]);
+        let t = VerifyTarget::Fingerprint(fp);
+        assert_eq!(
+            resolve_verify_target(&t, &[a.clone(), b.clone()]).unwrap(),
+            b
+        );
+        assert!(resolve_verify_target(&t, std::slice::from_ref(&a)).is_err());
+        assert!(resolve_verify_target(&t, &[]).is_err());
+        // Two candidates sharing the first 20 bytes are ambiguous.
+        let mut b2_bytes = b.0;
+        b2_bytes[31] ^= 1;
+        let b2 = PeerId(b2_bytes);
+        assert!(resolve_verify_target(&t, &[b, b2]).is_err());
+    }
+
+    #[tokio::test]
+    async fn dialer_sends_nothing_before_the_hello_check_passes() {
+        let (alice, bob) = (creds(), creds());
+        // (a) same root, different device than the ticket names.
+        let root = id();
+        let named = creds_with(&root, FAR);
+        let other_device = creds_with(&root, FAR);
+        let (tr, td) = ids(&named);
+        let hello_a = encode_listener_hello(&other_device);
+        // (b) the right device, but the ticket names a different root.
+        let (_, bd) = ids(&bob);
+        let wrong_root = id().peer_id().0;
+        let hello_b = encode_listener_hello(&bob);
+
+        for (hello, ticket_root, ticket_device) in [(hello_a, tr, td), (hello_b, wrong_root, bd)] {
+            let (dial, mut listen) = pair().await;
+            listen.send(&hello).await.unwrap();
+            listen.send(&[DECISION_FRESH]).await.unwrap();
+            let mut k = None;
+            let mut c = cache();
+            let r = negotiate_dial(
+                dial,
+                &alice,
+                &ticket_root,
+                &ticket_device,
+                &mut k,
+                &bnd(),
+                NOW,
+                &mut c,
+            )
+            .await;
+            assert!(r.is_err());
+            // The dialer end is dropped now: exactly the preamble was sent.
+            let first = tokio::time::timeout(MEDIUM, listen.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(first[0], WIRE_VERSION);
+            let next = tokio::time::timeout(MEDIUM, listen.recv()).await.unwrap();
+            assert!(next.is_err());
+        }
+    }
+
+    fn pidn(n: u8) -> PeerId {
+        PeerId([n; 32])
+    }
+
+    #[test]
+    fn kept_sessions_evict_least_recently_used() {
+        let mut s: KeptSessions<u8> = KeptSessions::with_cap(4);
+        let mut evicted = Vec::new();
+        for n in 1..=6u8 {
+            evicted.extend(s.insert(pidn(n), n));
+        }
+        assert_eq!(s.len(), 4);
+        assert_eq!(evicted, vec![pidn(1), pidn(2)]);
+        assert!(!s.contains_key(&pidn(1)) && !s.contains_key(&pidn(2)));
+        assert!((3..=6).all(|n| s.contains_key(&pidn(n))));
+        // Re-inserting 3 refreshes it; inserting 7 then evicts 4, not 3.
+        assert!(s.insert(pidn(3), 33).is_empty());
+        assert_eq!(s.get(&pidn(3)), Some(&33));
+        assert_eq!(s.insert(pidn(7), 7), vec![pidn(4)]);
+        assert!(s.contains_key(&pidn(3)));
+        assert_eq!(s.remove(&pidn(3)), Some(33));
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn kept_sessions_production_cap() {
+        assert_eq!(MAX_KEPT_SESSIONS, 64);
+        let mut s = KeptSessions::<u8>::new();
+        assert_eq!(s.cap, 64);
+        for n in 0..(MAX_KEPT_SESSIONS + 10) as u8 {
+            s.insert(pidn(n), n);
+        }
+        assert_eq!(s.len(), MAX_KEPT_SESSIONS);
+        for n in 0..(MAX_KEPT_SESSIONS + 10) as u8 {
+            assert_eq!(s.contains_key(&pidn(n)), n >= 10, "{n}");
+        }
     }
 
     #[test]

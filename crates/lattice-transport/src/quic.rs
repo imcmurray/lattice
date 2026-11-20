@@ -190,6 +190,24 @@ pub fn parse_ticket(ticket: &str) -> Result<ParsedTicket> {
 /// Upper bound on finishing one inbound connection in [`Transport::accept`].
 pub const TRAIT_ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Upper bound on each outgoing step (QUIC connect, then open_bi).
+pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// `fut` bounded by `limit`. On timeout, drop `fut` and return
+/// `Err(Error::Transport("{what} timed out after {limit:?}"))`.
+async fn within<T>(
+    limit: std::time::Duration,
+    what: &str,
+    fut: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(limit, fut).await {
+        Ok(r) => r,
+        Err(_) => Err(Error::Transport(format!(
+            "{what} timed out after {limit:?}"
+        ))),
+    }
+}
+
 /// Largest frame body `read_frame` will accept (64 KiB).
 pub const MAX_FRAME_LEN: usize = 65_536;
 
@@ -336,16 +354,30 @@ impl IrohTransport {
     }
 
     /// Dial the address decoded from a ticket. Returns the [`ParsedTicket`] and
-    /// the connection. The ticket's ids are not checked here; the caller
-    /// verifies the peer against them.
+    /// the connection.
+    ///
+    /// This does NOT authenticate the peer. It does not check the ticket's
+    /// `root_id` / `device_id`; it only reaches the iroh endpoint id named in
+    /// the ticket. Callers MUST verify the listener's device and root against
+    /// the ticket ids before sending any application data, as `lattice-net`
+    /// does with the listener hello.
+    ///
+    /// Each of the QUIC connect and the `open_bi` step is bounded by
+    /// [`CONNECT_TIMEOUT`]; on expiry this fails with [`Error::Transport`]
+    /// ("connect timed out after 15s" / "open_bi timed out after 15s").
     pub async fn connect_ticket(&self, ticket: &str) -> Result<(ParsedTicket, IrohConn)> {
         let (parsed, addr) = decode_ticket(ticket)?;
-        let conn = self
-            .ep
-            .connect(addr, ALPN)
-            .await
-            .map_err(|e| terr("connect", e))?;
-        let (send, recv) = conn.open_bi().await.map_err(|e| terr("open_bi", e))?;
+        let conn = within(CONNECT_TIMEOUT, "connect", async {
+            self.ep
+                .connect(addr, ALPN)
+                .await
+                .map_err(|e| terr("connect", e))
+        })
+        .await?;
+        let (send, recv) = within(CONNECT_TIMEOUT, "open_bi", async {
+            conn.open_bi().await.map_err(|e| terr("open_bi", e))
+        })
+        .await?;
         Ok((parsed, IrohConn { conn, send, recv }))
     }
 
@@ -395,15 +427,25 @@ impl Transport for IrohTransport {
     type Addr = IrohEndpointId;
     type Conn = IrohConn;
 
+    /// Dial an iroh endpoint id (relies on discovery to resolve the address).
+    ///
+    /// Does NOT authenticate the peer beyond reaching that endpoint id: the
+    /// caller must verify who answered before sending application data. Each of
+    /// the QUIC connect and the `open_bi` step is bounded by
+    /// [`CONNECT_TIMEOUT`] and fails with [`Error::Transport`] on expiry.
     async fn connect(&self, addr: &IrohEndpointId) -> Result<IrohConn> {
-        // Connect by endpoint id (relies on discovery to resolve the address).
         let id = EndpointId::from_bytes(&addr.0).map_err(|e| terr("endpoint id", e))?;
-        let conn = self
-            .ep
-            .connect(id, ALPN)
-            .await
-            .map_err(|e| terr("connect", e))?;
-        let (send, recv) = conn.open_bi().await.map_err(|e| terr("open_bi", e))?;
+        let conn = within(CONNECT_TIMEOUT, "connect", async {
+            self.ep
+                .connect(id, ALPN)
+                .await
+                .map_err(|e| terr("connect", e))
+        })
+        .await?;
+        let (send, recv) = within(CONNECT_TIMEOUT, "open_bi", async {
+            conn.open_bi().await.map_err(|e| terr("open_bi", e))
+        })
+        .await?;
         Ok(IrohConn { conn, send, recv })
     }
 
@@ -454,6 +496,41 @@ mod tests {
         }
         let _: fn(&IrohTransport) = _assert;
         let _: fn(IncomingConn) = _finish;
+    }
+
+    #[test]
+    fn connect_timeout_is_15s() {
+        assert_eq!(CONNECT_TIMEOUT, std::time::Duration::from_secs(15));
+    }
+
+    #[tokio::test]
+    async fn within_times_out_on_pending_future() {
+        let short = std::time::Duration::from_millis(20);
+        let start = std::time::Instant::now();
+        let r: Result<()> = within(short, "connect", std::future::pending()).await;
+        match r {
+            Err(Error::Transport(m)) => assert!(m.contains("connect timed out"), "{m}"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(start.elapsed() < short * 50);
+    }
+
+    #[tokio::test]
+    async fn within_passes_results_through() {
+        let limit = std::time::Duration::from_secs(5);
+        assert_eq!(
+            within(limit, "x", std::future::ready(Ok(7u8)))
+                .await
+                .unwrap(),
+            7
+        );
+        let r: Result<u8> = within(
+            limit,
+            "x",
+            std::future::ready(Err(Error::Transport("boom".into()))),
+        )
+        .await;
+        assert!(matches!(r, Err(Error::Transport(m)) if m == "boom"));
     }
 
     #[test]

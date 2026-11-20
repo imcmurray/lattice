@@ -86,8 +86,11 @@ It is still a bearer token for reachability. Both machines need outbound
 internet to reach the n0 relays for discovery/holepunching.
 
 Run `lattice-net whoami` to print your root and device ids, fingerprints and
-certificate expiry, and compare the **root fingerprint** with your peer out of
-band. `lattice-net show-recovery-phrase --i-understand` prints your recovery
+certificate expiry. On every connection `lattice-net` prints a 60-digit **safety
+number** of both root identities: compare it with your peer by voice or in
+person, then run `lattice-net verify-peer` to mark their root as verified
+(otherwise each connection says "UNVERIFIED peer"; nothing is verified
+automatically). `lattice-net show-recovery-phrase --i-understand` prints your recovery
 phrase for an offline backup — keep it secret.
 
 Device management:
@@ -97,6 +100,7 @@ lattice-net renew-device                 # re-issue the device cert (needs the r
 lattice-net revoke-device <64-hex id>    # sign a revocation list (needs the root)
 lattice-net forget-root --i-understand   # remove the root secret from this store
 lattice-net import-root                  # restore the root; phrase read from stdin
+lattice-net verify-peer <root peer id or fingerprint>  # mark a peer's root as verified
 ```
 
 Certificates are renewed automatically while the root is in the store.
