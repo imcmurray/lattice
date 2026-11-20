@@ -875,9 +875,8 @@ impl RevocationList {
         }
         let raw = take(&mut rest, n * 32)?;
         let mut revoked: Vec<PeerId> = Vec::with_capacity(n);
-        for c in raw.chunks_exact(32) {
-            let mut id = [0u8; 32];
-            id.copy_from_slice(c);
+        let (chunks, _) = raw.as_chunks::<32>();
+        for &id in chunks {
             if let Some(prev) = revoked.last() {
                 if prev.0 >= id {
                     return Err(Error::Crypto("revocation list not strictly sorted".into()));
