@@ -240,18 +240,7 @@ impl PublicIdentity {
     /// initiator (DESIGN.md §5.1, hybrid KEM).
     #[cfg(feature = "pq")]
     pub fn pq_encapsulate(&self) -> Result<(Vec<u8>, Zeroizing<[u8; 32]>)> {
-        let key = MlKemKey::<EncapsulationKey<MlKem768>>::try_from(self.ml_kem.as_slice())
-            .map_err(|_| Error::Crypto("malformed ML-KEM encapsulation key".into()))?;
-        let ek = EncapsulationKey::<MlKem768>::new(&key)
-            .map_err(|_| Error::Crypto("invalid ML-KEM encapsulation key".into()))?;
-        let mut m = [0u8; 32];
-        getrandom::getrandom(&mut m).map_err(|e| Error::Crypto(format!("rng: {e}")))?;
-        let mm = MlKemB32::try_from(&m[..]).map_err(|_| Error::Crypto("kem coin".into()))?;
-        m.zeroize();
-        let (ct, ss) = ek.encapsulate_deterministic(&mm);
-        let mut ssb = [0u8; 32];
-        ssb.copy_from_slice(ss.as_slice());
-        Ok((ct.as_slice().to_vec(), Zeroizing::new(ssb)))
+        pq_encapsulate_to(&self.ml_kem)
     }
 
     fn compute_peer_id(
@@ -271,6 +260,72 @@ impl PublicIdentity {
         let mut id = [0u8; 32];
         id.copy_from_slice(h.finalize().as_bytes());
         PeerId(id)
+    }
+}
+
+/// Encapsulate to an arbitrary encoded ML-KEM-768 encapsulation key, returning
+/// `(ciphertext_bytes, shared_secret)`. A wrong-length key or one that fails
+/// ML-KEM key validation gives [`Error::Crypto`]. Never panics.
+#[cfg(feature = "pq")]
+pub fn pq_encapsulate_to(ek_bytes: &[u8]) -> Result<(Vec<u8>, Zeroizing<[u8; 32]>)> {
+    let key = MlKemKey::<EncapsulationKey<MlKem768>>::try_from(ek_bytes)
+        .map_err(|_| Error::Crypto("malformed ML-KEM encapsulation key".into()))?;
+    let ek = EncapsulationKey::<MlKem768>::new(&key)
+        .map_err(|_| Error::Crypto("invalid ML-KEM encapsulation key".into()))?;
+    let mut m = [0u8; 32];
+    getrandom::getrandom(&mut m).map_err(|e| Error::Crypto(format!("rng: {e}")))?;
+    let mm = MlKemB32::try_from(&m[..]).map_err(|_| Error::Crypto("kem coin".into()))?;
+    m.zeroize();
+    let (ct, ss) = ek.encapsulate_deterministic(&mm);
+    let mut ssb = [0u8; 32];
+    ssb.copy_from_slice(ss.as_slice());
+    Ok((ct.as_slice().to_vec(), Zeroizing::new(ssb)))
+}
+
+/// Fresh, single-use ML-KEM-768 keypair for the v3 handshake (initiator side).
+/// Deliberately not `Clone`, and its `Debug` output prints no key material.
+#[cfg(feature = "pq")]
+pub struct EphemeralKem {
+    dk: MlKemDk,
+    ek: Vec<u8>,
+}
+
+#[cfg(feature = "pq")]
+impl std::fmt::Debug for EphemeralKem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EphemeralKem(..)")
+    }
+}
+
+#[cfg(feature = "pq")]
+impl EphemeralKem {
+    /// Generate a fresh keypair from a random 64-byte seed (zeroized after use).
+    pub fn generate() -> Result<Self> {
+        let mut b = [0u8; 64];
+        getrandom::getrandom(&mut b).map_err(|e| Error::Crypto(format!("rng: {e}")))?;
+        let mut s = MlKemSeed::default();
+        s.copy_from_slice(&b);
+        b.zeroize();
+        let dk = MlKemDk::from_seed(s);
+        let ek = dk.encapsulation_key().to_bytes().to_vec();
+        Ok(Self { dk, ek })
+    }
+
+    /// Encoded encapsulation key (1184 bytes for ML-KEM-768).
+    pub fn encapsulation_key_bytes(&self) -> Vec<u8> {
+        self.ek.clone()
+    }
+
+    /// Decapsulate `ct`, consuming the keypair (the secret key is dropped on
+    /// return). A wrong-length ciphertext gives [`Error::Crypto`].
+    pub fn decapsulate(self, ct: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
+        let ss = self
+            .dk
+            .decapsulate_slice(ct)
+            .map_err(|_| Error::Crypto("ML-KEM decapsulation failed".into()))?;
+        let mut b = [0u8; 32];
+        b.copy_from_slice(ss.as_slice());
+        Ok(Zeroizing::new(b))
     }
 }
 
@@ -723,6 +778,57 @@ mod tests {
         let mut trunc = c.sign(MSG);
         trunc.0.truncate(trunc.0.len() - 1);
         assert!(!c.public().verify(MSG, &trunc));
+    }
+
+    #[cfg(feature = "pq")]
+    #[test]
+    fn ephemeral_kem_roundtrip() {
+        let k = EphemeralKem::generate().unwrap();
+        let ek = k.encapsulation_key_bytes();
+        assert_eq!(ek.len(), 1184);
+        let (ct, ss) = pq_encapsulate_to(&ek).unwrap();
+        assert_eq!(*k.decapsulate(&ct).unwrap(), *ss);
+    }
+
+    #[cfg(feature = "pq")]
+    #[test]
+    fn ephemeral_kems_are_distinct() {
+        let a = EphemeralKem::generate().unwrap();
+        let b = EphemeralKem::generate().unwrap();
+        assert_ne!(a.encapsulation_key_bytes(), b.encapsulation_key_bytes());
+    }
+
+    #[cfg(feature = "pq")]
+    #[test]
+    fn pq_encapsulate_to_rejects_bad_keys() {
+        let ek = EphemeralKem::generate().unwrap().encapsulation_key_bytes();
+        assert!(matches!(pq_encapsulate_to(&[]), Err(Error::Crypto(_))));
+        assert!(matches!(
+            pq_encapsulate_to(&ek[..ek.len() - 1]),
+            Err(Error::Crypto(_))
+        ));
+        let mut long = ek.clone();
+        long.push(0);
+        assert!(matches!(pq_encapsulate_to(&long), Err(Error::Crypto(_))));
+        assert!(matches!(
+            pq_encapsulate_to(&vec![0xFFu8; 1184]),
+            Err(Error::Crypto(_))
+        ));
+    }
+
+    #[cfg(feature = "pq")]
+    #[test]
+    fn ephemeral_decapsulate_rejects_wrong_length_ct() {
+        let k = EphemeralKem::generate().unwrap();
+        assert!(matches!(k.decapsulate(&[0u8; 10]), Err(Error::Crypto(_))));
+    }
+
+    #[cfg(feature = "pq")]
+    #[test]
+    fn identity_pq_encapsulate_matches_decapsulate() {
+        let kp = Keypair::generate(CryptoSuite::Hybrid).unwrap();
+        let (ct, ss) = kp.public().pq_encapsulate().unwrap();
+        assert_eq!(*kp.pq_decapsulate(&ct).unwrap(), *ss);
     }
 
     #[test]

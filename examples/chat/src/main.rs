@@ -38,8 +38,9 @@ fn main() -> Result<()> {
     // Establish a hybrid-KEM (X25519 + ML-KEM-768) secure session with a peer
     // and exchange an end-to-end encrypted message.
     let bob = Keypair::generate(CryptoSuite::Hybrid)?;
-    let (handshake, mut alice_session) = SecureSession::initiate(&me, bob.public())?;
-    let mut bob_session = SecureSession::accept(&bob, me.public(), &handshake)?;
+    let (msg1, pending) = SecureSession::initiate(&me, bob.public(), b"")?;
+    let (msg2, mut bob_session) = SecureSession::respond(&bob, me.public(), b"", &msg1)?;
+    let mut alice_session = pending.finish(&msg2)?;
 
     let ciphertext = alice_session.seal(b"meet at the usual place")?;
     let plaintext = bob_session.open(&ciphertext)?;

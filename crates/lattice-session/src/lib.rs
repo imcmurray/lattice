@@ -1,21 +1,44 @@
 //! `lattice-session` — authenticated secure channels with a **Double Ratchet**
 //! over a hybrid-KEM handshake (DESIGN.md §5.1).
 //!
-//! Establishing a session combines two independent key exchanges into a root key:
+//! Establishing a session is a **two-message handshake** (v3) that mixes four
+//! shared secrets — two to the responder's static keys, two between fresh
+//! ephemerals — into a root key:
 //!
 //! ```text
-//! ss_x25519  = X25519(ephemeral_initiator, static_responder)   (classical)
-//! ss_mlkem   = ML-KEM-768 encapsulate -> responder             (post-quantum)
-//! transcript = "lattice-session-hs-v2" ‖ initiator ‖ responder ‖ eph ‖ ratchet_pub ‖ ct
-//! root_key   = HKDF( ikm = ss_x25519 ‖ ss_mlkem, salt = transcript )
-//! sig        = initiator.sign(transcript)        (hybrid: Ed25519 + ML-DSA)
+//!   Initiator (I)                                   Responder (R)
+//!   eph_i, ratchet_i, ephemeral ML-KEM (ek_i)
+//!   ss1 = X25519(eph_i, R.static)
+//!   (ct_s, ss2) = ML-KEM-encaps(R.static ek)
+//!   T1  = "lattice-session-hs-v3" ‖ lp(binding) ‖ I ‖ R
+//!         ‖ eph_i ‖ ratchet_i ‖ lp(ct_s) ‖ lp(ek_i)
+//!   sig_i = I.sign(T1)
+//!                  ── msg1: eph_i, ratchet_i, ct_s, ek_i, sig_i ──▶
+//!                                                   verify sig_i under I (first!)
+//!                                                   ss1, ss2 from static keys
+//!                                                   eph_r fresh; ss3 = X25519(eph_r, eph_i)
+//!                                                   (ct_e, ss4) = ML-KEM-encaps(ek_i)
+//!                                                   T2  = T1 ‖ lp(sig_i) ‖ eph_r ‖ lp(ct_e)
+//!                                                   sig_r = R.sign(T2)
+//!                  ◀── msg2: eph_r, ct_e, sig_r ──────────────────
+//!   verify sig_r under R (before any decapsulation)
+//!   ss3 = X25519(eph_i, eph_r); ss4 = ML-KEM-decaps(ek_i's dk, ct_e)
+//!
+//!   T    = T2 ‖ lp(sig_r)
+//!   root = HKDF( salt = T, ikm = ss1 ‖ ss2 ‖ ss3 ‖ ss4 )
 //! ```
 //!
-//! secure if **either** exchange holds (harvest-now-decrypt-later defense).
-//! [`SecureSession::accept`] rejects a handshake whose hybrid signature does not
-//! verify under the claimed initiator, so a third party cannot impersonate the
-//! initiator. Compromise of a long-term identity key still decrypts recorded
-//! sessions. The root key then seeds a Double Ratchet:
+//! (`lp(x)` is `u32le(len) ‖ x`; the ML-KEM legs are present only for a
+//! `Hybrid` responder.) Both sides sign the transcript with hybrid signatures
+//! (Ed25519 + ML-DSA), and a caller-supplied `binding` byte string (e.g. the
+//! transport channel's endpoint ids) is mixed in, so a handshake cannot be
+//! replayed onto another channel. The root is secure if **either** the
+//! classical or the post-quantum exchange holds (harvest-now-decrypt-later
+//! defense). Because both sides contribute fresh ephemerals that are erased
+//! after the handshake, a later compromise of a long-term identity key does
+//! **not** decrypt recorded sessions (forward secrecy); it does let the
+//! attacker impersonate the owner in *new* sessions. The root key then seeds a
+//! Double Ratchet:
 //!
 //! - **Symmetric ratchet** — each message derives a fresh key from a one-way
 //!   KDF chain, erasing its predecessor → *forward secrecy*.
@@ -37,7 +60,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use lattice_core::{Connection, Error, Identity, Result, Session, Signature, Verify};
+use lattice_core::{Connection, CryptoSuite, Error, Identity, Result, Session, Signature, Verify};
 use lattice_identity::{Keypair, PublicIdentity};
 
 use chacha20poly1305::aead::{Aead, Payload};
@@ -48,7 +71,7 @@ use sha2::Sha256;
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret as XStaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 
-const HS_DOMAIN: &[u8] = b"lattice-session-hs-v2";
+const HS_DOMAIN: &[u8] = b"lattice-session-hs-v3";
 const RESUME_KEY_INFO: &[u8] = b"lattice-session-resume-v1";
 const RESUME_DOMAIN: &[u8] = b"lattice-resume-v1";
 
@@ -74,18 +97,139 @@ type MessageKey = Zeroizing<[u8; 32]>;
 /// Identifies a skipped message: `(sender ratchet pubkey, message index)`.
 type SkippedId = ([u8; 32], u64);
 
-/// The initiator's one-pass handshake message, sent to the responder.
+/// Message 1 of the v3 handshake, initiator → responder.
 #[derive(Clone, Debug)]
-pub struct Handshake {
-    /// Ephemeral X25519 public key (KEM handshake).
-    pub eph_x25519: [u8; 32],
-    /// Initiator's initial DH-ratchet public key — lets the responder ratchet
-    /// immediately at accept, so either side may send first.
-    pub ratchet_pub: [u8; 32],
-    /// ML-KEM ciphertext (empty when the `pq` feature is off).
-    pub mlkem_ct: Vec<u8>,
-    /// Initiator's hybrid signature over the v2 transcript.
-    pub sig: Signature,
+pub struct HandshakeInit {
+    /// Fresh X25519 ephemeral public key.
+    pub eph_i: [u8; 32],
+    /// Initiator's first DH-ratchet public key — lets the responder ratchet
+    /// immediately, so either side may send first.
+    pub ratchet_pub_i: [u8; 32],
+    /// ML-KEM ciphertext to the responder's STATIC key (empty when PQ is off).
+    pub kem_ct_s: Vec<u8>,
+    /// Fresh EPHEMERAL ML-KEM-768 encapsulation key (empty when PQ is off).
+    pub kem_ek_i: Vec<u8>,
+    /// Initiator's hybrid signature over transcript `T1`.
+    pub sig_i: Signature,
+}
+
+/// Message 2 of the v3 handshake, responder → initiator.
+#[derive(Clone, Debug)]
+pub struct HandshakeResp {
+    /// Fresh X25519 ephemeral public key; also the responder's first ratchet
+    /// public key.
+    pub eph_r: [u8; 32],
+    /// ML-KEM ciphertext to the initiator's ephemeral key (empty when PQ is off).
+    pub kem_ct_e: Vec<u8>,
+    /// Responder's hybrid signature over transcript `T2`.
+    pub sig_r: Signature,
+}
+
+fn handshake_err(msg: &str) -> Error {
+    Error::Verify(msg.into())
+}
+
+/// Little-endian length prefix + bytes.
+fn put_lp(out: &mut Vec<u8>, x: &[u8]) {
+    out.extend_from_slice(&(x.len() as u32).to_le_bytes());
+    out.extend_from_slice(x);
+}
+
+impl HandshakeInit {
+    /// Wire encoding: `eph_i ‖ ratchet_pub_i ‖ lp(kem_ct_s) ‖ lp(kem_ek_i) ‖ lp(sig_i)`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(76 + self.kem_ct_s.len());
+        v.extend_from_slice(&self.eph_i);
+        v.extend_from_slice(&self.ratchet_pub_i);
+        put_lp(&mut v, &self.kem_ct_s);
+        put_lp(&mut v, &self.kem_ek_i);
+        put_lp(&mut v, &self.sig_i.0);
+        v
+    }
+
+    /// Parse [`HandshakeInit::to_bytes`]. Never panics; every error is
+    /// [`Error::Verify`].
+    pub fn from_bytes(b: &[u8]) -> Result<Self> {
+        if b.len() > MAX_HANDSHAKE_LEN {
+            return Err(handshake_err("handshake too large"));
+        }
+        if b.len() < 76 {
+            return Err(handshake_err("short handshake"));
+        }
+        let mut eph_i = [0u8; 32];
+        let mut ratchet_pub_i = [0u8; 32];
+        eph_i.copy_from_slice(&b[..32]);
+        ratchet_pub_i.copy_from_slice(&b[32..64]);
+        let mut pos = 64;
+        let kem_ct_s = take_field(b, &mut pos)?.to_vec();
+        let kem_ek_i = take_field(b, &mut pos)?.to_vec();
+        let sig_i = Signature(take_field(b, &mut pos)?.to_vec());
+        if pos != b.len() {
+            return Err(handshake_err("trailing data after handshake"));
+        }
+        Ok(Self {
+            eph_i,
+            ratchet_pub_i,
+            kem_ct_s,
+            kem_ek_i,
+            sig_i,
+        })
+    }
+}
+
+impl HandshakeResp {
+    /// Wire encoding: `eph_r ‖ lp(kem_ct_e) ‖ lp(sig_r)`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(40 + self.kem_ct_e.len() + self.sig_r.0.len());
+        v.extend_from_slice(&self.eph_r);
+        put_lp(&mut v, &self.kem_ct_e);
+        put_lp(&mut v, &self.sig_r.0);
+        v
+    }
+
+    /// Parse [`HandshakeResp::to_bytes`]. Never panics; every error is
+    /// [`Error::Verify`].
+    pub fn from_bytes(b: &[u8]) -> Result<Self> {
+        if b.len() > MAX_HANDSHAKE_LEN {
+            return Err(handshake_err("handshake too large"));
+        }
+        if b.len() < 40 {
+            return Err(handshake_err("short handshake"));
+        }
+        let mut eph_r = [0u8; 32];
+        eph_r.copy_from_slice(&b[..32]);
+        let mut pos = 32;
+        let kem_ct_e = take_field(b, &mut pos)?.to_vec();
+        let sig_r = Signature(take_field(b, &mut pos)?.to_vec());
+        if pos != b.len() {
+            return Err(handshake_err("trailing data after handshake"));
+        }
+        Ok(Self {
+            eph_r,
+            kem_ct_e,
+            sig_r,
+        })
+    }
+}
+
+#[cfg(feature = "pq")]
+type EphKem = lattice_identity::EphemeralKem;
+#[cfg(not(feature = "pq"))]
+type EphKem = ();
+
+/// Initiator state between msg1 and msg2. Holds the ephemeral secrets, which
+/// are zeroized when [`PendingInitiator::finish`] consumes it or it is dropped.
+/// Deliberately neither `Clone` nor `Debug`.
+pub struct PendingInitiator {
+    eph_secret: XStaticSecret,
+    ratchet_secret: XStaticSecret,
+    ratchet_pub: [u8; 32],
+    kem: Option<EphKem>,
+    ss1: Zeroizing<[u8; 32]>,
+    ss2: Option<Zeroizing<[u8; 32]>>,
+    peer: PublicIdentity,
+    /// `T1 ‖ lp(sig_i)`.
+    t2_prefix: Vec<u8>,
 }
 
 /// The mutable Double-Ratchet state. Cloned into a scratch copy on `open` so
@@ -145,88 +289,191 @@ pub struct SecureSession {
     resume_key: Zeroizing<[u8; 32]>,
 }
 
-/// Output of the initiator's hybrid-KEM handshake.
-struct KemInit {
-    eph_pub: [u8; 32],
-    mlkem_ct: Vec<u8>,
-    transcript: Vec<u8>,
-    root: Zeroizing<[u8; 32]>,
+impl PendingInitiator {
+    /// Complete the handshake with the responder's msg2. The responder's
+    /// signature is verified **before** any decapsulation or DH. Every failure
+    /// is [`Error::Verify`]; the ephemeral secrets are dropped either way.
+    pub fn finish(self, resp: &HandshakeResp) -> Result<SecureSession> {
+        let Self {
+            eph_secret,
+            ratchet_secret,
+            ratchet_pub,
+            kem,
+            ss1,
+            ss2,
+            peer,
+            t2_prefix,
+        } = self;
+
+        if resp.kem_ct_e.len() > MAX_HANDSHAKE_LEN || resp.sig_r.0.len() > MAX_HANDSHAKE_LEN {
+            return Err(handshake_err("handshake field too large"));
+        }
+        let t2 = transcript_t2(&t2_prefix, &resp.eph_r, &resp.kem_ct_e);
+        if !peer.verify(&t2, &resp.sig_r) {
+            return Err(handshake_err(
+                "handshake signature does not verify under expected responder",
+            ));
+        }
+        let pq = pq_on(&peer);
+        check_kem_fields(pq, &[&resp.kem_ct_e])?;
+
+        let ss3 = nonzero(dh(&eph_secret, &resp.eph_r))?;
+        let ss4 = if pq {
+            let kem = kem.ok_or_else(|| handshake_err("missing ephemeral KEM"))?;
+            Some(eph_kem_decapsulate(kem, &resp.kem_ct_e)?)
+        } else {
+            None
+        };
+        drop(eph_secret);
+
+        let t = transcript_final(&t2, &resp.sig_r);
+        let ikm = build_ikm([Some(&ss1), ss2.as_ref(), Some(&ss3), ss4.as_ref()]);
+        let sk = root_key(&ikm, &t);
+        let resume_key = derive_resume_key(&sk);
+
+        // Double Ratchet init (initiator): the responder's ephemeral is DHr.
+        let dhr = resp.eph_r;
+        let (rk, cks) = kdf_rk(&sk, &dh(&ratchet_secret, &dhr));
+        Ok(SecureSession {
+            core: RatchetCore {
+                rk,
+                dhs: ratchet_secret,
+                dhs_pub: ratchet_pub,
+                dhr: Some(dhr),
+                cks: Some(cks),
+                ckr: None,
+                ns: 0,
+                nr: 0,
+                pn: 0,
+            },
+            skipped: Skipped::default(),
+            resume_key,
+        })
+    }
 }
 
 impl SecureSession {
-    /// Initiator side: produce a [`Handshake`] and the local session.
-    pub fn initiate(me: &Keypair, peer: &PublicIdentity) -> Result<(Handshake, Self)> {
-        // Ratchet key first: its public half is bound into the signed transcript.
-        let (dhs, dhs_pub) = gen_ratchet_key()?;
-        let KemInit {
-            eph_pub,
-            mlkem_ct,
-            transcript,
-            root: sk,
-        } = kem_initiate(me, peer, &dhs_pub)?;
-        let sig = me.sign(&transcript);
+    /// Initiator side, step 1: produce msg1 and the [`PendingInitiator`] state.
+    /// `binding` is opaque caller-supplied channel-binding data (may be empty,
+    /// at most `MAX_HANDSHAKE_LEN` bytes); both sides must pass the same bytes.
+    pub fn initiate(
+        me: &Keypair,
+        peer: &PublicIdentity,
+        binding: &[u8],
+    ) -> Result<(HandshakeInit, PendingInitiator)> {
+        if binding.len() > MAX_HANDSHAKE_LEN {
+            return Err(handshake_err("binding too large"));
+        }
+        let (ratchet_secret, ratchet_pub) = gen_ratchet_key()?;
+        let (eph_secret, eph_i) = gen_ratchet_key()?;
 
-        // Double Ratchet init (Alice): peer's static as DHr.
-        let dhr = peer.x25519_bytes();
-        let resume_key = derive_resume_key(&sk);
-        let (rk, cks) = kdf_rk(&sk, &dh(&dhs, &dhr));
+        let pq = pq_on(peer);
+        let (kem_ct_s, ss2, kem, kem_ek_i) = if pq {
+            let (ct, ss2) = pq_encapsulate_static(peer)?;
+            let (kem, ek) = eph_kem_generate()?;
+            (ct, Some(ss2), Some(kem), ek)
+        } else {
+            (Vec::new(), None, None, Vec::new())
+        };
+        let ss1 = nonzero(dh(&eph_secret, &peer.x25519_bytes()))?;
 
-        let core = RatchetCore {
-            rk,
-            dhs,
-            dhs_pub,
-            dhr: Some(dhr),
-            cks: Some(cks),
-            ckr: None,
-            ns: 0,
-            nr: 0,
-            pn: 0,
+        let t1 = transcript_t1(
+            binding,
+            me.public(),
+            peer,
+            &eph_i,
+            &ratchet_pub,
+            &kem_ct_s,
+            &kem_ek_i,
+        );
+        let sig_i = me.sign(&t1);
+        let mut t2_prefix = t1;
+        put_lp(&mut t2_prefix, &sig_i.0);
+
+        let init = HandshakeInit {
+            eph_i,
+            ratchet_pub_i: ratchet_pub,
+            kem_ct_s,
+            kem_ek_i,
+            sig_i,
         };
-        let session = Self {
-            core,
-            skipped: Skipped::default(),
-            resume_key,
+        let pending = PendingInitiator {
+            eph_secret,
+            ratchet_secret,
+            ratchet_pub,
+            kem,
+            ss1,
+            ss2,
+            peer: peer.clone(),
+            t2_prefix,
         };
-        Ok((
-            Handshake {
-                eph_x25519: eph_pub,
-                ratchet_pub: dhs_pub,
-                mlkem_ct,
-                sig,
-            },
-            session,
-        ))
+        Ok((init, pending))
     }
 
-    /// Responder side: consume the [`Handshake`] and derive the session. The
-    /// handshake carries the initiator's initial ratchet key, so the responder
-    /// performs its first DH-ratchet step right away — giving it a sending chain
-    /// immediately, so either party may send first.
-    ///
-    /// The initiator's hybrid signature over the v2 transcript is verified under
-    /// `peer` **before** any KEM or ratchet work.
-    pub fn accept(me: &Keypair, peer: &PublicIdentity, hs: &Handshake) -> Result<Self> {
-        if hs.mlkem_ct.len() > MAX_HANDSHAKE_LEN || hs.sig.0.len() > MAX_HANDSHAKE_LEN {
-            return Err(Error::Verify("handshake field too large".into()));
+    /// Responder side: verify msg1 and produce msg2 plus the live session. The
+    /// initiator's signature over `T1` is verified under `peer` **before** any
+    /// DH or decapsulation. The responder's first ratchet key is its fresh
+    /// `eph_r` (never the static key), and it ratchets eagerly against the
+    /// initiator's ratchet key, so either party may send first.
+    pub fn respond(
+        me: &Keypair,
+        peer: &PublicIdentity,
+        binding: &[u8],
+        init: &HandshakeInit,
+    ) -> Result<(HandshakeResp, Self)> {
+        if binding.len() > MAX_HANDSHAKE_LEN
+            || init.kem_ct_s.len() > MAX_HANDSHAKE_LEN
+            || init.kem_ek_i.len() > MAX_HANDSHAKE_LEN
+            || init.sig_i.0.len() > MAX_HANDSHAKE_LEN
+        {
+            return Err(handshake_err("handshake field too large"));
         }
-        let t = transcript(
+        let t1 = transcript_t1(
+            binding,
             peer,
             me.public(),
-            &hs.eph_x25519,
-            &hs.ratchet_pub,
-            &hs.mlkem_ct,
+            &init.eph_i,
+            &init.ratchet_pub_i,
+            &init.kem_ct_s,
+            &init.kem_ek_i,
         );
-        if !peer.verify(&t, &hs.sig) {
-            return Err(Error::Verify(
-                "handshake signature does not verify under claimed initiator".into(),
+        if !peer.verify(&t1, &init.sig_i) {
+            return Err(handshake_err(
+                "handshake signature does not verify under claimed initiator",
             ));
         }
-        let sk = kem_accept(me, hs, &t)?;
+        let pq = pq_on(me.public());
+        check_kem_fields(pq, &[&init.kem_ct_s, &init.kem_ek_i])?;
+
+        let ss1 = nonzero(me.x25519_dh(&init.eph_i))?;
+        let ss2 = if pq {
+            Some(pq_decapsulate_static(me, &init.kem_ct_s)?)
+        } else {
+            None
+        };
+        let (eph_secret, eph_r) = gen_ratchet_key()?;
+        let ss3 = nonzero(dh(&eph_secret, &init.eph_i))?;
+        let (kem_ct_e, ss4) = if pq {
+            let (ct, ss) = pq_encapsulate_to_ek(&init.kem_ek_i)?;
+            (ct, Some(ss))
+        } else {
+            (Vec::new(), None)
+        };
+
+        let mut t2_prefix = t1;
+        put_lp(&mut t2_prefix, &init.sig_i.0);
+        let t2 = transcript_t2(&t2_prefix, &eph_r, &kem_ct_e);
+        let sig_r = me.sign(&t2);
+        let t = transcript_final(&t2, &sig_r);
+
+        let ikm = build_ikm([Some(&ss1), ss2.as_ref(), Some(&ss3), ss4.as_ref()]);
+        let sk = root_key(&ikm, &t);
         let resume_key = derive_resume_key(&sk);
+
         let mut core = RatchetCore {
             rk: sk,
-            dhs: me.x25519_secret(), // initial ratchet key = identity X25519
-            dhs_pub: me.public().x25519_bytes(),
+            dhs: eph_secret, // initial ratchet key = fresh eph_r (replaced below)
+            dhs_pub: eph_r,
             dhr: None,
             cks: None,
             ckr: None,
@@ -236,13 +483,20 @@ impl SecureSession {
         };
         // Eager first ratchet against the initiator's ratchet key: sets up our
         // receiving chain (matching the initiator's sending chain) and a fresh
-        // sending chain, so we can send before receiving.
-        dh_ratchet(&mut core, hs.ratchet_pub)?;
-        Ok(Self {
-            core,
-            skipped: Skipped::default(),
-            resume_key,
-        })
+        // sending chain. This replaces `dhs`, so the eph_r secret is gone.
+        dh_ratchet(&mut core, init.ratchet_pub_i)?;
+        Ok((
+            HandshakeResp {
+                eph_r,
+                kem_ct_e,
+                sig_r,
+            },
+            Self {
+                core,
+                skipped: Skipped::default(),
+                resume_key,
+            },
+        ))
     }
 
     /// HMAC tag proving possession of this session's secret for a resume
@@ -424,44 +678,79 @@ fn dh_ratchet(w: &mut RatchetCore, their_pub: [u8; 32]) -> Result<()> {
 
 // --- handshake (hybrid KEM) ------------------------------------------------
 
-fn kem_initiate(me: &Keypair, peer: &PublicIdentity, ratchet_pub: &[u8; 32]) -> Result<KemInit> {
-    let mut eb = [0u8; 32];
-    getrandom::getrandom(&mut eb).map_err(|e| Error::Crypto(format!("rng: {e}")))?;
-    let eph = XStaticSecret::from(eb);
-    eb.zeroize();
-    let eph_pub = XPublicKey::from(&eph).to_bytes();
-    let ss_x = Zeroizing::new(
-        eph.diffie_hellman(&XPublicKey::from(peer.x25519_bytes()))
-            .to_bytes(),
-    );
-
-    #[cfg(feature = "pq")]
-    let (mlkem_ct, ss_pq) = {
-        let (ct, ss) = peer.pq_encapsulate()?;
-        (ct, Some(ss))
-    };
-    #[cfg(not(feature = "pq"))]
-    let (mlkem_ct, ss_pq): (Vec<u8>, Option<Zeroizing<[u8; 32]>>) = (Vec::new(), None);
-
-    let transcript = transcript(me.public(), peer, &eph_pub, ratchet_pub, &mlkem_ct);
-    let root = root_key(&build_ikm(&ss_x, ss_pq.as_ref()), &transcript);
-    Ok(KemInit {
-        eph_pub,
-        mlkem_ct,
-        transcript,
-        root,
-    })
+/// PQ legs are on iff the `pq` feature is compiled in and the responder is a
+/// `Hybrid` identity. Both sides evaluate this on the responder's public
+/// identity, so they always agree.
+fn pq_on(responder: &PublicIdentity) -> bool {
+    cfg!(feature = "pq") && responder.suite() == CryptoSuite::Hybrid
 }
 
-fn kem_accept(me: &Keypair, hs: &Handshake, transcript: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
-    let ss_x = me.x25519_dh(&hs.eph_x25519);
+/// The KEM fields must all be non-empty with PQ on, all empty with PQ off.
+fn check_kem_fields(pq: bool, fields: &[&[u8]]) -> Result<()> {
+    if fields.iter().all(|f| f.is_empty() != pq) {
+        Ok(())
+    } else {
+        Err(handshake_err("KEM fields do not match the responder suite"))
+    }
+}
 
-    #[cfg(feature = "pq")]
-    let ss_pq = Some(me.pq_decapsulate(&hs.mlkem_ct)?);
-    #[cfg(not(feature = "pq"))]
-    let ss_pq: Option<Zeroizing<[u8; 32]>> = None;
+/// Reject an all-zero (non-contributory) X25519 output.
+fn nonzero(ss: Zeroizing<[u8; 32]>) -> Result<Zeroizing<[u8; 32]>> {
+    if ss.iter().all(|b| *b == 0) {
+        Err(handshake_err("non-contributory X25519 output"))
+    } else {
+        Ok(ss)
+    }
+}
 
-    Ok(root_key(&build_ikm(&ss_x, ss_pq.as_ref()), transcript))
+#[cfg(feature = "pq")]
+fn pq_encapsulate_static(peer: &PublicIdentity) -> Result<(Vec<u8>, Zeroizing<[u8; 32]>)> {
+    peer.pq_encapsulate()
+}
+#[cfg(not(feature = "pq"))]
+fn pq_encapsulate_static(_peer: &PublicIdentity) -> Result<(Vec<u8>, Zeroizing<[u8; 32]>)> {
+    Err(handshake_err("post-quantum support not compiled in"))
+}
+
+#[cfg(feature = "pq")]
+fn pq_decapsulate_static(me: &Keypair, ct: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
+    me.pq_decapsulate(ct)
+        .map_err(|_| handshake_err("ML-KEM decapsulation failed"))
+}
+#[cfg(not(feature = "pq"))]
+fn pq_decapsulate_static(_me: &Keypair, _ct: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
+    Err(handshake_err("post-quantum support not compiled in"))
+}
+
+#[cfg(feature = "pq")]
+fn pq_encapsulate_to_ek(ek: &[u8]) -> Result<(Vec<u8>, Zeroizing<[u8; 32]>)> {
+    lattice_identity::pq_encapsulate_to(ek)
+        .map_err(|_| handshake_err("invalid ephemeral ML-KEM key"))
+}
+#[cfg(not(feature = "pq"))]
+fn pq_encapsulate_to_ek(_ek: &[u8]) -> Result<(Vec<u8>, Zeroizing<[u8; 32]>)> {
+    Err(handshake_err("post-quantum support not compiled in"))
+}
+
+#[cfg(feature = "pq")]
+fn eph_kem_generate() -> Result<(EphKem, Vec<u8>)> {
+    let k = EphKem::generate()?;
+    let ek = k.encapsulation_key_bytes();
+    Ok((k, ek))
+}
+#[cfg(not(feature = "pq"))]
+fn eph_kem_generate() -> Result<(EphKem, Vec<u8>)> {
+    Err(handshake_err("post-quantum support not compiled in"))
+}
+
+#[cfg(feature = "pq")]
+fn eph_kem_decapsulate(kem: EphKem, ct: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
+    kem.decapsulate(ct)
+        .map_err(|_| handshake_err("ML-KEM decapsulation failed"))
+}
+#[cfg(not(feature = "pq"))]
+fn eph_kem_decapsulate(_kem: EphKem, _ct: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
+    Err(handshake_err("post-quantum support not compiled in"))
 }
 
 // --- key schedule primitives ----------------------------------------------
@@ -581,50 +870,58 @@ fn aead_open(mk: &[u8; 32], aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
         .map_err(|_| Error::Verify("AEAD open failed (tampered or wrong key)".into()))
 }
 
-fn transcript(
+/// `T1 = domain ‖ lp(binding) ‖ lp(initiator) ‖ lp(responder) ‖ eph_i ‖
+/// ratchet_pub_i ‖ lp(kem_ct_s) ‖ lp(kem_ek_i)`.
+fn transcript_t1(
+    binding: &[u8],
     initiator: &PublicIdentity,
     responder: &PublicIdentity,
-    eph: &[u8; 32],
-    ratchet_pub: &[u8; 32],
-    ct: &[u8],
+    eph_i: &[u8; 32],
+    ratchet_pub_i: &[u8; 32],
+    kem_ct_s: &[u8],
+    kem_ek_i: &[u8],
 ) -> Vec<u8> {
     let init = initiator.to_bytes();
     let resp = responder.to_bytes();
-    let mut t =
-        Vec::with_capacity(HS_DOMAIN.len() + 4 + init.len() + 4 + resp.len() + 64 + 4 + ct.len());
+    let mut t = Vec::with_capacity(256 + binding.len() + init.len() + resp.len());
     t.extend_from_slice(HS_DOMAIN);
-    t.extend_from_slice(&(init.len() as u32).to_le_bytes());
-    t.extend_from_slice(&init);
-    t.extend_from_slice(&(resp.len() as u32).to_le_bytes());
-    t.extend_from_slice(&resp);
-    t.extend_from_slice(eph);
-    t.extend_from_slice(ratchet_pub);
-    t.extend_from_slice(&(ct.len() as u32).to_le_bytes());
-    t.extend_from_slice(ct);
+    put_lp(&mut t, binding);
+    put_lp(&mut t, &init);
+    put_lp(&mut t, &resp);
+    t.extend_from_slice(eph_i);
+    t.extend_from_slice(ratchet_pub_i);
+    put_lp(&mut t, kem_ct_s);
+    put_lp(&mut t, kem_ek_i);
     t
 }
 
-fn build_ikm(ss_x: &[u8; 32], ss_pq: Option<&Zeroizing<[u8; 32]>>) -> Zeroizing<Vec<u8>> {
-    let mut ikm = Vec::with_capacity(64);
-    ikm.extend_from_slice(ss_x);
-    if let Some(pq) = ss_pq {
-        ikm.extend_from_slice(&pq[..]);
+/// `T2 = (T1 ‖ lp(sig_i)) ‖ eph_r ‖ lp(kem_ct_e)`; takes `T1 ‖ lp(sig_i)`.
+fn transcript_t2(t1_sig: &[u8], eph_r: &[u8; 32], kem_ct_e: &[u8]) -> Vec<u8> {
+    let mut t = Vec::with_capacity(t1_sig.len() + 32 + 4 + kem_ct_e.len());
+    t.extend_from_slice(t1_sig);
+    t.extend_from_slice(eph_r);
+    put_lp(&mut t, kem_ct_e);
+    t
+}
+
+/// `T = T2 ‖ lp(sig_r)`.
+fn transcript_final(t2: &[u8], sig_r: &Signature) -> Vec<u8> {
+    let mut t = Vec::with_capacity(t2.len() + 4 + sig_r.0.len());
+    t.extend_from_slice(t2);
+    put_lp(&mut t, &sig_r.0);
+    t
+}
+
+/// Plain concatenation `ss1 ‖ ss2 ‖ ss3 ‖ ss4`, skipping absent (PQ-off) legs.
+fn build_ikm(parts: [Option<&Zeroizing<[u8; 32]>>; 4]) -> Zeroizing<Vec<u8>> {
+    let mut ikm = Vec::with_capacity(128);
+    for p in parts.into_iter().flatten() {
+        ikm.extend_from_slice(&p[..]);
     }
     Zeroizing::new(ikm)
 }
 
 // --- session bound to a transport Connection ------------------------------
-
-fn encode_handshake(hs: &Handshake) -> Vec<u8> {
-    let mut v = Vec::with_capacity(72 + hs.mlkem_ct.len() + hs.sig.0.len());
-    v.extend_from_slice(&hs.eph_x25519);
-    v.extend_from_slice(&hs.ratchet_pub);
-    v.extend_from_slice(&(hs.mlkem_ct.len() as u32).to_le_bytes());
-    v.extend_from_slice(&hs.mlkem_ct);
-    v.extend_from_slice(&(hs.sig.0.len() as u32).to_le_bytes());
-    v.extend_from_slice(&hs.sig.0);
-    v
-}
 
 /// Read a `u32le` length at `*pos`, bounded by `MAX_HANDSHAKE_LEN`, then the
 /// bytes it describes. Never panics; consumes exactly what it returns.
@@ -645,31 +942,6 @@ fn take_field<'a>(b: &'a [u8], pos: &mut usize) -> Result<&'a [u8]> {
     Ok(&b[end..stop])
 }
 
-fn decode_handshake(b: &[u8]) -> Result<Handshake> {
-    if b.len() > MAX_HANDSHAKE_LEN {
-        return Err(Error::Verify("handshake too large".into()));
-    }
-    if b.len() < 68 {
-        return Err(Error::Verify("short handshake".into()));
-    }
-    let mut eph = [0u8; 32];
-    let mut ratchet_pub = [0u8; 32];
-    eph.copy_from_slice(&b[..32]);
-    ratchet_pub.copy_from_slice(&b[32..64]);
-    let mut pos = 64;
-    let ct = take_field(b, &mut pos)?.to_vec();
-    let sig = take_field(b, &mut pos)?.to_vec();
-    if pos != b.len() {
-        return Err(Error::Verify("trailing data after handshake".into()));
-    }
-    Ok(Handshake {
-        eph_x25519: eph,
-        ratchet_pub,
-        mlkem_ct: ct,
-        sig: Signature(sig),
-    })
-}
-
 /// A [`SecureSession`] bound to a transport [`Connection`]: it performs the
 /// handshake over the wire and then implements the core async [`Session`]
 /// (seal-and-send / receive-and-open). This is the join point between the
@@ -680,17 +952,33 @@ pub struct ConnectedSession<C: Connection> {
 }
 
 impl<C: Connection> ConnectedSession<C> {
-    /// Initiator: send the handshake over `conn`, return the live session.
-    pub async fn initiate(mut conn: C, me: &Keypair, peer: &PublicIdentity) -> Result<Self> {
-        let (hs, session) = SecureSession::initiate(me, peer)?;
-        conn.send(&encode_handshake(&hs)).await?;
+    /// Initiator: send msg1 over `conn`, receive msg2, return the live session.
+    /// Handshake-protocol failures are [`Error::Verify`]; transport errors
+    /// propagate unchanged.
+    pub async fn initiate(
+        mut conn: C,
+        me: &Keypair,
+        peer: &PublicIdentity,
+        binding: &[u8],
+    ) -> Result<Self> {
+        let (init, pending) = SecureSession::initiate(me, peer, binding)?;
+        conn.send(&init.to_bytes()).await?;
+        let resp = HandshakeResp::from_bytes(&conn.recv().await?)?;
+        let session = pending.finish(&resp)?;
         Ok(Self { conn, session })
     }
 
-    /// Responder: receive the handshake from `conn`, return the live session.
-    pub async fn accept(mut conn: C, me: &Keypair, peer: &PublicIdentity) -> Result<Self> {
-        let hs = decode_handshake(&conn.recv().await?)?;
-        let session = SecureSession::accept(me, peer, &hs)?;
+    /// Responder: receive msg1 from `conn`, respond with msg2, return the live
+    /// session. If the handshake is rejected nothing is sent.
+    pub async fn accept(
+        mut conn: C,
+        me: &Keypair,
+        peer: &PublicIdentity,
+        binding: &[u8],
+    ) -> Result<Self> {
+        let init = HandshakeInit::from_bytes(&conn.recv().await?)?;
+        let (resp, session) = SecureSession::respond(me, peer, binding, &init)?;
+        conn.send(&resp.to_bytes()).await?;
         Ok(Self { conn, session })
     }
 
@@ -736,18 +1024,47 @@ mod tests {
         Keypair::generate(CryptoSuite::Hybrid).unwrap()
     }
 
+    const B: &[u8] = b"test-binding";
+
+    /// Run the full three-step handshake, returning both messages and sessions.
+    fn handshake(
+        alice: &Keypair,
+        bob: &Keypair,
+        binding: &[u8],
+    ) -> (HandshakeInit, HandshakeResp, SecureSession, SecureSession) {
+        let (m1, pending) = SecureSession::initiate(alice, bob.public(), binding).unwrap();
+        let (m2, b) = SecureSession::respond(bob, alice.public(), binding, &m1).unwrap();
+        let a = pending.finish(&m2).unwrap();
+        (m1, m2, a, b)
+    }
+
     fn pair() -> (SecureSession, SecureSession) {
         let (alice, bob) = (id(), id());
-        let (hs, a) = SecureSession::initiate(&alice, bob.public()).unwrap();
-        let b = SecureSession::accept(&bob, alice.public(), &hs).unwrap();
+        let (_, _, a, b) = handshake(&alice, &bob, B);
         (a, b)
     }
 
     fn pair_ids() -> (Keypair, Keypair, SecureSession, SecureSession) {
         let (alice, bob) = (id(), id());
-        let (hs, a) = SecureSession::initiate(&alice, bob.public()).unwrap();
-        let b = SecureSession::accept(&bob, alice.public(), &hs).unwrap();
+        let (_, _, a, b) = handshake(&alice, &bob, b"");
         (alice, bob, a, b)
+    }
+
+    fn classical() -> Keypair {
+        Keypair::generate(CryptoSuite::Classical).unwrap()
+    }
+
+    /// `T1 ‖ lp(sig_i)` for a msg1, as the responder rebuilds it.
+    fn t1_of(init: &HandshakeInit, binding: &[u8], a: &Keypair, b: &Keypair) -> Vec<u8> {
+        transcript_t1(
+            binding,
+            a.public(),
+            b.public(),
+            &init.eph_i,
+            &init.ratchet_pub_i,
+            &init.kem_ct_s,
+            &init.kem_ek_i,
+        )
     }
 
     const D: ResumeRole = ResumeRole::Dialer;
@@ -779,8 +1096,7 @@ mod tests {
     fn resume_tag_from_other_session_is_rejected() {
         let (alice, bob, _a, b) = pair_ids();
         let eve = id();
-        let (hs, e) = SecureSession::initiate(&eve, bob.public()).unwrap();
-        let _ = SecureSession::accept(&bob, eve.public(), &hs).unwrap();
+        let (_, _, e, _) = handshake(&eve, &bob, b"");
         let (nd, nl) = ([5u8; 32], [6u8; 32]);
         let tag = e.resume_tag(D, alice.public(), bob.public(), &nd, &nl);
         assert!(matches!(
@@ -983,114 +1299,350 @@ mod tests {
     }
 
     #[test]
-    fn wrong_responder_cannot_read() {
+    fn wrong_responder_cannot_accept() {
         let (alice, bob, eve) = (id(), id(), id());
-        let (hs, mut a) = SecureSession::initiate(&alice, bob.public()).unwrap();
+        let (m1, _pending) = SecureSession::initiate(&alice, bob.public(), B).unwrap();
         assert!(
-            SecureSession::accept(&eve, alice.public(), &hs).is_err(),
+            SecureSession::respond(&eve, alice.public(), B, &m1).is_err(),
             "non-intended responder must not accept"
         );
-        let _ = a.seal(b"for bob only").unwrap();
-    }
-
-    fn valid() -> (Keypair, Keypair, Keypair, Handshake) {
-        let (alice, bob, eve) = (id(), id(), id());
-        let (hs, _) = SecureSession::initiate(&alice, bob.public()).unwrap();
-        (alice, bob, eve, hs)
-    }
-
-    #[test]
-    fn impersonation_is_rejected() {
-        let (alice, bob, eve, _) = valid();
-        let (hs, _) = SecureSession::initiate(&eve, bob.public()).unwrap();
-        assert!(SecureSession::accept(&bob, alice.public(), &hs).is_err());
-    }
-
-    #[test]
-    fn signature_by_wrong_key_is_rejected() {
-        let (alice, bob, eve, mut hs) = valid();
-        let t = transcript(
-            alice.public(),
-            bob.public(),
-            &hs.eph_x25519,
-            &hs.ratchet_pub,
-            &hs.mlkem_ct,
-        );
-        hs.sig = eve.sign(&t);
-        assert!(SecureSession::accept(&bob, alice.public(), &hs).is_err());
-    }
-
-    #[test]
-    fn tampered_ratchet_pub_is_rejected() {
-        let (alice, bob, _, mut hs) = valid();
-        hs.ratchet_pub[0] ^= 1;
-        assert!(SecureSession::accept(&bob, alice.public(), &hs).is_err());
-    }
-
-    #[test]
-    fn handshake_under_wrong_claimed_initiator_is_rejected() {
-        let (_, bob, eve, hs) = valid();
-        assert!(SecureSession::accept(&bob, eve.public(), &hs).is_err());
     }
 
     #[test]
     fn genuine_handshake_roundtrips_and_messages() {
         let (alice, bob) = (id(), id());
-        let (hs, mut a) = SecureSession::initiate(&alice, bob.public()).unwrap();
-        let mut b = SecureSession::accept(&bob, alice.public(), &hs).unwrap();
+        let (_, _, mut a, mut b) = handshake(&alice, &bob, B);
         let ct = a.seal(b"hi").unwrap();
         assert_eq!(b.open(&ct).unwrap(), b"hi");
+        let ct = b.seal(b"yo").unwrap();
+        assert_eq!(a.open(&ct).unwrap(), b"yo");
     }
 
     #[test]
-    fn wire_roundtrip_is_accepted() {
-        let (alice, bob, _, hs) = valid();
-        let d = decode_handshake(&encode_handshake(&hs)).unwrap();
-        assert_eq!(d.eph_x25519, hs.eph_x25519);
-        assert_eq!(d.ratchet_pub, hs.ratchet_pub);
-        assert_eq!(d.mlkem_ct, hs.mlkem_ct);
-        assert_eq!(d.sig.0, hs.sig.0);
-        assert!(SecureSession::accept(&bob, alice.public(), &d).is_ok());
+    fn responder_ratchet_key_is_ephemeral_not_static() {
+        let (alice, bob) = (id(), id());
+        let (_, m2, a, mut b) = handshake(&alice, &bob, B);
+        assert_ne!(m2.eph_r, bob.public().x25519_bytes());
+        assert_eq!(a.core.dhr, Some(m2.eph_r));
+        // After respond's eager ratchet the eph_r secret is replaced, and the
+        // first sealed header carries the *new* key — never the static one.
+        let frame = b.seal(b"first").unwrap();
+        assert_ne!(&frame[..32], &bob.public().x25519_bytes()[..]);
     }
 
     #[test]
-    fn malformed_wire_is_rejected() {
-        let (_, _, _, hs) = valid();
-        let enc = encode_handshake(&hs);
-        assert!(decode_handshake(&enc[..enc.len() - 1]).is_err());
-        for n in [0usize, 63, 67] {
-            assert!(decode_handshake(&enc[..n]).is_err());
+    fn handshake_has_forward_secrecy_against_identity_compromise() {
+        let (alice, bob) = (id(), id());
+        let (m1, m2, mut a, mut b) = handshake(&alice, &bob, B);
+        let first = a.seal(b"secret").unwrap();
+
+        // Attacker: both long-term keys + the recorded messages.
+        let ss1 = nonzero(bob.x25519_dh(&m1.eph_i)).unwrap();
+        let ss2 = bob.pq_decapsulate(&m1.kem_ct_s).unwrap();
+        let mut t2_prefix = t1_of(&m1, B, &alice, &bob);
+        put_lp(&mut t2_prefix, &m1.sig_i.0);
+        let t2 = transcript_t2(&t2_prefix, &m2.eph_r, &m2.kem_ct_e);
+        let t = transcript_final(&t2, &m2.sig_r);
+        let static_root = root_key(&build_ikm([Some(&ss1), Some(&ss2), None, None]), &t);
+        assert_ne!(*derive_resume_key(&static_root), *a.resume_key);
+
+        // A v2-style responder built from the static-only root cannot decrypt.
+        let mut core = RatchetCore {
+            rk: static_root.clone(),
+            dhs: bob.x25519_secret(),
+            dhs_pub: bob.public().x25519_bytes(),
+            dhr: None,
+            cks: None,
+            ckr: None,
+            ns: 0,
+            nr: 0,
+            pn: 0,
+        };
+        dh_ratchet(&mut core, m1.ratchet_pub_i).unwrap();
+        let mut forged = SecureSession {
+            core,
+            skipped: Skipped::default(),
+            resume_key: derive_resume_key(&static_root),
+        };
+        assert!(forged.open(&first).is_err());
+        // The real responder can.
+        assert_eq!(b.open(&first).unwrap(), b"secret");
+    }
+
+    #[test]
+    fn initiator_impersonation_is_rejected() {
+        let (alice, bob, eve) = (id(), id(), id());
+        // Eve signs, Bob is told the peer is Alice.
+        let (m1, _) = SecureSession::initiate(&eve, bob.public(), B).unwrap();
+        assert!(matches!(
+            SecureSession::respond(&bob, alice.public(), B, &m1),
+            Err(Error::Verify(_))
+        ));
+        // sig_i is Eve's signature over the correct T1.
+        let (mut m1, _) = SecureSession::initiate(&alice, bob.public(), B).unwrap();
+        m1.sig_i = eve.sign(&t1_of(&m1, B, &alice, &bob));
+        assert!(matches!(
+            SecureSession::respond(&bob, alice.public(), B, &m1),
+            Err(Error::Verify(_))
+        ));
+    }
+
+    #[test]
+    fn responder_impersonation_is_rejected() {
+        let (alice, bob, eve) = (id(), id(), id());
+        let (m1, pending) = SecureSession::initiate(&alice, bob.public(), B).unwrap();
+        // Eve cannot even answer a msg1 meant for Bob.
+        assert!(SecureSession::respond(&eve, alice.public(), B, &m1).is_err());
+        // Forged msg2 signed by Eve over the right T2.
+        let mut t2_prefix = t1_of(&m1, B, &alice, &bob);
+        put_lp(&mut t2_prefix, &m1.sig_i.0);
+        let eph_r = [9u8; 32];
+        let t2 = transcript_t2(&t2_prefix, &eph_r, &[1u8; 8]);
+        let forged = HandshakeResp {
+            eph_r,
+            kem_ct_e: vec![1u8; 8],
+            sig_r: eve.sign(&t2),
+        };
+        assert!(matches!(pending.finish(&forged), Err(Error::Verify(_))));
+    }
+
+    #[test]
+    fn tampering_with_any_msg1_field_is_rejected() {
+        let (alice, bob) = (id(), id());
+        let (m1, _) = SecureSession::initiate(&alice, bob.public(), B).unwrap();
+        let mid = |v: &Vec<u8>| v.len() / 2;
+        let mut cases: Vec<HandshakeInit> = Vec::new();
+        let mut c = m1.clone();
+        c.eph_i[0] ^= 1;
+        cases.push(c);
+        let mut c = m1.clone();
+        c.ratchet_pub_i[0] ^= 1;
+        cases.push(c);
+        let mut c = m1.clone();
+        let i = mid(&c.kem_ct_s);
+        c.kem_ct_s[i] ^= 1;
+        cases.push(c);
+        let mut c = m1.clone();
+        let i = mid(&c.kem_ek_i);
+        c.kem_ek_i[i] ^= 1;
+        cases.push(c);
+        let mut c = m1.clone();
+        let i = mid(&c.sig_i.0);
+        c.sig_i.0[i] ^= 1;
+        cases.push(c);
+        for c in cases {
+            assert!(SecureSession::respond(&bob, alice.public(), B, &c).is_err());
+        }
+    }
+
+    #[test]
+    fn tampering_with_any_msg2_field_is_rejected() {
+        let (alice, bob) = (id(), id());
+        let (m1, pending) = SecureSession::initiate(&alice, bob.public(), B).unwrap();
+        let (m2, _) = SecureSession::respond(&bob, alice.public(), B, &m1).unwrap();
+        // `finish` consumes the pending state, so re-run for each tampered copy.
+        let mut cases: Vec<HandshakeResp> = Vec::new();
+        let mut c = m2.clone();
+        c.eph_r[0] ^= 1;
+        cases.push(c);
+        let mut c = m2.clone();
+        let i = c.kem_ct_e.len() / 2;
+        c.kem_ct_e[i] ^= 1;
+        cases.push(c);
+        let mut c = m2.clone();
+        let i = c.sig_r.0.len() / 2;
+        c.sig_r.0[i] ^= 1;
+        cases.push(c);
+        // First case uses the pending we have; the rest need fresh handshakes.
+        assert!(pending.finish(&cases[0]).is_err());
+        for which in 1..cases.len() {
+            let (m1, pending) = SecureSession::initiate(&alice, bob.public(), B).unwrap();
+            let (mut m2, _) = SecureSession::respond(&bob, alice.public(), B, &m1).unwrap();
+            if which == 1 {
+                let i = m2.kem_ct_e.len() / 2;
+                m2.kem_ct_e[i] ^= 1;
+            } else {
+                let i = m2.sig_r.0.len() / 2;
+                m2.sig_r.0[i] ^= 1;
+            }
+            assert!(pending.finish(&m2).is_err());
+        }
+    }
+
+    #[test]
+    fn binding_must_match() {
+        let (alice, bob) = (id(), id());
+        let (m1, _) = SecureSession::initiate(&alice, bob.public(), b"one").unwrap();
+        assert!(SecureSession::respond(&bob, alice.public(), b"two", &m1).is_err());
+        let (m1, _) = SecureSession::initiate(&alice, bob.public(), b"").unwrap();
+        assert!(SecureSession::respond(&bob, alice.public(), b"x", &m1).is_err());
+        // Identical bindings (empty and non-empty) succeed.
+        let _ = handshake(&alice, &bob, b"");
+        let _ = handshake(&alice, &bob, b"same");
+        // Oversized binding is rejected up front.
+        let big = vec![0u8; MAX_HANDSHAKE_LEN + 1];
+        assert!(matches!(
+            SecureSession::initiate(&alice, bob.public(), &big),
+            Err(Error::Verify(_))
+        ));
+    }
+
+    #[test]
+    fn replayed_msg1_yields_an_incompatible_session() {
+        let (alice, bob) = (id(), id());
+        let (m1, pending) = SecureSession::initiate(&alice, bob.public(), B).unwrap();
+        let (m2, mut b1) = SecureSession::respond(&bob, alice.public(), B, &m1).unwrap();
+        let (m2b, mut b2) = SecureSession::respond(&bob, alice.public(), B, &m1).unwrap();
+        assert_ne!(m2.eph_r, m2b.eph_r);
+        let mut a = pending.finish(&m2).unwrap();
+        // Replayed responder → original initiator: neither direction works.
+        let from_b2 = b2.seal(b"replay").unwrap();
+        assert!(a.open(&from_b2).is_err());
+        let from_a = a.seal(b"orig").unwrap();
+        assert!(b2.open(&from_a).is_err());
+        // The first responder still works.
+        assert_eq!(b1.open(&from_a).unwrap(), b"orig");
+    }
+
+    #[test]
+    fn decoders_round_trip_and_complete_a_handshake() {
+        let (alice, bob) = (id(), id());
+        let (m1, pending) = SecureSession::initiate(&alice, bob.public(), B).unwrap();
+        let d1 = HandshakeInit::from_bytes(&m1.to_bytes()).unwrap();
+        assert_eq!(d1.eph_i, m1.eph_i);
+        assert_eq!(d1.ratchet_pub_i, m1.ratchet_pub_i);
+        assert_eq!(d1.kem_ct_s, m1.kem_ct_s);
+        assert_eq!(d1.kem_ek_i, m1.kem_ek_i);
+        assert_eq!(d1.sig_i.0, m1.sig_i.0);
+        let (m2, mut b) = SecureSession::respond(&bob, alice.public(), B, &d1).unwrap();
+        let d2 = HandshakeResp::from_bytes(&m2.to_bytes()).unwrap();
+        assert_eq!(d2.eph_r, m2.eph_r);
+        assert_eq!(d2.kem_ct_e, m2.kem_ct_e);
+        assert_eq!(d2.sig_r.0, m2.sig_r.0);
+        let mut a = pending.finish(&d2).unwrap();
+        let ct = a.seal(b"decoded").unwrap();
+        assert_eq!(b.open(&ct).unwrap(), b"decoded");
+    }
+
+    #[test]
+    fn malformed_msg1_is_rejected_without_panic() {
+        let (alice, bob) = (id(), id());
+        let (m1, _) = SecureSession::initiate(&alice, bob.public(), B).unwrap();
+        let enc = m1.to_bytes();
+        assert!(HandshakeInit::from_bytes(&[]).is_err());
+        for n in 0..enc.len() {
+            assert!(HandshakeInit::from_bytes(&enc[..n]).is_err(), "len {n}");
         }
         let mut extra = enc.clone();
         extra.push(0);
-        assert!(decode_handshake(&extra).is_err());
+        assert!(HandshakeInit::from_bytes(&extra).is_err());
+        assert!(HandshakeInit::from_bytes(&vec![0u8; MAX_HANDSHAKE_LEN + 1]).is_err());
+        // Each length prefix set to u32::MAX or MAX + 1.
+        let p0 = 64;
+        let p1 = p0 + 4 + m1.kem_ct_s.len();
+        let p2 = p1 + 4 + m1.kem_ek_i.len();
+        for p in [p0, p1, p2] {
+            for bad in [u32::MAX, MAX_HANDSHAKE_LEN as u32 + 1] {
+                let mut v = enc.clone();
+                v[p..p + 4].copy_from_slice(&bad.to_le_bytes());
+                assert!(HandshakeInit::from_bytes(&v).is_err());
+            }
+        }
+    }
 
-        let mut big_ct = vec![0u8; 68];
-        big_ct[64..68].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert!(decode_handshake(&big_ct).is_err());
+    #[test]
+    fn malformed_msg2_is_rejected_without_panic() {
+        let (alice, bob) = (id(), id());
+        let (_, m2, _, _) = handshake(&alice, &bob, B);
+        let enc = m2.to_bytes();
+        assert!(HandshakeResp::from_bytes(&[]).is_err());
+        for n in 0..enc.len() {
+            assert!(HandshakeResp::from_bytes(&enc[..n]).is_err(), "len {n}");
+        }
+        let mut extra = enc.clone();
+        extra.push(0);
+        assert!(HandshakeResp::from_bytes(&extra).is_err());
+        assert!(HandshakeResp::from_bytes(&vec![0u8; MAX_HANDSHAKE_LEN + 1]).is_err());
+        let p0 = 32;
+        let p1 = p0 + 4 + m2.kem_ct_e.len();
+        for p in [p0, p1] {
+            for bad in [u32::MAX, MAX_HANDSHAKE_LEN as u32 + 1] {
+                let mut v = enc.clone();
+                v[p..p + 4].copy_from_slice(&bad.to_le_bytes());
+                assert!(HandshakeResp::from_bytes(&v).is_err());
+            }
+        }
+    }
 
-        let mut big_sig = vec![0u8; 72];
-        big_sig[68..72].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert!(decode_handshake(&big_sig).is_err());
+    #[test]
+    fn classical_handshake_has_no_kem_fields_and_works() {
+        let (alice, bob) = (classical(), classical());
+        let (m1, m2, mut a, mut b) = handshake(&alice, &bob, B);
+        assert!(m1.kem_ct_s.is_empty() && m1.kem_ek_i.is_empty() && m2.kem_ct_e.is_empty());
+        let ct = a.seal(b"c2s").unwrap();
+        assert_eq!(b.open(&ct).unwrap(), b"c2s");
+        let ct = b.seal(b"s2c").unwrap();
+        assert_eq!(a.open(&ct).unwrap(), b"s2c");
+    }
 
-        assert!(decode_handshake(&vec![0u8; MAX_HANDSHAKE_LEN + 1]).is_err());
+    #[test]
+    fn classical_responder_rejects_kem_fields() {
+        let (alice, bob) = (classical(), classical());
+        let (mut m1, _) = SecureSession::initiate(&alice, bob.public(), B).unwrap();
+        m1.kem_ct_s = vec![1u8; 16];
+        // Not re-signed: signature check fails.
+        assert!(SecureSession::respond(&bob, alice.public(), B, &m1).is_err());
+        // Correctly re-signed: the KEM-field check fails.
+        m1.sig_i = alice.sign(&t1_of(&m1, B, &alice, &bob));
+        assert!(matches!(
+            SecureSession::respond(&bob, alice.public(), B, &m1),
+            Err(Error::Verify(_))
+        ));
+    }
+
+    #[test]
+    fn hybrid_responder_rejects_missing_kem_fields() {
+        let (alice, bob) = (id(), id());
+        let (mut m1, _) = SecureSession::initiate(&alice, bob.public(), B).unwrap();
+        m1.kem_ek_i.clear();
+        m1.sig_i = alice.sign(&t1_of(&m1, B, &alice, &bob));
+        assert!(matches!(
+            SecureSession::respond(&bob, alice.public(), B, &m1),
+            Err(Error::Verify(_))
+        ));
     }
 
     #[test]
     fn transcript_layout() {
-        let (alice, bob, _, hs) = valid();
-        let t = transcript(
-            alice.public(),
-            bob.public(),
-            &hs.eph_x25519,
-            &hs.ratchet_pub,
-            &hs.mlkem_ct,
-        );
-        assert!(t.starts_with(b"lattice-session-hs-v2"));
+        let (alice, bob) = (id(), id());
+        let (m1, _) = SecureSession::initiate(&alice, bob.public(), B).unwrap();
+        let t = t1_of(&m1, B, &alice, &bob);
+        assert!(t.starts_with(b"lattice-session-hs-v3"));
         let (i, r) = (alice.public().to_bytes(), bob.public().to_bytes());
-        assert_eq!(
-            t.len(),
-            21 + 4 + i.len() + 4 + r.len() + 32 + 32 + 4 + hs.mlkem_ct.len()
+        let var = [
+            B.len(),
+            i.len(),
+            r.len(),
+            m1.kem_ct_s.len(),
+            m1.kem_ek_i.len(),
+        ];
+        // domain + 5 length prefixes + eph_i + ratchet_pub_i + variable parts.
+        assert_eq!(t.len(), 21 + 5 * 4 + 64 + var.iter().sum::<usize>());
+    }
+
+    #[test]
+    fn build_ikm_is_plain_concatenation() {
+        let (a, b, c, d) = (
+            Zeroizing::new([1u8; 32]),
+            Zeroizing::new([2u8; 32]),
+            Zeroizing::new([3u8; 32]),
+            Zeroizing::new([4u8; 32]),
         );
+        let ikm = build_ikm([Some(&a), Some(&b), Some(&c), Some(&d)]);
+        assert_eq!(ikm.len(), 128);
+        assert_eq!(&ikm[32..64], &[2u8; 32]);
+        let classical = build_ikm([Some(&a), None, Some(&c), None]);
+        assert_eq!(classical.len(), 64);
+        assert_eq!(&classical[32..], &[3u8; 32]);
     }
 }

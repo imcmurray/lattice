@@ -29,7 +29,9 @@ pub mod prelude {
     };
     pub use lattice_identity::{DeviceCert, Keypair, PublicIdentity};
     pub use lattice_log::MemLog;
-    pub use lattice_session::{ConnectedSession, Handshake, SecureSession};
+    pub use lattice_session::{
+        ConnectedSession, HandshakeInit, HandshakeResp, PendingInitiator, SecureSession,
+    };
     pub use lattice_transport::{MemoryConn, MemoryNetwork, MemoryTransport};
 
     #[cfg(feature = "iroh")]

@@ -9,11 +9,15 @@
 ## Known limitations
 
 - Lattice is experimental, and this patch is not an external audit.
-- The handshake initiator is authenticated by a hybrid signature (Ed25519 and
-  ML-DSA) over the v2 handshake transcript (`lattice-session-hs-v2`).
-- Compromise of a long-term identity still decrypts recorded sessions. The KEM
-  targets the responder's static X25519 and ML-KEM keys, and the responder's
-  first ratchet secret is that static X25519 key.
+- Both sides sign the v3 handshake transcript (`lattice-session-hs-v3`) with
+  hybrid signatures (Ed25519 and ML-DSA). The transcript includes
+  caller-supplied channel-binding bytes. `lattice-net` currently passes a fixed
+  constant rather than the iroh endpoint ids, so the handshake is not yet bound
+  to the specific iroh channel.
+- Sessions now have forward secrecy against later identity compromise: the
+  handshake is hybrid, mixing fresh X25519 and ML-KEM ephemerals from both
+  sides, which are erased after the handshake. A compromised long-term identity
+  can still impersonate its owner in NEW sessions.
 - The `lattice-net` listen ticket is an unsigned bearer token for reachability.
   The Lattice identity is not bound to the iroh endpoint id.
 - Resuming a kept session in `lattice-net` requires a mutual HMAC proof bound to

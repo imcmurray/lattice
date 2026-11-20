@@ -5,6 +5,8 @@
 
 use lattice::prelude::*;
 
+const BINDING: &[u8] = b"session-over-transport-test";
+
 #[tokio::test]
 async fn encrypted_session_over_memory_transport() {
     let alice = Keypair::generate(CryptoSuite::Hybrid).unwrap();
@@ -24,13 +26,13 @@ async fn encrypted_session_over_memory_transport() {
         "accepted connection reports the dialer"
     );
 
-    // Run the handshake over the connection.
-    let mut a = ConnectedSession::initiate(alice_conn, &alice, bob.public())
-        .await
-        .unwrap();
-    let mut b = ConnectedSession::accept(bob_conn, &bob, alice.public())
-        .await
-        .unwrap();
+    // Run the two-message handshake over the connection (the initiator waits
+    // for the responder's reply, so both sides run concurrently).
+    let (a, b) = tokio::join!(
+        ConnectedSession::initiate(alice_conn, &alice, bob.public(), BINDING),
+        ConnectedSession::accept(bob_conn, &bob, alice.public(), BINDING)
+    );
+    let (mut a, mut b) = (a.unwrap(), b.unwrap());
 
     // Exchange encrypted messages both ways (drives the Double Ratchet).
     a.send(b"hello over the wire").await.unwrap();
@@ -41,6 +43,44 @@ async fn encrypted_session_over_memory_transport() {
 
     a.send(b"and again").await.unwrap();
     assert_eq!(b.recv().await.unwrap(), b"and again");
+}
+
+/// Mismatched bindings: the responder rejects with Verify and hangs up, so the
+/// initiator also errors (Verify or Transport).
+#[tokio::test]
+async fn mismatched_bindings_fail_handshake() {
+    let alice = Keypair::generate(CryptoSuite::Hybrid).unwrap();
+    let bob = Keypair::generate(CryptoSuite::Hybrid).unwrap();
+    let net = MemoryNetwork::new();
+    let alice_ep = net.endpoint(alice.peer_id());
+    let bob_ep = net.endpoint(bob.peer_id());
+    let aconn = alice_ep.connect(&bob.peer_id()).await.unwrap();
+    let (_, bconn) = bob_ep.accept().await.unwrap();
+    let (a, b) = tokio::join!(
+        ConnectedSession::initiate(aconn, &alice, bob.public(), b"binding-one"),
+        ConnectedSession::accept(bconn, &bob, alice.public(), b"binding-two")
+    );
+    assert!(matches!(b, Err(Error::Verify(_))));
+    assert!(a.is_err());
+}
+
+/// The responder expects a different peer than the one that dialed.
+#[tokio::test]
+async fn wrong_expected_peer_fails_handshake() {
+    let alice = Keypair::generate(CryptoSuite::Hybrid).unwrap();
+    let bob = Keypair::generate(CryptoSuite::Hybrid).unwrap();
+    let eve = Keypair::generate(CryptoSuite::Hybrid).unwrap();
+    let net = MemoryNetwork::new();
+    let alice_ep = net.endpoint(alice.peer_id());
+    let bob_ep = net.endpoint(bob.peer_id());
+    let aconn = alice_ep.connect(&bob.peer_id()).await.unwrap();
+    let (_, bconn) = bob_ep.accept().await.unwrap();
+    let (a, b) = tokio::join!(
+        ConnectedSession::initiate(aconn, &alice, bob.public(), BINDING),
+        ConnectedSession::accept(bconn, &bob, eve.public(), BINDING)
+    );
+    assert!(matches!(b, Err(Error::Verify(_))));
+    assert!(a.is_err());
 }
 
 /// Session resumption: after a transport drop, the same `SecureSession`s rebind
@@ -56,12 +96,11 @@ async fn session_resumes_across_a_dropped_connection() {
     // Initial connect + handshake + a round-trip.
     let aconn = alice_ep.connect(&bob.peer_id()).await.unwrap();
     let (_, bconn) = bob_ep.accept().await.unwrap();
-    let mut a = ConnectedSession::initiate(aconn, &alice, bob.public())
-        .await
-        .unwrap();
-    let mut b = ConnectedSession::accept(bconn, &bob, alice.public())
-        .await
-        .unwrap();
+    let (a, b) = tokio::join!(
+        ConnectedSession::initiate(aconn, &alice, bob.public(), BINDING),
+        ConnectedSession::accept(bconn, &bob, alice.public(), BINDING)
+    );
+    let (mut a, mut b) = (a.unwrap(), b.unwrap());
     a.send(b"msg-1").await.unwrap();
     assert_eq!(b.recv().await.unwrap(), b"msg-1");
     b.send(b"reply-1").await.unwrap();
@@ -96,12 +135,11 @@ async fn resume_tolerates_a_frame_lost_in_the_gap() {
 
     let aconn = alice_ep.connect(&bob.peer_id()).await.unwrap();
     let (_, bconn) = bob_ep.accept().await.unwrap();
-    let mut a = ConnectedSession::initiate(aconn, &alice, bob.public())
-        .await
-        .unwrap();
-    let mut b = ConnectedSession::accept(bconn, &bob, alice.public())
-        .await
-        .unwrap();
+    let (a, b) = tokio::join!(
+        ConnectedSession::initiate(aconn, &alice, bob.public(), BINDING),
+        ConnectedSession::accept(bconn, &bob, alice.public(), BINDING)
+    );
+    let (mut a, mut b) = (a.unwrap(), b.unwrap());
     a.send(b"delivered").await.unwrap();
     assert_eq!(b.recv().await.unwrap(), b"delivered");
 

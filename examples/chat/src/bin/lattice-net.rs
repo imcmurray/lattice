@@ -39,6 +39,8 @@ const DECISION_RESUMED: u8 = 1;
 const DECISION_CHALLENGE: u8 = 2;
 const NONCE_LEN: usize = 32;
 const TAG_LEN: usize = 32;
+// TODO(channel-binding): pass the iroh endpoint ids
+const HS_BINDING: &[u8] = b"lattice-net-v3";
 
 type StdinLines = Lines<BufReader<Stdin>>;
 
@@ -198,7 +200,7 @@ async fn accept_or_resume<C: Connection>(
     }
     // Fresh handshake (requested, or resume with no kept session).
     conn.send(&[DECISION_FRESH]).await?;
-    let cs = ConnectedSession::accept(conn, me, &peer).await?;
+    let cs = ConnectedSession::accept(conn, me, &peer, HS_BINDING).await?;
     // Only a successful handshake replaces the stale session for this peer.
     sessions.remove(&peer_id);
     eprintln!(
@@ -261,7 +263,7 @@ async fn negotiate_dial<C: Connection>(
             if kept.take().is_some() {
                 eprintln!("[lattice-net] peer couldn't resume — fresh handshake");
             }
-            let cs = ConnectedSession::initiate(conn, me, peer).await?;
+            let cs = ConnectedSession::initiate(conn, me, peer, HS_BINDING).await?;
             eprintln!(
                 "[lattice-net] connected to {:?} (fresh session) — type messages:",
                 peer.peer_id()
@@ -413,7 +415,9 @@ mod tests {
     }
 
     fn stale(alice: &Keypair, bob: &Keypair) -> HashMap<PeerId, SecureSession> {
-        let (_, s) = SecureSession::initiate(bob, alice.public()).unwrap();
+        let (m1, pending) = SecureSession::initiate(bob, alice.public(), b"").unwrap();
+        let (m2, _) = SecureSession::respond(alice, bob.public(), b"", &m1).unwrap();
+        let s = pending.finish(&m2).unwrap();
         HashMap::from([(alice.peer_id(), s)])
     }
 
@@ -431,11 +435,14 @@ mod tests {
         let (mut dial, listen) = pair().await;
         preamble(&mut dial, MODE_FRESH, &alice).await;
         // Eve's handshake, claimed to come from Alice.
-        let _dialer = ConnectedSession::initiate(dial, &eve, bob.public())
-            .await
-            .unwrap();
-        let r = accept_or_resume(listen, &bob, &mut sessions).await;
+        let dialer = async {
+            // The listener's decision byte comes first, then the handshake.
+            assert_eq!(dial.recv().await.unwrap(), [DECISION_FRESH]);
+            ConnectedSession::initiate(dial, &eve, bob.public(), HS_BINDING).await
+        };
+        let (d, r) = tokio::join!(dialer, accept_or_resume(listen, &bob, &mut sessions));
         assert!(r.is_err());
+        assert!(d.is_err());
         assert!(sessions.contains_key(&alice.peer_id()));
     }
 
@@ -445,20 +452,19 @@ mod tests {
         let mut sessions = stale(&alice, &bob);
         let (mut dial, listen) = pair().await;
         preamble(&mut dial, MODE_FRESH, &alice).await;
-        // Keep the dialer end alive so the listener's decision byte can be sent.
-        let _dialer = ConnectedSession::initiate(dial, &alice, bob.public())
-            .await
-            .unwrap();
-        let r = accept_or_resume(listen, &bob, &mut sessions).await;
+        let dialer = async {
+            assert_eq!(dial.recv().await.unwrap(), [DECISION_FRESH]);
+            ConnectedSession::initiate(dial, &alice, bob.public(), HS_BINDING).await
+        };
+        let (d, r) = tokio::join!(dialer, accept_or_resume(listen, &bob, &mut sessions));
+        assert!(d.is_ok());
         assert!(r.is_ok());
         assert!(!sessions.contains_key(&alice.peer_id()));
     }
 
     #[tokio::test]
     async fn genuine_resume_with_mutual_proof_succeeds() {
-        let (alice, bob) = (id(), id());
-        let (hs, a) = SecureSession::initiate(&alice, bob.public()).unwrap();
-        let b = SecureSession::accept(&bob, alice.public(), &hs).unwrap();
+        let (alice, bob, a, b) = genuine();
         let mut sessions = HashMap::from([(alice.peer_id(), b)]);
         let mut kept = Some(a);
         let (dial, listen) = pair().await;
@@ -491,8 +497,9 @@ mod tests {
     /// Genuine Alice–Bob pair: (alice, bob, alice's session, bob's session).
     fn genuine() -> (Keypair, Keypair, SecureSession, SecureSession) {
         let (alice, bob) = (id(), id());
-        let (hs, a) = SecureSession::initiate(&alice, bob.public()).unwrap();
-        let b = SecureSession::accept(&bob, alice.public(), &hs).unwrap();
+        let (m1, pending) = SecureSession::initiate(&alice, bob.public(), b"").unwrap();
+        let (m2, b) = SecureSession::respond(&bob, alice.public(), b"", &m1).unwrap();
+        let a = pending.finish(&m2).unwrap();
         (alice, bob, a, b)
     }
 
