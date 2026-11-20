@@ -10,7 +10,9 @@
 
 - Lattice is experimental, and this patch is not an external audit.
 - Both sides sign the v3 handshake transcript (`lattice-session-hs-v3`) with
-  hybrid signatures (Ed25519 and ML-DSA). The transcript includes
+  their identity signatures: Ed25519 and ML-DSA for a Hybrid identity (the
+  default, and what `lattice-net` uses), Ed25519 only for a Classical
+  identity. The transcript includes
   caller-supplied channel-binding bytes. `lattice-net` passes the dialer's and
   listener's iroh endpoint ids as that binding (`lattice-net-cb-v1`), so the
   handshake is bound to the specific iroh channel.
@@ -23,8 +25,9 @@
   sessions.
 - The `lattice-net` listener limits each pre-chat step and the finishing of an
   inbound QUIC connection to 15 s, and bounds pending accepts and busy replies
-  (8 each), dropping the excess. This is not Sybil or flood resistance: a flood
-  can still fill those slots and delay legitimate peers.
+  (8 each), dropping the excess. This is not Sybil or flood resistance: a
+  sustained flood can keep those slots full and lock legitimate peers out for
+  as long as it lasts.
 - The `lattice-net` listen ticket is a reachability bearer token. It is signed
   by the listener's Lattice identity: the signature (`lattice-ticket-v2`) covers
   the listener's iroh endpoint id, its full address (relay URLs and direct
@@ -79,8 +82,9 @@ it, and the impact you believe it has.
 
 **In scope** — anything that breaks a security property claimed in
 [`DESIGN.md`](./DESIGN.md): message confidentiality or integrity, the
-post-quantum hybrid guarantees (secure if *either* the classical or PQ half
-holds), forward secrecy / post-compromise security, identity authenticity, the
+post-quantum hybrid guarantees for `Hybrid` identities (secure if *either*
+the classical or PQ half holds; the `Classical` suite is classical-only by
+design), forward secrecy / post-compromise security, identity authenticity, the
 capability model, or the memory-safety invariant (`#![forbid(unsafe_code)]` in
 every crate we author).
 

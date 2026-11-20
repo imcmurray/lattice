@@ -13,7 +13,7 @@ workspace = true
 [features]
 default = []
 # Networked QUIC backend (iroh). Off by default to keep core builds light.
-iroh = ["dep:iroh", "dep:serde", "dep:postcard", "dep:hex", "tokio/io-util"]
+iroh = ["dep:iroh", "dep:serde", "dep:postcard", "dep:hex", "tokio/io-util", "tokio/time"]
 
 [dependencies]
 lattice-core = { path = "../lattice-core" }

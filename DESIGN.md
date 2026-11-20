@@ -9,7 +9,7 @@
 ## 1. Purpose, scope, non-goals
 
 ### 1.1 Purpose
-Lattice lets a developer build a **serverless, zero-infrastructure P2P application** — messaging, file sync, collaborative tooling, local-first apps — without standing up or trusting any central server. Data lives on user devices; peers discover each other and sync directly. The framework supplies the hard parts (identity, encrypted sessions, replicated state, connectivity) behind a small, ergonomic API so app authors think about *their app*, not about NAT traversal or ratchets.
+Lattice lets a developer build a **serverless, zero-infrastructure P2P application** — messaging, file sync, collaborative tooling, local-first apps — without standing up or trusting any central server. Data lives on user devices, and peers connect directly. The framework supplies the hard parts (identity, encrypted sessions, connectivity, and signed append-only logs) behind a small, ergonomic API so app authors think about *their app*, not about NAT traversal or ratchets. Peer discovery by topic and replicated (CRDT) state are goals, not implemented yet (see §8).
 
 It is explicitly a **framework for others to build on**, not a single app. The north-star validating app is a small encrypted group chat (a "ShadowWhisper, but in Rust and reusable").
 
@@ -135,9 +135,9 @@ Why `Identity`/`Verify` are split: a signature can't be checked against a `PeerI
 
 | Function | Classical | PQ (hybrid partner) | Notes |
 |---|---|---|---|
-| Identity signatures | Ed25519 | ML-DSA (Dilithium) | hybrid sig = both must verify |
+| Identity signatures | Ed25519 | ML-DSA (Dilithium) | hybrid sig = both must verify (Hybrid suite; a Classical identity signs with Ed25519 only) |
 | Key agreement | X25519 | ML-KEM (Kyber) | hybrid KEM, combined into one shared secret |
-| Session handshake | X25519 (two DHs) + HKDF-SHA256 | ML-KEM-768 (two encapsulations) | `lattice-session-hs-v3`: Lattice's own two-message handshake, signed by both sides with the hybrid identity signatures. No identity hiding |
+| Session handshake | X25519 (two DHs) + HKDF-SHA256 | ML-KEM-768 (two encapsulations) | `lattice-session-hs-v3`: Lattice's own two-message handshake, signed by both sides with their identity signatures (hybrid for Hybrid identities). No identity hiding |
 | Forward secrecy / PCS | Double Ratchet: X25519 DH ratchet, HKDF-SHA256 root/chain KDFs | — | per-message key evolution; the healing leg is classical |
 | Record encryption | ChaCha20-Poly1305 | — | per-message key; the ratchet header is the AAD |
 | Resume proofs | HMAC-SHA256 | — | `lattice-resume-v2`, keyed from the session root |
@@ -231,12 +231,12 @@ Note on duplicate versions: `ed25519-dalek 3.0.0-rc.0` appears in `Cargo.lock` b
 
 | Threat | Where | Vector | Mitigation |
 |---|---|---|---|
-| **S**poofing identity | Peer/Discovery | Claim to be another `PeerId` | Identity = public key; every entry signed (hybrid); the v3 handshake has mutual transcript signatures and a caller-supplied channel binding; `lattice-net` tickets are signed; first contact is TOFU with a manual fingerprint comparison |
+| **S**poofing identity | Peer/Discovery | Claim to be another `PeerId` | Identity = public key; every entry signed (hybrid for Hybrid identities); the v3 handshake has mutual transcript signatures and a caller-supplied channel binding; `lattice-net` tickets are signed; first contact is TOFU with a manual fingerprint comparison |
 | **T**ampering content | Transport/Peer | Alter messages/log entries in flight or at rest | AEAD per record; append-only log is a signed hash chain — any edit breaks verification, `verify()` fails closed |
-| **R**epudiation | Peer | "I never wrote that" | Per-entry hybrid signatures are non-repudiable within a room |
+| **R**epudiation | Peer | "I never wrote that" | Per-entry signatures (hybrid for Hybrid identities) are non-repudiable within a room |
 | **I**nfo disclosure | Transport/Relay | Read plaintext | E2E AEAD; relay sees only ciphertext + endpoints. Identities are **not** hidden: they are sent in the clear (the `lattice-net` preamble carries the dialer's identity bundle, the ticket carries the listener's), so a passive observer of the handshake can learn them |
 | **I**nfo disclosure (metadata) | Discovery/Relay | Learn who talks to whom | **v1: accepted risk (A7 deferred).** Metadata is not hidden. v2: tor/mix `Transport` impl |
-| **D**enial of service | Transport/Discovery | Drop/flood/eclipse | iroh relay fallback for reachability; 64 KiB caps on frames and handshake fields; `MAX_SKIP`/`MAX_SKIPPED_KEYS` bound ratchet work; `lattice-net`'s 15 s `NEGOTIATION_TIMEOUT` on each pre-chat step and on finishing an inbound QUIC connection; a one-byte busy reply to a connection that arrives during a chat; at most `MAX_PENDING_ACCEPTS` (8) concurrent pending accepts and `MAX_BUSY_REPLIES` (8) concurrent busy replies, with extra connections dropped immediately. `IrohTransport::accept_conn` itself is unbounded, and `lattice-net` no longer uses it. Residuals: a flood can still fill the 8+8 slots and delay legitimate peers for up to the timeout; there is no per-peer rate limiting; there is no Sybil resistance (§6.6) |
+| **D**enial of service | Transport/Discovery | Drop/flood/eclipse | iroh relay fallback for reachability; 64 KiB caps on frames and handshake fields; `MAX_SKIP`/`MAX_SKIPPED_KEYS` bound ratchet work; `lattice-net`'s 15 s `NEGOTIATION_TIMEOUT` on each pre-chat step and on finishing an inbound QUIC connection; a one-byte busy reply to a connection that arrives during a chat; at most `MAX_PENDING_ACCEPTS` (8) concurrent pending accepts and `MAX_BUSY_REPLIES` (8) concurrent busy replies, with extra connections dropped immediately. `IrohTransport::accept_conn` has no timeout and the `Transport::accept` trait method is limited to 15 s per inbound connection but still serial; `lattice-net` uses neither. Residuals: a sustained flood can keep the 8+8 slots full and lock legitimate peers out for as long as it lasts; there is no per-peer rate limiting; there is no Sybil resistance (§6.6) |
 | **E**levation of privilege | Caps | Forge/replay a capability to gain write/admin | Caps are signed and audience- and action-scoped, and verified locally (no server to trick). They are single-hop: no attenuation chain, no expiry and no revocation |
 
 ### 6.5 Key compromise handling

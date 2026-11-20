@@ -182,6 +182,9 @@ pub fn parse_ticket(ticket: &str) -> Result<ParsedTicket> {
     decode_ticket(ticket).map(|(p, _)| p)
 }
 
+/// Upper bound on finishing one inbound connection in [`Transport::accept`].
+pub const TRAIT_ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Largest frame body `read_frame` will accept (64 KiB).
 pub const MAX_FRAME_LEN: usize = 65_536;
 
@@ -400,16 +403,26 @@ impl Transport for IrohTransport {
         Ok(IrohConn { conn, send, recv })
     }
 
+    /// Accept the next inbound connection. Finishing it (QUIC handshake and
+    /// the first bi-stream) is limited to [`TRAIT_ACCEPT_TIMEOUT`], so a peer
+    /// that never opens a stream can't stall the caller forever. It is still
+    /// serial: callers that need concurrent accepts should use
+    /// [`IrohTransport::accept_incoming`] and finish each in its own task.
     async fn accept(&self) -> Result<(IrohEndpointId, IrohConn)> {
         let incoming = self
             .ep
             .accept()
             .await
             .ok_or_else(|| Error::Transport("endpoint closed".into()))?;
-        let conn = incoming.await.map_err(|e| terr("accept", e))?;
-        let remote = IrohEndpointId(*conn.remote_id().as_bytes());
-        let (send, recv) = conn.accept_bi().await.map_err(|e| terr("accept_bi", e))?;
-        Ok((remote, IrohConn { conn, send, recv }))
+        let finish = async {
+            let conn = incoming.await.map_err(|e| terr("accept", e))?;
+            let remote = IrohEndpointId(*conn.remote_id().as_bytes());
+            let (send, recv) = conn.accept_bi().await.map_err(|e| terr("accept_bi", e))?;
+            Ok((remote, IrohConn { conn, send, recv }))
+        };
+        tokio::time::timeout(TRAIT_ACCEPT_TIMEOUT, finish)
+            .await
+            .map_err(|_| Error::Transport("accept timed out".into()))?
     }
 
     async fn announce(&self, _topic: &Topic) -> Result<()> {
