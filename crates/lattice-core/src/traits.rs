@@ -3,7 +3,6 @@
 
 use crate::error::Result;
 use crate::types::{Entry, PeerId, Seq, Signature, Topic};
-
 /// An established bidirectional connection that carries whole **framed
 /// messages** (not a raw byte stream — the transport owns framing). This keeps
 /// the core dependency-free while the impls bring their own async runtime.
@@ -44,21 +43,28 @@ pub trait Verify {
 /// The network substrate. The ONLY place the underlying P2P stack is named, so
 /// iroh -> libp2p -> tor-relay is a contained swap (DESIGN.md ADR-001).
 #[allow(async_fn_in_trait)]
+///
+/// Addresses are transport-level locators and are **not** Lattice identities:
+/// an `Addr` is unauthenticated, and identity comes only from the session
+/// handshake that runs over the resulting connection.
 pub trait Transport {
+    /// Transport-level locator. NOT authenticated as a Lattice identity.
+    type Addr: Clone + core::fmt::Debug + PartialEq + Eq + core::hash::Hash + Send;
     /// The connection type this transport yields.
     type Conn: Connection;
-    /// Open a connection to a peer (direct/holepunched, else relayed).
-    async fn connect(&self, peer: &PeerId) -> Result<Self::Conn>;
-    /// Accept the next inbound connection, with the initiator's id.
-    async fn accept(&self) -> Result<(PeerId, Self::Conn)>;
+    /// Open a connection to an address (direct/holepunched, else relayed).
+    async fn connect(&self, addr: &Self::Addr) -> Result<Self::Conn>;
+    /// Accept the next inbound connection, with the remote's transport address
+    /// (unauthenticated as a Lattice identity).
+    async fn accept(&self) -> Result<(Self::Addr, Self::Conn)>;
     /// Announce presence on a discovery topic.
     async fn announce(&self, topic: &Topic) -> Result<()>;
-    /// Look up peers announcing a topic.
-    async fn lookup(&self, topic: &Topic) -> Result<Vec<PeerId>>;
+    /// Look up addresses announcing a topic.
+    async fn lookup(&self, topic: &Topic) -> Result<Vec<Self::Addr>>;
 }
 
 /// An authenticated, encrypted, forward-secret channel over a
-/// [`Transport::Stream`].
+/// [`Transport::Conn`].
 #[allow(async_fn_in_trait)]
 pub trait Session {
     /// Encrypt-and-send, advancing the ratchet.

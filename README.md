@@ -81,6 +81,11 @@ recoverable from the mnemonic. The ticket carries A's address + public
 identity so B can authenticate the handshake (trust-on-first-use). Both machines
 need outbound internet to reach the n0 relays for discovery/holepunching.
 
+Run `lattice-net whoami` to print your peer id and fingerprint, and compare
+fingerprints with your peer out of band. `lattice-net show-recovery-phrase
+--i-understand` prints your recovery phrase for an offline backup — keep it
+secret.
+
 **Reconnect & resume:** the session survives drops. If the connection breaks,
 the listener returns to waiting and the dialer re-dials the same ticket with
 exponential backoff (1→30s). If both sides still hold their session (a transient

@@ -11,18 +11,26 @@
 - Lattice is experimental, and this patch is not an external audit.
 - Both sides sign the v3 handshake transcript (`lattice-session-hs-v3`) with
   hybrid signatures (Ed25519 and ML-DSA). The transcript includes
-  caller-supplied channel-binding bytes. `lattice-net` currently passes a fixed
-  constant rather than the iroh endpoint ids, so the handshake is not yet bound
-  to the specific iroh channel.
+  caller-supplied channel-binding bytes. `lattice-net` passes the dialer's and
+  listener's iroh endpoint ids as that binding (`lattice-net-cb-v1`), so the
+  handshake is bound to the specific iroh channel.
 - Sessions now have forward secrecy against later identity compromise: the
   handshake is hybrid, mixing fresh X25519 and ML-KEM ephemerals from both
   sides, which are erased after the handshake. A compromised long-term identity
   can still impersonate its owner in NEW sessions.
-- The `lattice-net` listen ticket is an unsigned bearer token for reachability.
-  The Lattice identity is not bound to the iroh endpoint id.
+- The `lattice-net` listen ticket is signed by the listener's Lattice identity
+  and names its iroh endpoint. The dialer checks the signature before dialing
+  and checks that it reached that endpoint. Both the handshake transcripts and
+  the resume proofs are bound to both endpoint ids (`lattice-net-cb-v1`,
+  `lattice-resume-v2`). The ticket still grants reachability: anyone holding it
+  can try to connect.
 - Resuming a kept session in `lattice-net` requires a mutual HMAC proof bound to
-  that session's secret (`lattice-resume-v1`). Anyone holding the current
-  session state (for example a compromised device) can still resume.
+  that session's secret and the channel binding (`lattice-resume-v2`). Anyone
+  holding the current session state (for example a compromised device) can still
+  resume.
+- On first contact, compare fingerprints (`lattice-net whoami`) with your peer
+  out of band (trust on first use): the ticket itself is not authenticated out
+  of band.
 - Signatures are bound to the signer's full identity (crypto suite and PeerId,
   `lattice-sig-v2`), so a signature cannot move between the Classical and Hybrid
   identities derived from one mnemonic. This changes every signature: logs,

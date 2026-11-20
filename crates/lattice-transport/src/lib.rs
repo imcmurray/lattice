@@ -20,8 +20,8 @@ use tokio::sync::Mutex as AsyncMutex;
 mod quic;
 #[cfg(feature = "iroh")]
 pub use quic::{
-    read_frame, write_frame, ConnHandle, IrohConn, IrohTransport, LinkInfo, RecvStream, SendStream,
-    ALPN,
+    parse_ticket, read_frame, ticket_message, write_frame, ConnHandle, IrohConn, IrohEndpointId,
+    IrohTransport, LinkInfo, RecvStream, SendStream, ALPN, MAX_TICKET_LEN,
 };
 
 type Inbox = mpsc::UnboundedSender<(PeerId, MemoryConn)>;
@@ -100,9 +100,10 @@ impl MemoryTransport {
 }
 
 impl Transport for MemoryTransport {
+    type Addr = PeerId;
     type Conn = MemoryConn;
 
-    async fn connect(&self, peer: &PeerId) -> Result<MemoryConn> {
+    async fn connect(&self, peer: &Self::Addr) -> Result<MemoryConn> {
         let inbox = self.inbox_of(peer)?;
         let (mine, theirs) = MemoryConn::pair();
         inbox
@@ -111,7 +112,7 @@ impl Transport for MemoryTransport {
         Ok(mine)
     }
 
-    async fn accept(&self) -> Result<(PeerId, MemoryConn)> {
+    async fn accept(&self) -> Result<(Self::Addr, MemoryConn)> {
         self.incoming
             .lock()
             .await
@@ -124,7 +125,7 @@ impl Transport for MemoryTransport {
         Ok(()) // registration is implicit via `endpoint`
     }
 
-    async fn lookup(&self, _topic: &Topic) -> Result<Vec<PeerId>> {
+    async fn lookup(&self, _topic: &Topic) -> Result<Vec<Self::Addr>> {
         Ok(self.net.listeners.lock().unwrap().keys().cloned().collect())
     }
 }

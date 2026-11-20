@@ -2,18 +2,30 @@
 //!
 //! On device A:  `lattice-net listen`            → prints a TICKET
 //! On device B:  `lattice-net connect <ticket>`  → dials A
+//! Either side:  `lattice-net whoami`            → prints your peer id + fingerprint
+//!               `lattice-net show-recovery-phrase --i-understand`
 //!
 //! Each side loads a persistent PQ-hybrid identity via [`IdentityStore`] (OS
 //! keychain, else an age-encrypted file), then runs the hybrid-KEM +
 //! Double-Ratchet handshake over an iroh QUIC connection and relays stdin lines
 //! as end-to-end-encrypted messages.
 //!
+//! The TICKET is signed by the listener's Lattice identity and names its iroh
+//! endpoint. The dialer verifies that signature *before dialing*, then checks
+//! that it actually reached the endpoint the ticket names. Both the handshake
+//! transcript and the resume proofs are bound to the dialer's and listener's
+//! iroh endpoint ids (`lattice-net-cb-v1`), so a session cannot be replayed onto
+//! a different QUIC connection. The ticket still grants reachability, and a
+//! first contact is trust-on-first-use: compare the printed fingerprints
+//! (`lattice-net whoami`) with your peer out of band.
+//!
 //! Reconnects use **session resumption** (ADR-006): on a drop, each side keeps
 //! its `SecureSession`; the dialer's reconnect preamble signals `resume`, and if
 //! the listener still holds that peer's session both sides exchange HMAC proofs
-//! keyed by the session's secret (`lattice-resume-v1`); only when both verify do
-//! they rebind to the new connection with no re-handshake. If either side lost
-//! its state (e.g. a restart), they fall back to a fresh handshake.
+//! keyed by the session's secret and the channel binding (`lattice-resume-v2`);
+//! only when both verify do they rebind to the new connection with no
+//! re-handshake. If either side lost its state (e.g. a restart), they fall back
+//! to a fresh handshake.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,7 +34,9 @@ use std::time::Duration;
 use lattice::identity::storage::IdentityStore;
 use lattice::prelude::*;
 use lattice::session::{resume_nonce, ResumeRole};
-use lattice::transport::{read_frame, write_frame, IrohConn, IrohTransport};
+use lattice::transport::{
+    parse_ticket, read_frame, ticket_message, write_frame, IrohConn, IrohTransport,
+};
 use tokio::io::{AsyncBufReadExt, BufReader, Lines, Stdin};
 use tokio::sync::{Mutex, Notify};
 
@@ -39,8 +53,21 @@ const DECISION_RESUMED: u8 = 1;
 const DECISION_CHALLENGE: u8 = 2;
 const NONCE_LEN: usize = 32;
 const TAG_LEN: usize = 32;
-// TODO(channel-binding): pass the iroh endpoint ids
-const HS_BINDING: &[u8] = b"lattice-net-v3";
+/// Domain separator of the channel binding passed to the handshake and resume.
+const CB_DOMAIN: &[u8] = b"lattice-net-cb-v1";
+
+const USAGE: &str = "usage:
+  lattice-net listen
+  lattice-net connect <ticket>
+  lattice-net whoami
+  lattice-net show-recovery-phrase --i-understand";
+
+const RECOVERY_REFUSAL: &str = "the recovery phrase is the root secret of your identity:
+anyone who has it can impersonate you. If you really want it printed, rerun with
+`lattice-net show-recovery-phrase --i-understand`";
+
+const RECOVERY_WARNING: &str = "[lattice-net] ⚠ this recovery phrase controls your identity.
+Keep it secret and store it offline: anyone who has it can impersonate you.";
 
 type StdinLines = Lines<BufReader<Stdin>>;
 
@@ -60,8 +87,88 @@ enum Outcome {
     LocalClosed,
 }
 
+/// A parsed command line.
+#[derive(Debug, PartialEq)]
+enum Command {
+    Listen,
+    Connect(String),
+    Whoami,
+    ShowRecoveryPhrase,
+    Usage,
+}
+
+/// Parse the full argv (`args[0]` is the program name). Runs before any
+/// identity is loaded.
+fn parse_command(args: &[String]) -> Result<Command> {
+    match args.get(1).map(String::as_str) {
+        Some("listen") => Ok(Command::Listen),
+        Some("connect") => {
+            let ticket = args
+                .get(2)
+                .ok_or_else(|| Error::Other("usage: lattice-net connect <ticket>".into()))?;
+            Ok(Command::Connect(ticket.clone()))
+        }
+        Some("whoami") => Ok(Command::Whoami),
+        Some("show-recovery-phrase") => {
+            if args.len() == 3 && args[2] == "--i-understand" {
+                Ok(Command::ShowRecoveryPhrase)
+            } else {
+                Err(Error::Other(RECOVERY_REFUSAL.into()))
+            }
+        }
+        _ => Ok(Command::Usage),
+    }
+}
+
+/// `CB_DOMAIN ‖ dialer_endpoint_id ‖ listener_endpoint_id` (81 bytes): binds a
+/// session to the exact iroh endpoints of the connection that carries it.
+fn channel_binding(dialer_ep: &[u8; 32], listener_ep: &[u8; 32]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(CB_DOMAIN.len() + 64);
+    b.extend_from_slice(CB_DOMAIN);
+    b.extend_from_slice(dialer_ep);
+    b.extend_from_slice(listener_ep);
+    b
+}
+
+/// Verify a ticket's signature under the identity it carries (pure; no network).
+fn verify_ticket(
+    app_identity: &[u8],
+    app_sig: &[u8],
+    endpoint_id: &[u8; 32],
+) -> Result<PublicIdentity> {
+    let id = PublicIdentity::from_bytes(app_identity)?;
+    let msg = ticket_message(endpoint_id, app_identity);
+    if app_sig.is_empty() || !id.verify(&msg, &Signature(app_sig.to_vec())) {
+        return Err(Error::Verify("ticket signature invalid".into()));
+    }
+    Ok(id)
+}
+
+/// Fail unless the connection reached the endpoint we expected.
+fn check_endpoint(expected: &[u8; 32], remote: &[u8; 32]) -> Result<()> {
+    if expected != remote {
+        return Err(Error::Verify("endpoint id mismatch".into()));
+    }
+    Ok(())
+}
+
+/// Print the peer's fingerprint for out-of-band comparison.
+fn announce_peer(peer: &PeerId, what: &str) {
+    eprintln!("[lattice-net] {what} — type messages:");
+    eprintln!(
+        "[lattice-net] peer fingerprint: {} — compare this with your peer out of band",
+        peer.fingerprint()
+    );
+}
+
 async fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    // Parse first: bad usage must not touch (or create) any identity.
+    let cmd = parse_command(&args)?;
+    if cmd == Command::Usage {
+        eprintln!("{USAGE}");
+        return Ok(());
+    }
 
     // Persistent identity: OS keychain if available, else an age-encrypted file.
     let loaded = IdentityStore::open_default().load_or_create(CryptoSuite::Hybrid)?;
@@ -71,11 +178,6 @@ async fn run() -> Result<()> {
     } else {
         ""
     };
-    eprintln!(
-        "[lattice-net] identity {:?} [stored via {:?}]{note}",
-        me.peer_id(),
-        loaded.backend
-    );
     if loaded.migrated {
         eprintln!(
             "[lattice-net] ⚠ migrated your legacy plaintext identity into secure storage ({:?}); \
@@ -84,22 +186,33 @@ async fn run() -> Result<()> {
         );
     }
 
+    match cmd {
+        Command::Whoami => {
+            println!("peer id: {}", me.peer_id());
+            println!("fingerprint: {}", me.peer_id().fingerprint());
+            return Ok(());
+        }
+        Command::ShowRecoveryPhrase => {
+            eprintln!("{RECOVERY_WARNING}");
+            println!("{}", me.mnemonic());
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    eprintln!(
+        "[lattice-net] your fingerprint: {} [stored via {:?}]{note}",
+        me.peer_id().fingerprint(),
+        loaded.backend
+    );
+
     // Read stdin once and reuse it across reconnects (typed input isn't lost).
     let lines = BufReader::new(tokio::io::stdin()).lines();
 
-    match args.get(1).map(String::as_str) {
-        Some("listen") => listen(me, lines).await,
-        Some("connect") => {
-            let ticket = args
-                .get(2)
-                .ok_or_else(|| Error::Other("usage: lattice-net connect <ticket>".into()))?
-                .clone();
-            connect(me, ticket, lines).await
-        }
-        _ => {
-            eprintln!("usage:\n  lattice-net listen\n  lattice-net connect <ticket>");
-            Ok(())
-        }
+    match cmd {
+        Command::Listen => listen(me, lines).await,
+        Command::Connect(ticket) => connect(me, ticket, lines).await,
+        _ => Ok(()),
     }
 }
 
@@ -108,7 +221,11 @@ async fn run() -> Result<()> {
 async fn listen(me: Keypair, mut lines: StdinLines) -> Result<()> {
     let t = IrohTransport::bind().await?;
     eprintln!("[lattice-net] coming online (contacting relay)...");
-    let ticket = t.ticket(&me.public().to_bytes()).await?;
+    // The ticket is signed by our Lattice identity and names our iroh endpoint.
+    let app_identity = me.public().to_bytes();
+    let msg = ticket_message(&t.endpoint_id_bytes(), &app_identity);
+    let app_sig = me.sign(&msg).0;
+    let ticket = t.ticket(&app_identity, &app_sig).await?;
     println!("\n=== TICKET (copy to the other device) ===\n{ticket}\n=========================================\n");
 
     let mut sessions: HashMap<PeerId, SecureSession> = HashMap::new();
@@ -121,7 +238,8 @@ async fn listen(me: Keypair, mut lines: StdinLines) -> Result<()> {
                 continue;
             }
         };
-        let (peer_id, sess) = match accept_or_resume(conn, &me, &mut sessions).await {
+        let binding = channel_binding(&conn.remote_endpoint_id(), &t.endpoint_id_bytes());
+        let (peer_id, sess) = match accept_or_resume(conn, &me, &mut sessions, &binding).await {
             Ok(x) => x,
             Err(e) => {
                 eprintln!("[lattice-net] negotiation failed: {e} — still listening");
@@ -147,10 +265,12 @@ async fn listen(me: Keypair, mut lines: StdinLines) -> Result<()> {
 
 /// Read the dialer's preamble; resume a kept session if asked and available,
 /// otherwise run a fresh handshake. Returns the peer id and the live session.
+/// `binding` is the channel binding of this connection.
 async fn accept_or_resume<C: Connection>(
     mut conn: C,
     me: &Keypair,
     sessions: &mut HashMap<PeerId, SecureSession>,
+    binding: &[u8],
 ) -> Result<(PeerId, ConnectedSession<C>)> {
     let preamble = conn.recv().await?;
     if preamble.len() < 1 + NONCE_LEN {
@@ -173,6 +293,7 @@ async fn accept_or_resume<C: Connection>(
                 me.public(),
                 &dialer_nonce,
                 &listener_nonce,
+                binding,
             );
             let mut challenge = Vec::with_capacity(1 + NONCE_LEN + TAG_LEN);
             challenge.push(DECISION_CHALLENGE);
@@ -186,38 +307,56 @@ async fn accept_or_resume<C: Connection>(
                 me.public(),
                 &dialer_nonce,
                 &listener_nonce,
+                binding,
                 &tag,
             )?;
             let sess = sessions
                 .remove(&peer_id)
                 .ok_or_else(|| Error::Verify("kept session vanished during resume".into()))?;
-            eprintln!(
-                "[lattice-net] {:?} resumed — no re-handshake — type messages:",
-                peer_id
-            );
+            announce_peer(&peer_id, "peer resumed — no re-handshake");
             return Ok((peer_id, ConnectedSession::resume(conn, sess)));
         }
     }
     // Fresh handshake (requested, or resume with no kept session).
     conn.send(&[DECISION_FRESH]).await?;
-    let cs = ConnectedSession::accept(conn, me, &peer, HS_BINDING).await?;
+    let cs = ConnectedSession::accept(conn, me, &peer, binding).await?;
     // Only a successful handshake replaces the stale session for this peer.
     sessions.remove(&peer_id);
-    eprintln!(
-        "[lattice-net] {:?} connected (fresh session) — type messages:",
-        peer_id
-    );
+    announce_peer(&peer_id, "peer connected (fresh session)");
     Ok((peer_id, cs))
+}
+
+/// What the dialer learned from (and verified about) the ticket, before dialing.
+struct VerifiedTicket {
+    /// The listener's identity, as proven by the ticket signature.
+    identity: PublicIdentity,
+    /// The identity bytes exactly as carried by the ticket.
+    identity_bytes: Vec<u8>,
+    /// The iroh endpoint id the ticket names (covered by the signature).
+    endpoint_id: [u8; 32],
 }
 
 /// Dialer loop: dial, negotiate resume-vs-fresh, chat; keep the `SecureSession`
 /// across drops so the next dial can resume.
 async fn connect(me: Keypair, ticket: String, mut lines: StdinLines) -> Result<()> {
+    // Verify the ticket before binding or dialing; a bad ticket is fatal, not retried.
+    let (identity_bytes, sig, endpoint_id) = parse_ticket(&ticket)?;
+    let identity = verify_ticket(&identity_bytes, &sig, &endpoint_id)?;
+    eprintln!(
+        "[lattice-net] peer fingerprint (from ticket): {} — compare this with your peer out of band",
+        identity.peer_id().fingerprint()
+    );
+    let verified = VerifiedTicket {
+        identity,
+        identity_bytes,
+        endpoint_id,
+    };
+
     let t = IrohTransport::bind().await?;
     let mut kept: Option<SecureSession> = None;
     let mut backoff = 1u64;
     loop {
-        match dial_once(&t, &ticket, &me, &mut kept, &mut lines).await {
+        match dial_once(&t, &ticket, &verified, &me, &mut kept, &mut lines).await {
             Ok(Outcome::LocalClosed) => {
                 eprintln!("[lattice-net] input closed — exiting");
                 break;
@@ -239,12 +378,14 @@ async fn connect(me: Keypair, ticket: String, mut lines: StdinLines) -> Result<(
 
 /// Dialer-side negotiation after the transport connects: send the preamble,
 /// then either resume the kept session (after a mutual proof) or run a fresh
-/// handshake. `kept` is only taken once the outcome is certain.
+/// handshake. `kept` is only taken once the outcome is certain. `binding` is
+/// the channel binding of this connection.
 async fn negotiate_dial<C: Connection>(
     mut conn: C,
     me: &Keypair,
     peer: &PublicIdentity,
     kept: &mut Option<SecureSession>,
+    binding: &[u8],
 ) -> Result<ConnectedSession<C>> {
     // Preamble: [mode] ++ dialer nonce ++ our identity bundle.
     let (mode, dialer_nonce) = if kept.is_some() {
@@ -263,11 +404,8 @@ async fn negotiate_dial<C: Connection>(
             if kept.take().is_some() {
                 eprintln!("[lattice-net] peer couldn't resume — fresh handshake");
             }
-            let cs = ConnectedSession::initiate(conn, me, peer, HS_BINDING).await?;
-            eprintln!(
-                "[lattice-net] connected to {:?} (fresh session) — type messages:",
-                peer.peer_id()
-            );
+            let cs = ConnectedSession::initiate(conn, me, peer, binding).await?;
+            announce_peer(&peer.peer_id(), "connected (fresh session)");
             Ok(cs)
         }
         Some(DECISION_CHALLENGE) => {
@@ -288,6 +426,7 @@ async fn negotiate_dial<C: Connection>(
                 peer,
                 &dialer_nonce,
                 &listener_nonce,
+                binding,
                 listener_tag,
             )?;
             let dialer_tag = sess.resume_tag(
@@ -296,15 +435,13 @@ async fn negotiate_dial<C: Connection>(
                 peer,
                 &dialer_nonce,
                 &listener_nonce,
+                binding,
             );
             conn.send(&dialer_tag).await?;
             let sess = kept
                 .take()
                 .ok_or_else(|| Error::Verify("kept session vanished during resume".into()))?;
-            eprintln!(
-                "[lattice-net] resumed with {:?} — no re-handshake — type messages:",
-                peer.peer_id()
-            );
+            announce_peer(&peer.peer_id(), "resumed — no re-handshake");
             Ok(ConnectedSession::resume(conn, sess))
         }
         Some(DECISION_RESUMED) => Err(Error::Verify(
@@ -317,15 +454,23 @@ async fn negotiate_dial<C: Connection>(
 async fn dial_once(
     t: &IrohTransport,
     ticket: &str,
+    verified: &VerifiedTicket,
     me: &Keypair,
     kept: &mut Option<SecureSession>,
     lines: &mut StdinLines,
 ) -> Result<Outcome> {
     eprintln!("[lattice-net] dialing peer...");
-    let (peer_bytes, conn) = t.connect_ticket(ticket).await?;
-    let peer = PublicIdentity::from_bytes(&peer_bytes)?;
+    let (peer_bytes, _sig, ticket_ep, conn) = t.connect_ticket(ticket).await?;
+    // The ticket we dialed must be the one we verified, and we must have
+    // reached the endpoint it names.
+    check_endpoint(&verified.endpoint_id, &ticket_ep)?;
+    check_endpoint(&ticket_ep, &conn.remote_endpoint_id())?;
+    if peer_bytes != verified.identity_bytes {
+        return Err(Error::Verify("ticket identity changed".into()));
+    }
+    let binding = channel_binding(&t.endpoint_id_bytes(), &conn.remote_endpoint_id());
 
-    let cs = negotiate_dial(conn, me, &peer, kept).await?;
+    let cs = negotiate_dial(conn, me, &verified.identity, kept, &binding).await?;
 
     match chat(cs, lines).await {
         Ok((Outcome::PeerDisconnected, recovered)) => {
@@ -403,6 +548,11 @@ mod tests {
         Keypair::generate(CryptoSuite::Hybrid).unwrap()
     }
 
+    /// A fixed, valid channel binding for tests that don't care about its value.
+    fn bnd() -> Vec<u8> {
+        channel_binding(&[0xd1; 32], &[0x11; 32])
+    }
+
     /// Connected in-memory pair: (dialer end, listener end).
     async fn pair() -> (MemoryConn, MemoryConn) {
         let net = MemoryNetwork::new();
@@ -434,13 +584,14 @@ mod tests {
         let mut sessions = stale(&alice, &bob);
         let (mut dial, listen) = pair().await;
         preamble(&mut dial, MODE_FRESH, &alice).await;
+        let b = bnd();
         // Eve's handshake, claimed to come from Alice.
         let dialer = async {
             // The listener's decision byte comes first, then the handshake.
             assert_eq!(dial.recv().await.unwrap(), [DECISION_FRESH]);
-            ConnectedSession::initiate(dial, &eve, bob.public(), HS_BINDING).await
+            ConnectedSession::initiate(dial, &eve, bob.public(), &b).await
         };
-        let (d, r) = tokio::join!(dialer, accept_or_resume(listen, &bob, &mut sessions));
+        let (d, r) = tokio::join!(dialer, accept_or_resume(listen, &bob, &mut sessions, &b));
         assert!(r.is_err());
         assert!(d.is_err());
         assert!(sessions.contains_key(&alice.peer_id()));
@@ -452,14 +603,32 @@ mod tests {
         let mut sessions = stale(&alice, &bob);
         let (mut dial, listen) = pair().await;
         preamble(&mut dial, MODE_FRESH, &alice).await;
+        let b = bnd();
         let dialer = async {
             assert_eq!(dial.recv().await.unwrap(), [DECISION_FRESH]);
-            ConnectedSession::initiate(dial, &alice, bob.public(), HS_BINDING).await
+            ConnectedSession::initiate(dial, &alice, bob.public(), &b).await
         };
-        let (d, r) = tokio::join!(dialer, accept_or_resume(listen, &bob, &mut sessions));
+        let (d, r) = tokio::join!(dialer, accept_or_resume(listen, &bob, &mut sessions, &b));
         assert!(d.is_ok());
         assert!(r.is_ok());
         assert!(!sessions.contains_key(&alice.peer_id()));
+    }
+
+    #[tokio::test]
+    async fn fresh_handshake_with_mismatched_bindings_fails() {
+        let (alice, bob) = (id(), id());
+        let mut sessions = HashMap::new();
+        let (dial, listen) = pair().await;
+        let b_dial = channel_binding(&[1u8; 32], &[2u8; 32]);
+        let b_listen = channel_binding(&[1u8; 32], &[3u8; 32]);
+        let mut kept = None;
+        let (d, r) = tokio::join!(
+            negotiate_dial(dial, &alice, bob.public(), &mut kept, &b_dial),
+            accept_or_resume(listen, &bob, &mut sessions, &b_listen)
+        );
+        assert!(matches!(r, Err(Error::Verify(_))));
+        assert!(d.is_err());
+        assert!(sessions.is_empty());
     }
 
     #[tokio::test]
@@ -468,9 +637,10 @@ mod tests {
         let mut sessions = HashMap::from([(alice.peer_id(), b)]);
         let mut kept = Some(a);
         let (dial, listen) = pair().await;
+        let bd = bnd();
         let (d, l) = tokio::join!(
-            negotiate_dial(dial, &alice, bob.public(), &mut kept),
-            accept_or_resume(listen, &bob, &mut sessions)
+            negotiate_dial(dial, &alice, bob.public(), &mut kept, &bd),
+            accept_or_resume(listen, &bob, &mut sessions, &bd)
         );
         let (mut d, (_, mut l)) = (d.unwrap(), l.unwrap());
         assert!(kept.is_none());
@@ -482,6 +652,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resume_with_mismatched_bindings_fails_and_keeps_state() {
+        let (alice, bob, a, b) = genuine();
+        let mut sessions = HashMap::from([(alice.peer_id(), b)]);
+        let mut kept = Some(a);
+        let (dial, listen) = pair().await;
+        let b_dial = channel_binding(&[1u8; 32], &[2u8; 32]);
+        let b_listen = channel_binding(&[1u8; 32], &[3u8; 32]);
+        let (d, l) = tokio::join!(
+            negotiate_dial(dial, &alice, bob.public(), &mut kept, &b_dial),
+            accept_or_resume(listen, &bob, &mut sessions, &b_listen)
+        );
+        assert!(d.is_err());
+        assert!(l.is_err());
+        assert!(kept.is_some());
+        assert!(sessions.contains_key(&alice.peer_id()));
+    }
+
+    #[tokio::test]
     async fn impostor_with_legacy_preamble_cannot_resume() {
         let (alice, bob) = (id(), id());
         let mut sessions = stale(&alice, &bob);
@@ -489,7 +677,7 @@ mod tests {
         let mut p = vec![MODE_RESUME];
         p.extend_from_slice(&alice.public().to_bytes());
         dial.send(&p).await.unwrap();
-        let r = accept_or_resume(listen, &bob, &mut sessions).await;
+        let r = accept_or_resume(listen, &bob, &mut sessions, &bnd()).await;
         assert!(r.is_err());
         assert!(sessions.contains_key(&alice.peer_id()));
     }
@@ -519,7 +707,7 @@ mod tests {
             .await
             .unwrap();
         eve.send(&[0xAA; TAG_LEN]).await.unwrap();
-        let r = accept_or_resume(listen, &bob, &mut sessions).await;
+        let r = accept_or_resume(listen, &bob, &mut sessions, &bnd()).await;
         assert!(r.is_err());
         assert!(sessions.contains_key(&alice.peer_id()));
         let reply = eve.recv().await.unwrap();
@@ -536,7 +724,7 @@ mod tests {
             .await
             .unwrap();
         drop(eve);
-        let r = accept_or_resume(listen, &bob, &mut sessions).await;
+        let r = accept_or_resume(listen, &bob, &mut sessions, &bnd()).await;
         assert!(r.is_err());
         assert!(sessions.contains_key(&alice.peer_id()));
     }
@@ -554,8 +742,9 @@ mod tests {
             listen.send(&reply).await.unwrap();
             p
         };
+        let bd = bnd();
         let (r, p) = tokio::join!(
-            negotiate_dial(dial, &alice, bob.public(), &mut kept),
+            negotiate_dial(dial, &alice, bob.public(), &mut kept, &bd),
             script
         );
         assert!(r.is_err());
@@ -572,7 +761,7 @@ mod tests {
         let mut kept = Some(a);
         let (dial, mut listen) = pair().await;
         listen.send(&[DECISION_RESUMED]).await.unwrap();
-        let r = negotiate_dial(dial, &alice, bob.public(), &mut kept).await;
+        let r = negotiate_dial(dial, &alice, bob.public(), &mut kept, &bnd()).await;
         assert!(r.is_err());
         assert!(kept.is_some());
     }
@@ -585,7 +774,7 @@ mod tests {
         let mut reply = vec![DECISION_CHALLENGE];
         reply.extend_from_slice(&[0u8; NONCE_LEN + TAG_LEN]);
         listen.send(&reply).await.unwrap();
-        let r = negotiate_dial(dial, &alice, bob.public(), &mut kept).await;
+        let r = negotiate_dial(dial, &alice, bob.public(), &mut kept, &bnd()).await;
         assert!(r.is_err());
     }
 
@@ -596,7 +785,7 @@ mod tests {
             let mut sessions = stale(&alice, &bob);
             let (mut dial, listen) = pair().await;
             dial.send(&vec![MODE_RESUME; n]).await.unwrap();
-            let r = accept_or_resume(listen, &bob, &mut sessions).await;
+            let r = accept_or_resume(listen, &bob, &mut sessions, &bnd()).await;
             assert!(r.is_err(), "len {n}");
             assert!(sessions.contains_key(&alice.peer_id()));
         }
@@ -612,12 +801,127 @@ mod tests {
             listen.send(&[0xFF]).await.unwrap(); // unknown decision → dialer errors
             p
         };
+        let bd = bnd();
         let (r, p) = tokio::join!(
-            negotiate_dial(dial, &alice, bob.public(), &mut kept),
+            negotiate_dial(dial, &alice, bob.public(), &mut kept, &bd),
             script
         );
         assert!(r.is_err());
         assert_eq!(p[0], MODE_FRESH);
         assert!(p[1..1 + NONCE_LEN].iter().all(|b| *b == 0));
+    }
+
+    // ---- channel binding ----
+
+    #[test]
+    fn channel_binding_layout_and_asymmetry() {
+        let (d, l) = ([1u8; 32], [2u8; 32]);
+        let b = channel_binding(&d, &l);
+        assert!(b.starts_with(b"lattice-net-cb-v1"));
+        assert_eq!(b.len(), 81);
+        assert_eq!(&b[17..49], &d);
+        assert_eq!(&b[49..], &l);
+        // Dialer view (own, remote) == listener view (remote, own).
+        assert_eq!(channel_binding(&d, &l), channel_binding(&d, &l));
+        assert_ne!(channel_binding(&l, &d), b);
+        let mut d2 = d;
+        d2[0] ^= 1;
+        let mut l2 = l;
+        l2[31] ^= 1;
+        assert_ne!(channel_binding(&d2, &l), b);
+        assert_ne!(channel_binding(&d, &l2), b);
+    }
+
+    // ---- ticket verification ----
+
+    fn signed_ticket(k: &Keypair, ep: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
+        let ident = k.public().to_bytes();
+        let sig = k.sign(&ticket_message(ep, &ident)).0;
+        (ident, sig)
+    }
+
+    #[test]
+    fn verify_ticket_accepts_genuine() {
+        let k = id();
+        let ep = [5u8; 32];
+        let (ident, sig) = signed_ticket(&k, &ep);
+        let got = verify_ticket(&ident, &sig, &ep).unwrap();
+        assert_eq!(got.peer_id(), k.peer_id());
+    }
+
+    #[test]
+    fn verify_ticket_rejects_tampering() {
+        let (k, other) = (id(), id());
+        let ep = [5u8; 32];
+        let (ident, sig) = signed_ticket(&k, &ep);
+
+        // Changed endpoint id.
+        let mut ep2 = ep;
+        ep2[0] ^= 1;
+        let r = verify_ticket(&ident, &sig, &ep2);
+        assert!(matches!(r, Err(Error::Verify(_))));
+        // Signature from a different keypair.
+        let (_, other_sig) = signed_ticket(&other, &ep);
+        let r = verify_ticket(&ident, &other_sig, &ep);
+        assert!(matches!(r, Err(Error::Verify(_))));
+        // Empty signature.
+        let r = verify_ticket(&ident, &[], &ep);
+        assert!(matches!(r, Err(Error::Verify(_))));
+        // Swapped identity (valid identity, signature not made by it).
+        let other_ident = other.public().to_bytes();
+        let r = verify_ticket(&other_ident, &sig, &ep);
+        assert!(r.is_err());
+        // Tampered identity bytes.
+        let mut bad = ident.clone();
+        let mid = bad.len() / 2;
+        bad[mid] ^= 1;
+        let r = verify_ticket(&bad, &sig, &ep);
+        assert!(r.is_err());
+        // Truncated identity bytes.
+        let r = verify_ticket(&ident[..ident.len() / 2], &sig, &ep);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn check_endpoint_matches_only_equal_ids() {
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        assert!(check_endpoint(&a, &a).is_ok());
+        assert!(matches!(check_endpoint(&a, &b), Err(Error::Verify(_))));
+    }
+
+    // ---- command line ----
+
+    /// `parse_command` over `["lattice-net", ..a]`.
+    fn cmd(a: &[&str]) -> Result<Command> {
+        let mut args = vec!["lattice-net".to_string()];
+        args.extend(a.iter().map(|s| s.to_string()));
+        parse_command(&args)
+    }
+
+    #[test]
+    fn parse_command_subcommands() {
+        assert_eq!(cmd(&[]).unwrap(), Command::Usage);
+        assert_eq!(cmd(&["bogus"]).unwrap(), Command::Usage);
+        assert_eq!(cmd(&["listen"]).unwrap(), Command::Listen);
+        assert_eq!(cmd(&["whoami"]).unwrap(), Command::Whoami);
+        assert_eq!(
+            cmd(&["connect", "abc"]).unwrap(),
+            Command::Connect("abc".into())
+        );
+        assert!(cmd(&["connect"]).is_err());
+    }
+
+    #[test]
+    fn parse_command_recovery_phrase_requires_flag() {
+        assert_eq!(
+            cmd(&["show-recovery-phrase", "--i-understand"]).unwrap(),
+            Command::ShowRecoveryPhrase
+        );
+        match cmd(&["show-recovery-phrase"]) {
+            Err(Error::Other(m)) => assert!(m.contains("--i-understand")),
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(cmd(&["show-recovery-phrase", "--yes"]).is_err());
+        assert!(cmd(&["show-recovery-phrase", "--i-understand", "x"]).is_err());
     }
 }

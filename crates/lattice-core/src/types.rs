@@ -18,6 +18,31 @@ impl fmt::Debug for PeerId {
     }
 }
 
+/// Full identity: 64 lowercase hex chars, no prefix or suffix.
+impl fmt::Display for PeerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for b in &self.0 {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl PeerId {
+    /// First 20 bytes as 40 lowercase hex chars in 10 groups of 4, separated by
+    /// single spaces (49 chars) — easy to compare out of band.
+    pub fn fingerprint(&self) -> String {
+        let mut s = String::with_capacity(49);
+        for (i, b) in self.0[..20].iter().enumerate() {
+            if i > 0 && i % 2 == 0 {
+                s.push(' ');
+            }
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    }
+}
+
 /// A hybrid signature (classical + post-quantum), carried as length-prefixed
 /// opaque bytes (the classical and PQ component signatures concatenated).
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -56,4 +81,35 @@ pub enum CryptoSuite {
     /// production posture (secure if *either* component holds).
     #[default]
     Hybrid,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_is_full_lowercase_hex() {
+        let s = PeerId([0xab; 32]).to_string();
+        assert_eq!(s, "ab".repeat(32));
+        assert_eq!(s.len(), 64);
+    }
+
+    #[test]
+    fn fingerprint_groups() {
+        let mut b = [0u8; 32];
+        for (i, x) in b.iter_mut().enumerate() {
+            *x = i as u8;
+        }
+        let fp = PeerId(b).fingerprint();
+        assert_eq!(fp, "0001 0203 0405 0607 0809 0a0b 0c0d 0e0f 1011 1213");
+        assert_eq!(fp.len(), 49);
+    }
+
+    #[test]
+    fn debug_stays_short() {
+        assert_eq!(
+            format!("{:?}", PeerId([0x12; 32])),
+            "PeerId(12121212\u{2026})"
+        );
+    }
 }

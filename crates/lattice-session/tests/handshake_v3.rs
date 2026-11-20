@@ -88,13 +88,29 @@ fn ac3_resume_tags_match_across_pair() {
     use lattice_session::ResumeRole;
     let (a, b, (i, r, _, _)) = hybrid_pair();
     let (dn, ln) = ([1u8; 32], [2u8; 32]);
-    let t_i = i.resume_tag(ResumeRole::Dialer, a.public(), b.public(), &dn, &ln);
-    let t_r = r.resume_tag(ResumeRole::Dialer, a.public(), b.public(), &dn, &ln);
+    let t_i = i.resume_tag(ResumeRole::Dialer, a.public(), b.public(), &dn, &ln, b"b");
+    let t_r = r.resume_tag(ResumeRole::Dialer, a.public(), b.public(), &dn, &ln, b"b");
     assert_eq!(t_i, t_r);
-    r.verify_resume_tag(ResumeRole::Dialer, a.public(), b.public(), &dn, &ln, &t_i)
-        .unwrap();
-    i.verify_resume_tag(ResumeRole::Dialer, a.public(), b.public(), &dn, &ln, &t_r)
-        .unwrap();
+    r.verify_resume_tag(
+        ResumeRole::Dialer,
+        a.public(),
+        b.public(),
+        &dn,
+        &ln,
+        b"b",
+        &t_i,
+    )
+    .unwrap();
+    i.verify_resume_tag(
+        ResumeRole::Dialer,
+        a.public(),
+        b.public(),
+        &dn,
+        &ln,
+        b"b",
+        &t_r,
+    )
+    .unwrap();
 }
 
 // ---- AC 4 ----

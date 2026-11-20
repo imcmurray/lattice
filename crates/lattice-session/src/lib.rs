@@ -73,7 +73,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 const HS_DOMAIN: &[u8] = b"lattice-session-hs-v3";
 const RESUME_KEY_INFO: &[u8] = b"lattice-session-resume-v1";
-const RESUME_DOMAIN: &[u8] = b"lattice-resume-v1";
+const RESUME_DOMAIN: &[u8] = b"lattice-resume-v2";
 
 /// Which side of a resume negotiation a tag is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -508,6 +508,7 @@ impl SecureSession {
         listener: &PublicIdentity,
         dialer_nonce: &[u8; 32],
         listener_nonce: &[u8; 32],
+        binding: &[u8],
     ) -> [u8; 32] {
         let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(&self.resume_key[..])
             .expect("hmac accepts any key length");
@@ -517,6 +518,7 @@ impl SecureSession {
             listener,
             dialer_nonce,
             listener_nonce,
+            binding,
         ));
         let out = mac.finalize().into_bytes();
         let mut tag = [0u8; 32];
@@ -526,6 +528,7 @@ impl SecureSession {
 
     /// Verify a peer's resume tag in constant time. Fails with
     /// [`Error::Verify`] on any mismatch or a tag whose length is not 32.
+    #[allow(clippy::too_many_arguments)]
     pub fn verify_resume_tag(
         &self,
         role: ResumeRole,
@@ -533,6 +536,7 @@ impl SecureSession {
         listener: &PublicIdentity,
         dialer_nonce: &[u8; 32],
         listener_nonce: &[u8; 32],
+        binding: &[u8],
         tag: &[u8],
     ) -> Result<()> {
         let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(&self.resume_key[..])
@@ -543,6 +547,7 @@ impl SecureSession {
             listener,
             dialer_nonce,
             listener_nonce,
+            binding,
         ));
         mac.verify_slice(tag)
             .map_err(|_| Error::Verify("resume proof failed".into()))
@@ -816,10 +821,13 @@ fn resume_msg(
     listener: &PublicIdentity,
     dialer_nonce: &[u8; 32],
     listener_nonce: &[u8; 32],
+    binding: &[u8],
 ) -> Vec<u8> {
     let dp = dialer.to_bytes();
     let lp = listener.to_bytes();
-    let mut m = Vec::with_capacity(RESUME_DOMAIN.len() + 1 + 64 + 4 + dp.len() + 4 + lp.len());
+    let mut m = Vec::with_capacity(
+        RESUME_DOMAIN.len() + 1 + 64 + 4 + binding.len() + 4 + dp.len() + 4 + lp.len(),
+    );
     m.extend_from_slice(RESUME_DOMAIN);
     m.push(match role {
         ResumeRole::Dialer => 0x01,
@@ -827,6 +835,8 @@ fn resume_msg(
     });
     m.extend_from_slice(dialer_nonce);
     m.extend_from_slice(listener_nonce);
+    m.extend_from_slice(&(binding.len() as u32).to_le_bytes());
+    m.extend_from_slice(binding);
     m.extend_from_slice(&(dp.len() as u32).to_le_bytes());
     m.extend_from_slice(&dp);
     m.extend_from_slice(&(lp.len() as u32).to_le_bytes());
@@ -1070,15 +1080,17 @@ mod tests {
     const D: ResumeRole = ResumeRole::Dialer;
     const L: ResumeRole = ResumeRole::Listener;
 
+    const BND: &[u8] = b"binding-x";
+
     #[test]
     fn resume_tags_verify_across_genuine_pair() {
         let (alice, bob, a, b) = pair_ids();
         let (nd, nl) = ([1u8; 32], [2u8; 32]);
-        let td = a.resume_tag(D, alice.public(), bob.public(), &nd, &nl);
-        b.verify_resume_tag(D, alice.public(), bob.public(), &nd, &nl, &td)
+        let td = a.resume_tag(D, alice.public(), bob.public(), &nd, &nl, BND);
+        b.verify_resume_tag(D, alice.public(), bob.public(), &nd, &nl, BND, &td)
             .unwrap();
-        let tl = b.resume_tag(L, alice.public(), bob.public(), &nd, &nl);
-        a.verify_resume_tag(L, alice.public(), bob.public(), &nd, &nl, &tl)
+        let tl = b.resume_tag(L, alice.public(), bob.public(), &nd, &nl, BND);
+        a.verify_resume_tag(L, alice.public(), bob.public(), &nd, &nl, BND, &tl)
             .unwrap();
     }
 
@@ -1087,8 +1099,8 @@ mod tests {
         let (alice, bob, a, b) = pair_ids();
         let (nd, nl) = ([3u8; 32], [4u8; 32]);
         assert_eq!(
-            a.resume_tag(D, alice.public(), bob.public(), &nd, &nl),
-            b.resume_tag(D, alice.public(), bob.public(), &nd, &nl)
+            a.resume_tag(D, alice.public(), bob.public(), &nd, &nl, BND),
+            b.resume_tag(D, alice.public(), bob.public(), &nd, &nl, BND)
         );
     }
 
@@ -1098,9 +1110,9 @@ mod tests {
         let eve = id();
         let (_, _, e, _) = handshake(&eve, &bob, b"");
         let (nd, nl) = ([5u8; 32], [6u8; 32]);
-        let tag = e.resume_tag(D, alice.public(), bob.public(), &nd, &nl);
+        let tag = e.resume_tag(D, alice.public(), bob.public(), &nd, &nl, BND);
         assert!(matches!(
-            b.verify_resume_tag(D, alice.public(), bob.public(), &nd, &nl, &tag),
+            b.verify_resume_tag(D, alice.public(), bob.public(), &nd, &nl, BND, &tag),
             Err(Error::Verify(_))
         ));
     }
@@ -1109,13 +1121,13 @@ mod tests {
     fn resume_tag_role_mismatch_is_rejected() {
         let (alice, bob, a, b) = pair_ids();
         let (nd, nl) = ([7u8; 32], [8u8; 32]);
-        let td = a.resume_tag(D, alice.public(), bob.public(), &nd, &nl);
+        let td = a.resume_tag(D, alice.public(), bob.public(), &nd, &nl, BND);
         assert!(b
-            .verify_resume_tag(L, alice.public(), bob.public(), &nd, &nl, &td)
+            .verify_resume_tag(L, alice.public(), bob.public(), &nd, &nl, BND, &td)
             .is_err());
-        let tl = a.resume_tag(L, alice.public(), bob.public(), &nd, &nl);
+        let tl = a.resume_tag(L, alice.public(), bob.public(), &nd, &nl, BND);
         assert!(b
-            .verify_resume_tag(D, alice.public(), bob.public(), &nd, &nl, &tl)
+            .verify_resume_tag(D, alice.public(), bob.public(), &nd, &nl, BND, &tl)
             .is_err());
     }
 
@@ -1124,38 +1136,53 @@ mod tests {
         let (alice, bob, a, b) = pair_ids();
         let eve = id();
         let (nd, nl) = ([9u8; 32], [10u8; 32]);
-        let tag = a.resume_tag(D, alice.public(), bob.public(), &nd, &nl);
+        let tag = a.resume_tag(D, alice.public(), bob.public(), &nd, &nl, BND);
         let mut nd2 = nd;
         nd2[0] ^= 1;
         let mut nl2 = nl;
         nl2[31] ^= 1;
         assert!(b
-            .verify_resume_tag(D, alice.public(), bob.public(), &nd2, &nl, &tag)
+            .verify_resume_tag(D, alice.public(), bob.public(), &nd2, &nl, BND, &tag)
             .is_err());
         assert!(b
-            .verify_resume_tag(D, alice.public(), bob.public(), &nd, &nl2, &tag)
+            .verify_resume_tag(D, alice.public(), bob.public(), &nd, &nl2, BND, &tag)
             .is_err());
         assert!(b
-            .verify_resume_tag(D, eve.public(), bob.public(), &nd, &nl, &tag)
+            .verify_resume_tag(D, eve.public(), bob.public(), &nd, &nl, BND, &tag)
             .is_err());
         assert!(b
-            .verify_resume_tag(D, alice.public(), eve.public(), &nd, &nl, &tag)
+            .verify_resume_tag(D, alice.public(), eve.public(), &nd, &nl, BND, &tag)
             .is_err());
         assert!(b
-            .verify_resume_tag(D, bob.public(), alice.public(), &nd, &nl, &tag)
+            .verify_resume_tag(D, bob.public(), alice.public(), &nd, &nl, BND, &tag)
             .is_err());
+    }
+
+    #[test]
+    fn resume_tag_binds_channel_binding() {
+        let (alice, bob, a, b) = pair_ids();
+        let (nd, nl) = ([15u8; 32], [16u8; 32]);
+        let tag = a.resume_tag(D, alice.public(), bob.public(), &nd, &nl, b"X");
+        b.verify_resume_tag(D, alice.public(), bob.public(), &nd, &nl, b"X", &tag)
+            .unwrap();
+        for other in [&b"Y"[..], &b""[..], &b"XY"[..]] {
+            assert!(matches!(
+                b.verify_resume_tag(D, alice.public(), bob.public(), &nd, &nl, other, &tag),
+                Err(Error::Verify(_))
+            ));
+        }
     }
 
     #[test]
     fn resume_tag_bad_lengths_are_rejected() {
         let (alice, bob, a, b) = pair_ids();
         let (nd, nl) = ([11u8; 32], [12u8; 32]);
-        let tag = a.resume_tag(D, alice.public(), bob.public(), &nd, &nl);
+        let tag = a.resume_tag(D, alice.public(), bob.public(), &nd, &nl, BND);
         for n in [0usize, 31, 33, 64] {
             let mut t = tag.to_vec();
             t.resize(n, 0);
             assert!(b
-                .verify_resume_tag(D, alice.public(), bob.public(), &nd, &nl, &t)
+                .verify_resume_tag(D, alice.public(), bob.public(), &nd, &nl, BND, &t)
                 .is_err());
         }
     }
@@ -1165,11 +1192,11 @@ mod tests {
         let (alice, bob, mut a, mut b) = pair_ids();
         let (nd, nl) = ([13u8; 32], [14u8; 32]);
         for _ in 0..3 {
-            let t = a.resume_tag(D, alice.public(), bob.public(), &nd, &nl);
-            b.verify_resume_tag(D, alice.public(), bob.public(), &nd, &nl, &t)
+            let t = a.resume_tag(D, alice.public(), bob.public(), &nd, &nl, BND);
+            b.verify_resume_tag(D, alice.public(), bob.public(), &nd, &nl, BND, &t)
                 .unwrap();
-            let t = b.resume_tag(L, alice.public(), bob.public(), &nd, &nl);
-            a.verify_resume_tag(L, alice.public(), bob.public(), &nd, &nl, &t)
+            let t = b.resume_tag(L, alice.public(), bob.public(), &nd, &nl, BND);
+            a.verify_resume_tag(L, alice.public(), bob.public(), &nd, &nl, BND, &t)
                 .unwrap();
         }
         let ct = a.seal(b"x").unwrap();
