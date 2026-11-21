@@ -422,6 +422,9 @@ pub enum IncomingSource {
     Unknown,
 }
 
+/// iroh 1.0.1's mapped-address prefix `fd15:70a:510b::/48` (see `classify_remote_addr`).
+const IROH_MAPPED_PREFIX_48: [u16; 3] = [0xfd15, 0x070a, 0x510b];
+
 /// Pure: classify an IP address iroh reports for an `Incoming`.
 ///
 /// iroh 1.0's `Incoming::remote_addr()` is an `IncomingAddr`: `Ip(SocketAddr)`
@@ -435,9 +438,6 @@ pub enum IncomingSource {
 /// `Relayed` here. Other unique-local (`fc00::/7`) addresses are real LAN/VPN peers
 /// and are `Direct`.
 /// Unspecified addresses (`0.0.0.0`, `::`) are `Unknown`.
-/// iroh 1.0.1's mapped-address prefix `fd15:70a:510b::/48` (see `classify_remote_addr`).
-const IROH_MAPPED_PREFIX_48: [u16; 3] = [0xfd15, 0x070a, 0x510b];
-
 pub(crate) fn classify_remote_addr(addr: std::net::SocketAddr) -> IncomingSource {
     use std::net::IpAddr;
     let v6 = match addr.ip() {
