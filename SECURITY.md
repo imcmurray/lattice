@@ -25,15 +25,33 @@
   sessions.
 - The `lattice-net` listener limits each pre-chat step and the finishing of an
   inbound QUIC connection to 15 s, and bounds pending accepts and busy replies
-  (8 each), dropping the excess. This is not Sybil or flood resistance: a
-  sustained flood can keep those slots full and lock legitimate peers out for
-  as long as it lasts.
+  (8 each), dropping the excess. Before any work is spawned it also applies a
+  per-source rate limit (IPv4 /32, IPv6 /64), a per-endpoint-id rate limit, a
+  global accept-rate cap, and a temporary ban (5 minutes) for a source or
+  endpoint id after 8 failures in 60 s. 2 of the 8 pending-accept slots are
+  reserved: a stranger can hold one only for a short provisional handshake
+  (5 s), while an endpoint id that recently authenticated with a verified root
+  keeps it. Relayed connections have no usable client address, so they share
+  one rate limit and are never source-banned (so do direct peers with a
+  unique-local IPv6 address, which are conservatively treated as relayed).
+  Dropped attempts are reported as
+  one summary warning per 10 s. This reduces a single-source flood, not a
+  distributed one: a botnet with many IPs and fresh endpoint ids can still
+  fill the non-reserved slots and the global cap and lock strangers out for as
+  long as it lasts; source addresses are not authenticated before the
+  handshake and endpoint ids are free to make; a relayed flood can rate limit
+  legitimate relayed strangers; evicted entries forget their bans; and the
+  verified-endpoint table is in memory and per dialer process (a restarted
+  dialer is a stranger until it authenticates once). This is not Sybil
+  resistance (see DESIGN.md §6.6).
 - The `lattice-net` listen ticket (v3) is a compact, **unsigned** bearer token:
   the listener's iroh address plus its root and device PeerIds, small enough for
   a QR code. It grants reachability: anyone holding it can try to connect. It
-  is no weaker than the old signed ticket (`lattice-ticket-v2`, historical and
-  superseded): the ticket travels out of band, and an attacker who can edit it
-  could equally replace the PeerIds, so a signature added nothing. Substituting
+  does not weaken session authentication compared with the old signed ticket
+  (`lattice-ticket-v2`, historical and superseded): the hello, handshake and
+  certificate chain pin the device and root either way. What changed is that an
+  edit to only the address is no longer rejected before dialing (the signature
+  used to catch it); it can only deny service. Substituting
   the relay URL or direct addresses can only deny service, because TLS pins the
   iroh endpoint id and the listener's hello, handshake and certificate chain pin
   the device and root. The dialer checks the listener's hello (device and root

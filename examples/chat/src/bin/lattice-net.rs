@@ -69,6 +69,17 @@
 //! one-byte "busy" reply and is dropped, with at most 8 busy replies at a
 //! time. Excess connections beyond either limit are dropped immediately. A
 //! dialer treats a busy reply as a failed attempt and retries with backoff.
+//!
+//! **Flood limits** (`flood.rs`, DESIGN.md §6.6). Before any task is spawned the
+//! acceptor applies, per attempt: a per-source token bucket (IPv4 /32, IPv6 /64;
+//! relayed attempts share one bucket and are never source-banned), a temporary
+//! source ban after repeated failures, a global accept-rate cap, and a free
+//! pending-accept slot. Of the 8 slots, `RESERVED_VERIFIED_SLOTS` are only kept
+//! past the handshake by endpoint ids that recently authenticated with a
+//! verified root. After the handshake, per-endpoint-id buckets and bans apply.
+//! Dropped attempts are not printed one by one: one summary warning is printed
+//! per `DROP_WARN_INTERVAL`. Source addresses are unauthenticated and endpoint
+//! ids are free to generate, so a distributed flood is limited, not stopped.
 //! Identity hiding is absent: the listener's identities and the dialer's device
 //! identity are sent in the clear (the auth bundles are encrypted).
 
@@ -82,10 +93,16 @@ use lattice::identity::storage::{IdentityStore, StorageBackend};
 use lattice::prelude::*;
 use lattice::session::{resume_nonce, ResumeRole};
 use lattice::transport::{
-    encode_ticket, parse_ticket, read_frame, write_frame, IrohConn, IrohTransport,
+    encode_ticket, parse_ticket, read_frame, write_frame, IncomingConn, IncomingSource, IrohConn,
+    IrohTransport,
 };
 use tokio::io::{AsyncBufReadExt, BufReader, Lines, Stdin};
 use tokio::sync::{Mutex, Notify};
+
+// `src/bin/lattice-net/flood.rs`: pure limiter, std only. (`#[path]` because a
+// crate-root file resolves `mod x;` next to itself, not in a `lattice-net/` dir.)
+#[path = "lattice-net/flood.rs"]
+mod flood;
 
 /// First byte of the dialer's preamble. Must differ from the old preamble's
 /// first byte (`MODE_FRESH`/`MODE_RESUME`, 0/1) so an old dialer is recognised.
@@ -130,6 +147,31 @@ const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_BUSY_REPLIES: usize = 8;
 /// Max concurrent pending accepts (QUIC handshake + accept_bi); over the limit an incoming is dropped.
 const MAX_PENDING_ACCEPTS: usize = 8;
+/// Of `MAX_PENDING_ACCEPTS`, slots a stranger can only hold provisionally.
+const RESERVED_VERIFIED_SLOTS: usize = 2;
+/// `finish()` bound while holding a reserved slot (a stranger may hold one only this long).
+const PROVISIONAL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Per source: IPv4 /32 or IPv6 /64.
+const SOURCE_BURST: u32 = 4;
+const SOURCE_REFILL: Duration = Duration::from_secs(2);
+/// The one bucket shared by every relayed / unknown-source attempt.
+const RELAYED_BURST: u32 = 16;
+const RELAYED_REFILL: Duration = Duration::from_millis(250);
+/// Per remote endpoint id.
+const ENDPOINT_BURST: u32 = 4;
+const ENDPOINT_REFILL: Duration = Duration::from_secs(2);
+/// Global accept-rate cap (20/s sustained).
+const GLOBAL_ACCEPT_BURST: u32 = 32;
+const GLOBAL_ACCEPT_REFILL: Duration = Duration::from_millis(50);
+const MAX_FAILURES_BEFORE_BAN: u32 = 8;
+const FAILURE_WINDOW: Duration = Duration::from_secs(60);
+const BAN_DURATION: Duration = Duration::from_secs(300);
+const MAX_TRACKED_SOURCES: usize = 4096;
+const MAX_TRACKED_ENDPOINTS: usize = 4096;
+const MAX_VERIFIED_ENDPOINTS: usize = 256;
+const MAX_ENDPOINTS_PER_VERIFIED_ROOT: usize = 4;
+/// At most one dropped-connection summary line per this interval.
+const DROP_WARN_INTERVAL: Duration = Duration::from_secs(10);
 const NONCE_LEN: usize = 32;
 const TAG_LEN: usize = 32;
 /// Domain separator of the channel binding passed to the handshake and resume.
@@ -301,7 +343,12 @@ fn trust_lines(
 /// Load known_peers (on Err: warn and treat as unverified), compute
 /// verified = known.contains(peer) || peer == own root, record the peer as
 /// seen (warn on Err), and print `trust_lines` to stderr. Never verifies anyone.
-fn report_peer_trust(store: &IdentityStore, own_root: &PublicIdentity, peer_root: &PublicIdentity) {
+/// Returns whether the peer counted as verified.
+fn report_peer_trust(
+    store: &IdentityStore,
+    own_root: &PublicIdentity,
+    peer_root: &PublicIdentity,
+) -> bool {
     let peer_id = peer_root.peer_id();
     let known = match store.load_known_peers() {
         Ok(k) => k,
@@ -317,6 +364,7 @@ fn report_peer_trust(store: &IdentityStore, own_root: &PublicIdentity, peer_root
     for line in trust_lines(own_root, peer_root, verified) {
         eprintln!("{line}");
     }
+    verified
 }
 
 /// `verify-peer`: mark a root as verified. Touches only `known_peers` (and
@@ -1019,7 +1067,7 @@ async fn run() -> Result<()> {
                 .map(|l| l.revoked().to_vec())
                 .unwrap_or_default();
             set.push(id);
-            let seq = old.as_ref().map_or(1, |l| l.seq() + 1);
+            let seq = next_revocation_seq(old.as_ref().map(|l| l.seq()))?;
             let list = root.keypair.revoke_devices(seq, now, &set)?;
             store.store_revocation(&list)?;
             println!(
@@ -1055,6 +1103,21 @@ async fn run() -> Result<()> {
             }
         }
         Command::ImportRoot | Command::VerifyPeer(_) | Command::Usage => Ok(()),
+    }
+}
+
+/// The `seq` of the next revocation list: 1 for the first, else `prev + 1`.
+/// Errors (never overflows) when `prev` is already `u64::MAX`.
+fn next_revocation_seq(prev: Option<u64>) -> Result<u64> {
+    match prev {
+        None => Ok(1),
+        Some(s) => s.checked_add(1).ok_or_else(|| {
+            Error::Other(
+                "the revocation list sequence number is already at its maximum; \
+                 cannot issue a newer list"
+                    .into(),
+            )
+        }),
     }
 }
 
@@ -1103,18 +1166,24 @@ async fn listen(
     );
 
     // Acceptor task: only takes `Incoming`s, so one slow peer cannot stall it.
-    // Each incoming finishes (QUIC handshake + first stream, limited to
-    // NEGOTIATION_TIMEOUT) in its own task under the `pending` semaphore. A free
-    // gate hands the connection to this loop; a taken gate gets a one-byte
-    // "busy" reply under the `busy` semaphore. Excess connections are dropped.
+    // Before any task is spawned, `spawn_admitted` applies the source / global
+    // limits and takes a pending-accept slot. Each admitted incoming finishes
+    // (QUIC handshake + first stream, bounded) in its own task, then the
+    // per-endpoint limits apply. A free gate hands the connection to this loop;
+    // a taken gate gets a one-byte "busy" reply under the `busy` semaphore.
+    // Excess connections are dropped, and counted into one summary warning.
     let t = Arc::new(t);
     let gate = Arc::new(ChatGate::new());
     let busy = Arc::new(tokio::sync::Semaphore::new(MAX_BUSY_REPLIES));
-    let pending = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_ACCEPTS));
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<IrohConn>(1);
+    let pool = flood::SlotPool::new(MAX_PENDING_ACCEPTS, RESERVED_VERIFIED_SLOTS);
+    let guard: Arc<std::sync::Mutex<ListenGuard>> = Arc::new(std::sync::Mutex::new(
+        flood::FloodGuard::new(flood::MonotonicClock::new(), listener_limits()),
+    ));
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(IrohConn, SourceKey)>(1);
     let acceptor = {
         let t = t.clone();
         let gate = gate.clone();
+        let guard = guard.clone();
         tokio::spawn(async move {
             loop {
                 let incoming = match t.accept_incoming().await {
@@ -1124,25 +1193,14 @@ async fn listen(
                         break;
                     }
                 };
-                let (gate, tx_task, busy) = (gate.clone(), tx.clone(), busy.clone());
-                let task = async move {
-                    let conn = match accept_within(NEGOTIATION_TIMEOUT, incoming.finish()).await {
-                        Ok(c) => c,
-                        Err(e) => {
-                            eprintln!("[lattice-net] inbound connection failed: {e}");
-                            return;
-                        }
-                    };
-                    // Not under the timeout: a timeout between claiming the gate
-                    // and sending would leave the gate claimed forever.
-                    let _ = dispatch(conn, &gate, &tx_task, &busy, |c| async move {
-                        let _ = tokio::time::timeout(NEGOTIATION_TIMEOUT, reply_busy(c)).await;
-                    })
-                    .await;
-                };
-                if spawn_bounded(&pending, task).is_none() {
-                    eprintln!("[lattice-net] too many pending accepts — dropped a connection");
-                }
+                let src = source_key(incoming.remote_source());
+                let (gate, tx_task, busy, guard_task) =
+                    (gate.clone(), tx.clone(), busy.clone(), guard.clone());
+                // On refusal `incoming` (owned by the unused closure) is dropped,
+                // which refuses the attempt; the drop was already counted.
+                let _ = spawn_admitted(&guard, &pool, &src, move |slot| async move {
+                    accept_task(incoming, slot, src, guard_task, gate, tx_task, busy).await
+                });
                 if tx.is_closed() {
                     break;
                 }
@@ -1153,10 +1211,11 @@ async fn listen(
     let mut sessions: KeptSessions = KeptSessions::new();
     loop {
         eprintln!("[lattice-net] waiting for a peer to connect...");
-        let Some(conn) = rx.recv().await else {
+        let Some((conn, src)) = rx.recv().await else {
             break; // acceptor ended
         };
-        let binding = channel_binding(&conn.remote_endpoint_id(), &t.endpoint_id_bytes());
+        let remote_ep = conn.remote_endpoint_id();
+        let binding = channel_binding(&remote_ep, &t.endpoint_id_bytes());
         let limit = NEGOTIATION_TIMEOUT;
         let accepted = negotiate_accept(
             conn,
@@ -1173,11 +1232,13 @@ async fn listen(
             Ok(x) => x,
             Err(e) => {
                 eprintln!("[lattice-net] negotiation failed: {e} — still listening");
+                lock_guard(&guard).record_failure(&src, Some(&remote_ep));
                 gate.release();
                 continue;
             }
         };
-        report_peer_trust(&store, &me.root, &auth.root);
+        let verified = report_peer_trust(&store, &me.root, &auth.root);
+        lock_guard(&guard).record_success(&src, &remote_ep, verified.then(|| auth.root.peer_id()));
         match chat(sess, &mut lines).await {
             Ok((Outcome::LocalClosed, _)) => {
                 eprintln!("[lattice-net] input closed — exiting");
@@ -1202,6 +1263,162 @@ async fn listen(
     }
     acceptor.abort();
     Ok(())
+}
+
+/// Who an inbound attempt is attributed to for rate limiting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum SourceKey {
+    /// A direct IPv4 source (/32).
+    V4(std::net::Ipv4Addr),
+    /// A direct IPv6 source, by its /64 prefix (first 8 bytes).
+    V6Prefix([u8; 8]),
+    /// Relayed or unknown: no usable client address, so all of them share one key.
+    Relayed,
+}
+
+impl flood::SourceKind for SourceKey {
+    fn is_shared(&self) -> bool {
+        matches!(self, SourceKey::Relayed)
+    }
+}
+
+/// IPv4 → /32; IPv4-mapped IPv6 → that IPv4; other IPv6 → /64; relayed or
+/// unknown → the shared `Relayed` key.
+fn source_key(src: IncomingSource) -> SourceKey {
+    match src {
+        IncomingSource::Direct(addr) => match addr.ip() {
+            std::net::IpAddr::V4(ip) => SourceKey::V4(ip),
+            std::net::IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+                Some(v4) => SourceKey::V4(v4),
+                None => {
+                    let o = ip.octets();
+                    SourceKey::V6Prefix([o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7]])
+                }
+            },
+        },
+        IncomingSource::Relayed | IncomingSource::Unknown => SourceKey::Relayed,
+    }
+}
+
+/// The listener's flood limits, built only from the named consts.
+fn listener_limits() -> flood::Limits {
+    flood::Limits {
+        source: flood::BucketParams {
+            burst: SOURCE_BURST,
+            refill_every: SOURCE_REFILL,
+        },
+        shared_source: flood::BucketParams {
+            burst: RELAYED_BURST,
+            refill_every: RELAYED_REFILL,
+        },
+        endpoint: flood::BucketParams {
+            burst: ENDPOINT_BURST,
+            refill_every: ENDPOINT_REFILL,
+        },
+        global: flood::BucketParams {
+            burst: GLOBAL_ACCEPT_BURST,
+            refill_every: GLOBAL_ACCEPT_REFILL,
+        },
+        ban: flood::BanParams {
+            max_failures: MAX_FAILURES_BEFORE_BAN,
+            window: FAILURE_WINDOW,
+            ban_for: BAN_DURATION,
+        },
+        max_sources: MAX_TRACKED_SOURCES,
+        max_endpoints: MAX_TRACKED_ENDPOINTS,
+        max_verified: MAX_VERIFIED_ENDPOINTS,
+        max_verified_per_root: MAX_ENDPOINTS_PER_VERIFIED_ROOT,
+        warn_interval: DROP_WARN_INTERVAL,
+    }
+}
+
+type ListenGuard = flood::FloodGuard<flood::MonotonicClock, SourceKey, [u8; 32], PeerId>;
+
+/// Lock the guard; a poisoned mutex is recovered so the limiter never panics the listener.
+fn lock_guard<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Count a drop and print the aggregated summary line if one is due.
+fn note_drop<C: flood::Clock>(
+    guard: &std::sync::Mutex<flood::FloodGuard<C, SourceKey, [u8; 32], PeerId>>,
+    reason: flood::DropReason,
+) {
+    let line = lock_guard(guard).note_drop(reason);
+    if let Some(line) = line {
+        eprintln!("{line}");
+    }
+}
+
+/// Admission before any task is spawned: `guard.admit_source`, then
+/// `pool.try_acquire`. On refusal the drop is counted (the summary line is
+/// printed if due), `make` is never called, nothing is spawned and the reason
+/// is returned. On success `make(slot)` is spawned.
+fn spawn_admitted<C, F, Fut>(
+    guard: &std::sync::Mutex<flood::FloodGuard<C, SourceKey, [u8; 32], PeerId>>,
+    pool: &Arc<flood::SlotPool>,
+    src: &SourceKey,
+    make: F,
+) -> std::result::Result<tokio::task::JoinHandle<Fut::Output>, flood::DropReason>
+where
+    C: flood::Clock,
+    F: FnOnce(flood::Slot) -> Fut,
+    Fut: std::future::Future + Send + 'static,
+    Fut::Output: Send + 'static,
+{
+    let admitted = lock_guard(guard).admit_source(src);
+    let slot = admitted.and_then(|()| pool.try_acquire().ok_or(flood::DropReason::NoSlot));
+    match slot {
+        Ok(slot) => Ok(tokio::spawn(make(slot))),
+        Err(reason) => {
+            note_drop(guard, reason);
+            Err(reason)
+        }
+    }
+}
+
+/// One admitted inbound attempt: bounded `finish`, per-endpoint admission,
+/// slot classification, then `dispatch`. The slot is held until this returns.
+async fn accept_task(
+    incoming: IncomingConn,
+    slot: flood::Slot,
+    src: SourceKey,
+    guard: Arc<std::sync::Mutex<ListenGuard>>,
+    gate: Arc<ChatGate>,
+    tx: tokio::sync::mpsc::Sender<(IrohConn, SourceKey)>,
+    busy: Arc<tokio::sync::Semaphore>,
+) {
+    let limit = match slot.kind() {
+        flood::SlotKind::General => NEGOTIATION_TIMEOUT,
+        flood::SlotKind::Reserved => PROVISIONAL_HANDSHAKE_TIMEOUT,
+    };
+    let conn = match accept_within(limit, incoming.finish()).await {
+        Ok(c) => c,
+        Err(_) => {
+            lock_guard(&guard).record_failure(&src, None);
+            note_drop(&guard, flood::DropReason::Failed);
+            return;
+        }
+    };
+    let ep = conn.remote_endpoint_id();
+    let admitted = lock_guard(&guard).admit_endpoint(&ep);
+    let verified = match admitted {
+        Ok(v) => v,
+        Err(reason) => {
+            note_drop(&guard, reason);
+            return;
+        }
+    };
+    let Some(_slot) = slot.classify(verified) else {
+        note_drop(&guard, flood::DropReason::StrangerInReservedSlot);
+        return;
+    };
+    // Not under the timeout: a timeout between claiming the gate and sending
+    // would leave the gate claimed forever.
+    let _ = dispatch((conn, src), &gate, &tx, &busy, |(c, _)| async move {
+        let _ = tokio::time::timeout(NEGOTIATION_TIMEOUT, reply_busy(c)).await;
+    })
+    .await;
 }
 
 /// Spawn `fut` iff `sem` has a free permit (never waits). The permit moves into
@@ -2694,6 +2911,179 @@ mod tests {
         assert_eq!(MAX_BUSY_REPLIES, 8);
         assert_eq!(MAX_PENDING_ACCEPTS, 8);
         assert_eq!(NEGOTIATION_TIMEOUT, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn flood_limits_are_set() {
+        assert_eq!(RESERVED_VERIFIED_SLOTS, 2);
+        const { assert!(RESERVED_VERIFIED_SLOTS < MAX_PENDING_ACCEPTS) };
+        assert_eq!(PROVISIONAL_HANDSHAKE_TIMEOUT, Duration::from_secs(5));
+        assert!(PROVISIONAL_HANDSHAKE_TIMEOUT < NEGOTIATION_TIMEOUT);
+        assert_eq!((SOURCE_BURST, SOURCE_REFILL), (4, Duration::from_secs(2)));
+        assert_eq!(
+            (RELAYED_BURST, RELAYED_REFILL),
+            (16, Duration::from_millis(250))
+        );
+        assert_eq!(
+            (ENDPOINT_BURST, ENDPOINT_REFILL),
+            (4, Duration::from_secs(2))
+        );
+        assert_eq!(
+            (GLOBAL_ACCEPT_BURST, GLOBAL_ACCEPT_REFILL),
+            (32, Duration::from_millis(50))
+        );
+        assert_eq!(MAX_FAILURES_BEFORE_BAN, 8);
+        assert_eq!(FAILURE_WINDOW, Duration::from_secs(60));
+        assert_eq!(BAN_DURATION, Duration::from_secs(300));
+        assert_eq!(MAX_TRACKED_SOURCES, 4096);
+        assert_eq!(MAX_TRACKED_ENDPOINTS, 4096);
+        assert_eq!(MAX_VERIFIED_ENDPOINTS, 256);
+        assert_eq!(MAX_ENDPOINTS_PER_VERIFIED_ROOT, 4);
+        assert_eq!(DROP_WARN_INTERVAL, Duration::from_secs(10));
+        let l = listener_limits();
+        assert_eq!(l.source.burst, SOURCE_BURST);
+        assert_eq!(l.global.refill_every, GLOBAL_ACCEPT_REFILL);
+        assert_eq!(l.ban.max_failures, MAX_FAILURES_BEFORE_BAN);
+        assert_eq!(l.max_sources, MAX_TRACKED_SOURCES);
+    }
+
+    // ---- spawn_admitted ----
+
+    type TestGuard =
+        std::sync::Mutex<flood::FloodGuard<flood::FakeClock, SourceKey, [u8; 32], PeerId>>;
+
+    fn test_guard(l: flood::Limits) -> TestGuard {
+        std::sync::Mutex::new(flood::FloodGuard::new(flood::FakeClock::new(), l))
+    }
+
+    fn src1() -> SourceKey {
+        SourceKey::V4(std::net::Ipv4Addr::new(1, 2, 3, 4))
+    }
+
+    /// Try to admit with a `make` that records whether it was called.
+    fn try_admit(
+        guard: &TestGuard,
+        pool: &Arc<flood::SlotPool>,
+        src: &SourceKey,
+    ) -> (
+        std::result::Result<tokio::task::JoinHandle<u8>, flood::DropReason>,
+        bool,
+    ) {
+        let called = Arc::new(AtomicBool::new(false));
+        let flag = called.clone();
+        let r = spawn_admitted(guard, pool, src, move |slot| {
+            flag.store(true, Ordering::SeqCst);
+            async move {
+                let _slot = slot;
+                std::future::pending::<u8>().await
+            }
+        });
+        (r, called.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn over_limit_path_spawns_nothing() {
+        // source banned
+        let guard = test_guard(listener_limits());
+        let pool = flood::SlotPool::new(MAX_PENDING_ACCEPTS, RESERVED_VERIFIED_SLOTS);
+        for _ in 0..MAX_FAILURES_BEFORE_BAN {
+            guard.lock().unwrap().record_failure(&src1(), None);
+        }
+        let (r, called) = try_admit(&guard, &pool, &src1());
+        assert_eq!(r.err(), Some(flood::DropReason::SourceBanned));
+        assert!(!called);
+        assert_eq!(pool.in_use(), (0, 0));
+
+        // source rate-limited
+        let mut l = listener_limits();
+        l.source.burst = 1;
+        let guard = test_guard(l);
+        let (first, called) = try_admit(&guard, &pool, &src1());
+        let first = first.expect("first attempt admitted");
+        assert!(called);
+        assert_eq!(pool.in_use(), (1, 0));
+        let (r, called) = try_admit(&guard, &pool, &src1());
+        assert_eq!(r.err(), Some(flood::DropReason::SourceRateLimited));
+        assert!(!called);
+        assert_eq!(pool.in_use(), (1, 0));
+        first.abort();
+        let _ = first.await;
+        assert_eq!(pool.in_use(), (0, 0));
+
+        // global bucket empty
+        let mut l = listener_limits();
+        l.global.burst = 0;
+        let guard = test_guard(l);
+        let (r, called) = try_admit(&guard, &pool, &src1());
+        assert_eq!(r.err(), Some(flood::DropReason::GlobalRateLimited));
+        assert!(!called);
+        assert_eq!(pool.in_use(), (0, 0));
+
+        // no free slot
+        let guard = test_guard(listener_limits());
+        let tiny = flood::SlotPool::new(1, 0);
+        let (held, _) = try_admit(&guard, &tiny, &src1());
+        let held = held.expect("one slot free");
+        let (r, called) = try_admit(&guard, &tiny, &src1());
+        assert_eq!(r.err(), Some(flood::DropReason::NoSlot));
+        assert!(!called);
+        assert_eq!(tiny.in_use(), (1, 0));
+        held.abort();
+        let _ = held.await;
+        assert_eq!(tiny.in_use(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn admitted_path_runs_make_once_and_releases_slot() {
+        let guard = test_guard(listener_limits());
+        let pool = flood::SlotPool::new(MAX_PENDING_ACCEPTS, RESERVED_VERIFIED_SLOTS);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let h = spawn_admitted(&guard, &pool, &src1(), move |slot| {
+            c.fetch_add(1, Ordering::SeqCst);
+            async move {
+                let _slot = slot;
+                7u8
+            }
+        })
+        .expect("admitted");
+        assert_eq!(h.await.unwrap(), 7);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.in_use(), (0, 0));
+    }
+
+    #[test]
+    fn source_key_maps_addresses() {
+        let direct = |s: &str| IncomingSource::Direct(s.parse().unwrap());
+        assert_eq!(
+            source_key(direct("1.2.3.4:5")),
+            SourceKey::V4(std::net::Ipv4Addr::new(1, 2, 3, 4))
+        );
+        assert_eq!(
+            source_key(direct("[::ffff:1.2.3.4]:5")),
+            SourceKey::V4(std::net::Ipv4Addr::new(1, 2, 3, 4))
+        );
+        let a = source_key(direct("[2001:db8:1:2:aaaa::1]:5"));
+        let b = source_key(direct("[2001:db8:1:2:bbbb::9]:7"));
+        let c = source_key(direct("[2001:db8:1:3::1]:5"));
+        assert!(matches!(a, SourceKey::V6Prefix(_)));
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        for s in [IncomingSource::Relayed, IncomingSource::Unknown] {
+            let k = source_key(s);
+            assert_eq!(k, SourceKey::Relayed);
+            assert!(flood::SourceKind::is_shared(&k));
+        }
+        assert!(!flood::SourceKind::is_shared(&a));
+    }
+
+    #[test]
+    fn revocation_seq_never_overflows() {
+        assert_eq!(next_revocation_seq(None).unwrap(), 1);
+        assert_eq!(next_revocation_seq(Some(41)).unwrap(), 42);
+        assert_eq!(next_revocation_seq(Some(u64::MAX - 1)).unwrap(), u64::MAX);
+        let e = next_revocation_seq(Some(u64::MAX)).unwrap_err();
+        assert!(e.to_string().contains("maximum"), "{e}");
     }
 
     #[tokio::test]

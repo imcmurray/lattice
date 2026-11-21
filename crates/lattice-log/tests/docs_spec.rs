@@ -147,6 +147,75 @@ fn docs_mention_safety_numbers_and_hardening() {
     }
 }
 
+/// The ADR-006 entry in §8 (from its last mention up to the next ADR).
+fn adr006(d: &str) -> String {
+    let start = d.rfind("ADR-006").unwrap();
+    let end = start + d[start..].find("ADR-007").unwrap();
+    d[start..end].to_string()
+}
+
+#[test]
+fn adr006_describes_the_current_wire() {
+    let adr = adr006(&collapsed("DESIGN.md"));
+    for need in ["WIRE_VERSION", "resume_allowed", "hello", "ADR-013"] {
+        assert!(adr.contains(need), "ADR-006 missing {need:?}");
+    }
+    for bad in ["1-byte mode prefix", "resumes if it holds the session"] {
+        assert!(!adr.contains(bad), "ADR-006 still contains {bad:?}");
+    }
+}
+
+#[test]
+fn design_documents_flood_limits() {
+    let d = collapsed("DESIGN.md");
+    for need in [
+        "RESERVED_VERIFIED_SLOTS",
+        "MAX_FAILURES_BEFORE_BAN",
+        "BAN_DURATION",
+        "MAX_TRACKED_SOURCES",
+        "GLOBAL_ACCEPT_REFILL",
+        "PROVISIONAL_HANDSHAKE_TIMEOUT",
+        "/64",
+        "IncomingAddr",
+        "share **one** source key",
+        "never failure-tracked or banned",
+        "provisionally",
+        "MAX_PENDING_ACCEPTS",
+        "MAX_BUSY_REPLIES",
+    ] {
+        assert!(d.contains(need), "DESIGN.md missing {need:?}");
+    }
+    for residual in [
+        "botnet with many source IPs and fresh endpoint ids",
+        "saturate the non-reserved slots and the global cap",
+        "Relayed peers share one address and bucket",
+        "Stalled handshakes can still churn the reserved slots",
+        "Endpoint ids are free to generate",
+        "forgets its ban",
+        "in memory and per dialer process",
+        "Source IPs are not authenticated before the handshake",
+    ] {
+        assert!(
+            d.contains(residual),
+            "DESIGN.md missing residual {residual:?}"
+        );
+    }
+    assert!(!d.contains("there is no per-peer rate limiting"));
+}
+
+#[test]
+fn security_md_documents_flood_limits_and_ticket_edit() {
+    let raw = collapsed("SECURITY.md");
+    let s = raw.to_lowercase();
+    for need in ["rate limit", "ban", "reserved", "botnet", "relay"] {
+        assert!(s.contains(need), "SECURITY.md missing {need:?}");
+    }
+    assert!(!s.contains("a signature added nothing"));
+    assert!(!s.contains("this is not sybil or flood resistance"));
+    assert!(s.contains("no longer rejected before dialing"));
+    assert!(s.contains("can only deny service"));
+}
+
 #[test]
 fn security_md_has_new_limitations() {
     let s = read("SECURITY.md").to_lowercase();

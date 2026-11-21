@@ -411,7 +411,56 @@ pub struct IncomingConn {
     incoming: iroh::endpoint::Incoming,
 }
 
+/// Where an inbound attempt came from, as far as can be told before the QUIC handshake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IncomingSource {
+    /// A real UDP source address (direct path). Unauthenticated, spoofable.
+    Direct(std::net::SocketAddr),
+    /// Arrived via an iroh relay / an iroh-synthetic ("mapped") address: no usable client IP.
+    Relayed,
+    /// iroh did not expose an address we can interpret.
+    Unknown,
+}
+
+/// Pure: classify an IP address iroh reports for an `Incoming`.
+///
+/// iroh 1.0's `Incoming::remote_addr()` is an `IncomingAddr`: `Ip(SocketAddr)`
+/// for a direct path and `Relay { .. }` for a relayed one (see
+/// [`IncomingConn::remote_source`]; a relayed attempt carries no client IP).
+/// Synthetic "mapped" IPv6 addresses that iroh uses internally live in a
+/// unique-local `fd..` prefix; its exact value was not read from iroh's source
+/// here, so as a conservative guard the whole unique-local range `fc00::/7` is
+/// treated as synthetic: anything not provably a real address is `Relayed`.
+/// Unspecified addresses (`0.0.0.0`, `::`) are `Unknown`.
+pub(crate) fn classify_remote_addr(addr: std::net::SocketAddr) -> IncomingSource {
+    use std::net::IpAddr;
+    let v6 = match addr.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => return IncomingSource::Unknown,
+        IpAddr::V4(_) => return IncomingSource::Direct(addr),
+        IpAddr::V6(ip) => ip,
+    };
+    if v6.is_unspecified() {
+        return IncomingSource::Unknown;
+    }
+    if (v6.segments()[0] & 0xfe00) == 0xfc00 {
+        return IncomingSource::Relayed;
+    }
+    IncomingSource::Direct(addr)
+}
+
 impl IncomingConn {
+    /// Where this attempt came from. Cheap, no I/O, does not await the handshake.
+    /// A direct IP path is `Direct` (unauthenticated, spoofable); a relay path is
+    /// `Relayed`; any other address kind iroh may add is `Unknown`.
+    pub fn remote_source(&self) -> IncomingSource {
+        use iroh::endpoint::IncomingAddr;
+        match self.incoming.remote_addr() {
+            IncomingAddr::Ip(addr) => classify_remote_addr(addr),
+            IncomingAddr::Relay { .. } => IncomingSource::Relayed,
+            _ => IncomingSource::Unknown,
+        }
+    }
+
     /// Complete the QUIC handshake, then accept the peer's first bi-stream.
     ///
     /// Has NO timeout of its own: a peer that completes QUIC but never opens a
@@ -496,6 +545,29 @@ mod tests {
         }
         let _: fn(&IrohTransport) = _assert;
         let _: fn(IncomingConn) = _finish;
+        let _: fn(&IncomingConn) -> IncomingSource = IncomingConn::remote_source;
+    }
+
+    #[test]
+    fn classify_remote_addr_cases() {
+        let direct4: std::net::SocketAddr = "203.0.113.7:4433".parse().unwrap();
+        let direct6: std::net::SocketAddr = "[2001:db8::1]:4433".parse().unwrap();
+        assert_eq!(
+            classify_remote_addr(direct4),
+            IncomingSource::Direct(direct4)
+        );
+        assert_eq!(
+            classify_remote_addr(direct6),
+            IncomingSource::Direct(direct6)
+        );
+        let mapped: std::net::SocketAddr = "[fd15:70a:510b:1::7]:443".parse().unwrap();
+        assert_eq!(classify_remote_addr(mapped), IncomingSource::Relayed);
+        for s in ["0.0.0.0:0", "[::]:0"] {
+            assert_eq!(
+                classify_remote_addr(s.parse().unwrap()),
+                IncomingSource::Unknown
+            );
+        }
     }
 
     #[test]

@@ -303,11 +303,15 @@ impl IdentityStore {
     /// Requires a stored device (secret, `device.cert`, `root.pub`). Leaves the
     /// device, cert, `root.pub`, revocation files and `config.toml` intact.
     /// Back up the recovery phrase first: this is irreversible.
+    ///
+    /// For an age-file store with the keyring enabled, a leftover keyring root
+    /// entry (from an earlier keyring run) is deleted too. If that delete fails,
+    /// the files are still removed and an error naming the stale entry is returned.
     pub fn forget_root(&self) -> Result<()> {
-        self.forget_root_with(&real_kr())
+        self.forget_root_with(&real_kr(), keyring_enabled())
     }
 
-    fn forget_root_with(&self, kr: &Kr) -> Result<()> {
+    fn forget_root_with(&self, kr: &Kr, keyring_on: bool) -> Result<()> {
         let cfg = self.read_config();
         let device_ok = self.slot_present(Slot::Device, &cfg, kr)?
             && self.cert_path().exists()
@@ -319,13 +323,25 @@ impl IdentityStore {
                     .into(),
             ));
         }
-        if cfg.backend == Some(StorageBackend::Keyring)
-            || (cfg.backend.is_none() && keyring_enabled())
-        {
+        if cfg.backend == Some(StorageBackend::Keyring) || (cfg.backend.is_none() && keyring_on) {
             (kr.delete)(Slot::Root.account())?;
         }
+        // An age-file store may still have a root entry in the keyring; delete it
+        // too, but never let a keyring failure leave identity.age in place.
+        let stale_keyring = if cfg.backend == Some(StorageBackend::AgeFile) && keyring_on {
+            (kr.delete)(Slot::Root.account())
+        } else {
+            Ok(())
+        };
         remove_if_exists(&self.age_path(Slot::Root))?;
         remove_if_exists(&self.legacy_path())?;
+        if let Err(e) = stale_keyring {
+            return Err(Error::Other(format!(
+                "the root file was removed, but the keyring entry `{}` could not be deleted: \
+                 {e}; remove it manually with your OS keychain tool",
+                Slot::Root.account()
+            )));
+        }
         Ok(())
     }
 
@@ -1201,6 +1217,96 @@ mod tests {
         store.load_or_create(CryptoSuite::Classical).unwrap();
         assert!(store.forget_root().is_err());
         assert!(store.load_root(CryptoSuite::Classical).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// An age-file store with a root and a device.
+    fn age_store_with_device(tag: &str) -> (PathBuf, IdentityStore) {
+        let tmp = tmp_dir(tag);
+        let store = IdentityStore::with_dir(tmp.clone());
+        let root = store.load_or_create(CryptoSuite::Classical).unwrap();
+        store
+            .provision_device(&root.keypair, CryptoSuite::Classical, 5000)
+            .unwrap();
+        assert!(tmp.join("identity.age").exists());
+        (tmp, store)
+    }
+
+    /// Run `forget_root_with` with a recording `Kr` whose delete returns
+    /// `delete_err` (as a message) or Ok. Returns the result and the accounts deleted.
+    fn forget_with(
+        store: &IdentityStore,
+        keyring_on: bool,
+        delete_err: Option<&str>,
+    ) -> (Result<()>, Vec<String>) {
+        let deleted = std::cell::RefCell::new(Vec::<String>::new());
+        let load = |_: &str| Ok(Some(Zeroizing::new("x".to_string())));
+        let save = |_: &str, _: &str| true;
+        let delete = |a: &str| {
+            deleted.borrow_mut().push(a.to_string());
+            match delete_err {
+                Some(m) => Err(Error::Other(m.to_string())),
+                None => Ok(()),
+            }
+        };
+        let r = store.forget_root_with(
+            &Kr {
+                load: &load,
+                save: &save,
+                delete: &delete,
+            },
+            keyring_on,
+        );
+        let d = deleted.borrow().clone();
+        (r, d)
+    }
+
+    #[test]
+    fn forget_root_age_with_keyring_deletes_entry() {
+        let (tmp, store) = age_store_with_device("forget-age-kr");
+        let (r, deleted) = forget_with(&store, true, None);
+        r.unwrap();
+        assert_eq!(deleted, vec!["identity-mnemonic".to_string()]);
+        assert!(!tmp.join("identity.age").exists());
+        assert!(tmp.join("device.age").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn forget_root_age_keyring_error_still_removes_file() {
+        let (tmp, store) = age_store_with_device("forget-age-kr-err");
+        let (r, deleted) = forget_with(&store, true, Some("locked"));
+        let msg = r.unwrap_err().to_string();
+        assert!(
+            msg.contains("identity-mnemonic") && msg.contains("locked"),
+            "{msg}"
+        );
+        assert_eq!(deleted.len(), 1);
+        assert!(!tmp.join("identity.age").exists());
+        assert!(tmp.join("device.age").exists());
+        assert!(tmp.join("device.cert").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn forget_root_age_without_keyring_never_deletes() {
+        let (tmp, store) = age_store_with_device("forget-age-nokr");
+        let (r, deleted) = forget_with(&store, false, Some("must not be called"));
+        r.unwrap();
+        assert!(deleted.is_empty());
+        assert!(!tmp.join("identity.age").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn forget_root_keyring_backend_delete_error_is_err() {
+        let (tmp, store) = age_store_with_device("forget-kr-backend");
+        std::fs::write(tmp.join("config.toml"), "backend = \"keyring\"\n").unwrap();
+        let (r, deleted) = forget_with(&store, true, Some("boom"));
+        assert!(r.is_err());
+        assert_eq!(deleted.len(), 1);
+        // unchanged behaviour: the keyring delete runs (and fails) before any file is removed
+        assert!(tmp.join("identity.age").exists());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
