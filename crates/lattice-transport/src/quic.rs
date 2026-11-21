@@ -427,11 +427,17 @@ pub enum IncomingSource {
 /// iroh 1.0's `Incoming::remote_addr()` is an `IncomingAddr`: `Ip(SocketAddr)`
 /// for a direct path and `Relay { .. }` for a relayed one (see
 /// [`IncomingConn::remote_source`]; a relayed attempt carries no client IP).
-/// Synthetic "mapped" IPv6 addresses that iroh uses internally live in a
-/// unique-local `fd..` prefix; its exact value was not read from iroh's source
-/// here, so as a conservative guard the whole unique-local range `fc00::/7` is
-/// treated as synthetic: anything not provably a real address is `Relayed`.
+/// iroh's synthetic "mapped" IPv6 addresses all live in `fd15:70a:510b::/48`
+/// (iroh 1.0.1 `socket/mapped_addrs.rs`: `ADDR_PREFIXL` 0xfd + `ADDR_GLOBAL_ID`
+/// 15:07:0a:51:0b, with relay/custom/endpoint-id subnets under it). iroh normally
+/// converts them to `IncomingAddr::Relay`/`Custom`, but `to_transport_addr` falls
+/// back to `Ip(addr)` when a lookup fails, so an address in that /48 is treated as
+/// `Relayed` here. Other unique-local (`fc00::/7`) addresses are real LAN/VPN peers
+/// and are `Direct`.
 /// Unspecified addresses (`0.0.0.0`, `::`) are `Unknown`.
+/// iroh 1.0.1's mapped-address prefix `fd15:70a:510b::/48` (see `classify_remote_addr`).
+const IROH_MAPPED_PREFIX_48: [u16; 3] = [0xfd15, 0x070a, 0x510b];
+
 pub(crate) fn classify_remote_addr(addr: std::net::SocketAddr) -> IncomingSource {
     use std::net::IpAddr;
     let v6 = match addr.ip() {
@@ -442,7 +448,7 @@ pub(crate) fn classify_remote_addr(addr: std::net::SocketAddr) -> IncomingSource
     if v6.is_unspecified() {
         return IncomingSource::Unknown;
     }
-    if (v6.segments()[0] & 0xfe00) == 0xfc00 {
+    if v6.segments()[..3] == IROH_MAPPED_PREFIX_48 {
         return IncomingSource::Relayed;
     }
     IncomingSource::Direct(addr)
@@ -562,6 +568,17 @@ mod tests {
         );
         let mapped: std::net::SocketAddr = "[fd15:70a:510b:1::7]:443".parse().unwrap();
         assert_eq!(classify_remote_addr(mapped), IncomingSource::Relayed);
+        let mapped_ep: std::net::SocketAddr = "[fd15:70a:510b::9]:443".parse().unwrap();
+        assert_eq!(classify_remote_addr(mapped_ep), IncomingSource::Relayed);
+        // Real unique-local LAN/VPN peers outside iroh's /48 are direct.
+        for s in [
+            "[fd00::1]:4433",
+            "[fc00::1]:4433",
+            "[fd15:70a:510c::1]:4433",
+        ] {
+            let a: std::net::SocketAddr = s.parse().unwrap();
+            assert_eq!(classify_remote_addr(a), IncomingSource::Direct(a));
+        }
         for s in ["0.0.0.0:0", "[::]:0"] {
             assert_eq!(
                 classify_remote_addr(s.parse().unwrap()),

@@ -32,8 +32,7 @@
   reserved: a stranger can hold one only for a short provisional handshake
   (5 s), while an endpoint id that recently authenticated with a verified root
   keeps it. Relayed connections have no usable client address, so they share
-  one rate limit and are never source-banned (so do direct peers with a
-  unique-local IPv6 address, which are conservatively treated as relayed).
+  one rate limit and are never source-banned.
   Dropped attempts are reported as
   one summary warning per 10 s. This reduces a single-source flood, not a
   distributed one: a botnet with many IPs and fresh endpoint ids can still
