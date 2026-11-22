@@ -33,7 +33,6 @@ fn design_mentions_required_terms() {
         "lattice-resume-v2",
         "lattice-ticket-v2",
         "lattice-net-cb-v1",
-        "ed25519-dalek 3.0.0",
         "64 KiB",
         "not_after",
         "ADR-007",

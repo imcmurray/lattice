@@ -433,8 +433,9 @@ const IROH_MAPPED_PREFIX_48: [u16; 3] = [0xfd15, 0x070a, 0x510b];
 /// iroh's synthetic "mapped" IPv6 addresses all live in `fd15:70a:510b::/48`
 /// (iroh 1.5.0 `socket/mapped_addrs.rs`: `ADDR_PREFIXL` 0xfd + `ADDR_GLOBAL_ID`
 /// 15:07:0a:51:0b, with relay/custom/endpoint-id subnets under it). iroh normally
-/// converts them to `IncomingAddr::Relay`/`Custom`, but `to_transport_addr` falls
-/// back to `Ip(addr)` when a lookup fails, so an address in that /48 is treated as
+/// converts them to `IncomingAddr::Relay`/`Custom`, but `Incoming::remote_addr`
+/// falls back to `Ip(addr)` when the mapped-address lookup fails (iroh 1.5.0
+/// `endpoint/connection.rs`), so an address in that /48 is treated as
 /// `Relayed` here. Other unique-local (`fc00::/7`) addresses are real LAN/VPN peers
 /// and are `Direct`.
 /// Unspecified addresses (`0.0.0.0`, `::`) are `Unknown`.

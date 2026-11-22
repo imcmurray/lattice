@@ -6,7 +6,6 @@ yanked = "deny"
 # still fail CI. Revisit and remove these as upstreams drop the dependencies.
 ignore = [
     "RUSTSEC-2023-0089",  # atomic-polyfill unmaintained (transitive)
-    "RUSTSEC-2024-0436",  # paste unmaintained (transitive; macro helper)
     "RUSTSEC-2026-0173",  # proc-macro-error2 unmaintained (transitive)
     "RUSTSEC-2026-0374",  # basic-toml unmaintained (transitive; age -> i18n-embed config)
     "RUSTSEC-2026-0543",  # chrono unmaintained (transitive; iroh -> netwatch -> wmi, Windows only)

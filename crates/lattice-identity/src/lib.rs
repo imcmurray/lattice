@@ -1686,4 +1686,52 @@ mod tests {
             assert!(PublicIdentity::from_bytes(&kp.public().to_bytes()).is_ok());
         }
     }
+
+    /// Known-answer test pinning Lattice's post-quantum outputs across dependency
+    /// updates (values generated with ml-dsa 0.1.1 / ml-kem 0.3.2 at main ece4d2d).
+    /// A crate bump that changes key generation, signing, encapsulation or
+    /// decapsulation output fails here instead of silently changing identities or
+    /// breaking interop.
+    #[cfg(feature = "pq")]
+    #[test]
+    fn pq_outputs_match_known_answers() {
+        let hex = |b: &[u8]| blake3::hash(b).to_hex().to_string();
+        // Hybrid signature: Ed25519 + ML-DSA-65, both deterministic.
+        let (_, h) = pair();
+        let sig = h.sign(b"lattice pq known-answer test");
+        assert_eq!(sig.0.len(), 3381);
+        assert_eq!(
+            hex(&sig.0),
+            "cdb15f61a5aa94e427b1b6f24aebfe1340eecf519a126668a4eef5f825cf6c08"
+        );
+        // ML-KEM-768: key generation from a fixed seed.
+        let mut seed = MlKemSeed::default();
+        seed.copy_from_slice(&[0x42u8; 64]);
+        let dk = MlKemDk::from_seed(seed);
+        let ek = dk.encapsulation_key().clone();
+        assert_eq!(
+            hex(&ek.to_bytes()),
+            "fa88246c20b3b266f6dd762098c644f8758af78f1214964c87e50ac969082eb3"
+        );
+        // Deterministic encapsulation with fixed randomness.
+        let (ct, ss) = ek.encapsulate_deterministic(&MlKemB32::from([0x24u8; 32]));
+        assert_eq!(
+            hex(ct.as_slice()),
+            "6b9d7dd4f32be638ad2a2827bcd3c25dc1775227ce7cfffa6966f9aca01e366b"
+        );
+        let want_ss = "bcf2af3bd39ae7ab59ce584a3731e1b93fdefba36d30a828275d1aabf5d27d1e";
+        assert_eq!(hex_encode(ss.as_slice()), want_ss);
+        // Decapsulation through Lattice's own wrapper recovers the same secret.
+        let kem = EphemeralKem {
+            dk,
+            ek: ek.to_bytes().to_vec(),
+        };
+        let got = kem.decapsulate(ct.as_slice()).unwrap();
+        assert_eq!(hex_encode(&got[..]), want_ss);
+    }
+
+    #[cfg(feature = "pq")]
+    fn hex_encode(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
 }
