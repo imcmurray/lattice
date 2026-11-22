@@ -422,16 +422,16 @@ pub enum IncomingSource {
     Unknown,
 }
 
-/// iroh 1.0.1's mapped-address prefix `fd15:70a:510b::/48` (see `classify_remote_addr`).
+/// iroh 1.5.0's mapped-address prefix `fd15:70a:510b::/48` (see `classify_remote_addr`).
 const IROH_MAPPED_PREFIX_48: [u16; 3] = [0xfd15, 0x070a, 0x510b];
 
 /// Pure: classify an IP address iroh reports for an `Incoming`.
 ///
-/// iroh 1.0's `Incoming::remote_addr()` is an `IncomingAddr`: `Ip(SocketAddr)`
+/// iroh 1.5's `Incoming::remote_addr()` is an `IncomingAddr`: `Ip(SocketAddr)`
 /// for a direct path and `Relay { .. }` for a relayed one (see
 /// [`IncomingConn::remote_source`]; a relayed attempt carries no client IP).
 /// iroh's synthetic "mapped" IPv6 addresses all live in `fd15:70a:510b::/48`
-/// (iroh 1.0.1 `socket/mapped_addrs.rs`: `ADDR_PREFIXL` 0xfd + `ADDR_GLOBAL_ID`
+/// (iroh 1.5.0 `socket/mapped_addrs.rs`: `ADDR_PREFIXL` 0xfd + `ADDR_GLOBAL_ID`
 /// 15:07:0a:51:0b, with relay/custom/endpoint-id subnets under it). iroh normally
 /// converts them to `IncomingAddr::Relay`/`Custom`, but `to_transport_addr` falls
 /// back to `Ip(addr)` when a lookup fails, so an address in that /48 is treated as

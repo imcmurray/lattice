@@ -33,7 +33,7 @@ fn design_mentions_required_terms() {
         "lattice-resume-v2",
         "lattice-ticket-v2",
         "lattice-net-cb-v1",
-        "ed25519-dalek 3.0.0-rc.0",
+        "ed25519-dalek 3.0.0",
         "64 KiB",
         "not_after",
         "ADR-007",
@@ -47,6 +47,21 @@ fn design_mentions_required_terms() {
     ] {
         assert!(d.contains(need), "DESIGN.md missing {need:?}");
     }
+}
+
+#[test]
+fn docs_drop_release_candidate_claims() {
+    let d = read("DESIGN.md");
+    let s = read("SECURITY.md");
+    assert!(!d.contains("3.0.0-rc"), "DESIGN.md still mentions 3.0.0-rc");
+    assert!(
+        !s.contains("3.0.0-rc"),
+        "SECURITY.md still mentions 3.0.0-rc"
+    );
+    assert!(
+        !d.contains("iroh 1.0.1"),
+        "DESIGN.md still mentions iroh 1.0.1"
+    );
 }
 
 #[test]

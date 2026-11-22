@@ -18,7 +18,7 @@ iroh = ["dep:iroh", "dep:serde", "dep:postcard", "dep:hex", "tokio/io-util", "to
 [dependencies]
 lattice-core = { path = "../lattice-core" }
 tokio = { version = "1", features = ["sync"] }
-iroh = { version = "1", optional = true }
+iroh = { version = "1.5", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 postcard = { version = "1", features = ["alloc"], optional = true }
 hex = { version = "0.4", optional = true }
